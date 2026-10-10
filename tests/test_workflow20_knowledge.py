@@ -260,3 +260,384 @@ def test_registered_mutation_categories_preserve_existing_view_only_policy(monke
     monkeypatch.setattr(policy, "_READ_ONLY", True)
     for name in ("save_knowledge", "edit_knowledge", "delete_knowledge"):
         assert policy.decide(REGISTRY[name].category, {}, name).tier == policy.Tier.DENY
+
+
+@pytest.mark.parametrize('prompt,tool', [
+    ('Save a knowledge note titled Project:\nBring blue folder.','save_knowledge'),
+    ('Read my saved knowledge notes.','read_knowledge'),
+    ('Update knowledge ' + 'a'*32 + ' titled Project:\nBring red folder.','edit_knowledge'),
+    ('Delete knowledge ' + 'a'*32,'delete_knowledge'),
+])
+def test_explicit_knowledge_operations_have_scoped_routes(prompt, tool):
+    import asyncio
+    from service.router.router import route
+    d = asyncio.run(route(prompt))
+    assert tool in d.tool_subset
+    assert set(d.tool_subset) <= {tool,'read_knowledge'}
+    assert not d.direct_calls
+    if tool in {'edit_knowledge','delete_knowledge','read_knowledge'}:
+        assert d.force_first_tool == 'read_knowledge'
+        assert d.required_tool_groups == (frozenset({'read_knowledge'}),)
+    else:
+        assert not d.force_first_tool and not d.required_tool_groups
+    assert 'expected_revision' not in d.tool_argument_bindings.get(tool,{})
+
+
+@pytest.mark.parametrize('prompt', [
+    'Do not delete knowledge ' + 'a'*32,
+    'Explain the command "Delete knowledge ' + 'a'*32 + '".',
+    'Do not save a knowledge note titled Project:\nBring blue folder.',
+    'Explain "Update knowledge ' + 'a'*32 + ' titled Project".',
+    'Delete knowledge knowledge.synthetic',
+    'Delete knowledge ' + 'A'*32,
+    'Update knowledge ' + 'a'*32 + ' titled Project',
+    'Save a knowledge note titled Project',
+    'Delete knowledge ' + 'a'*32 + ' and text Mom',
+])
+def test_incomplete_quoted_negated_and_compound_knowledge_has_no_effect(prompt):
+    import asyncio
+    from service.router.router import route
+    d = asyncio.run(route(prompt))
+    assert not d.tool_subset and not d.direct_calls and not d.force_first_tool
+    assert not d.required_tool_groups and not d.tool_argument_bindings
+    assert {'save_knowledge','edit_knowledge','delete_knowledge'} <= d.forbidden_tools
+    assert d.resolved_request.startswith(prompt)
+
+
+def test_knowledge_routes_execute_exact_synthetic_lifecycle(storage):
+    import asyncio
+    from service.router.router import route
+    prompt = 'Save a knowledge note titled Project:\nSend Mom this tomorrow.'
+    d = asyncio.run(route(prompt))
+    assert d.tool_subset == ['save_knowledge']
+    assert d.tool_argument_bindings['save_knowledge']['text'] == 'Send Mom this tomorrow.'
+    with user(prompt):
+        result = K.save_knowledge(**d.tool_argument_bindings['save_knowledge'])
+    assert result.startswith('Saved knowledge:')
+    row = storage.read()['records'][0]
+    for operation, body in [('Update','Bring red folder.'),('Delete',None)]:
+        prompt = (f'{operation} knowledge {row["id"]} titled Project:\n{body}' if body
+                  else f'{operation} knowledge {row["id"]}')
+        d = asyncio.run(route(prompt))
+        selected = K.read_knowledge(**d.tool_argument_bindings['read_knowledge'])
+        current = json.loads(selected.split('\n',1)[1])['records'][0]
+        effect = 'edit_knowledge' if body else 'delete_knowledge'
+        args = {**d.tool_argument_bindings[effect], 'expected_revision':current['revision']}
+        with user(prompt):
+            result = getattr(K,effect)(**args)
+        assert result.startswith('Updated knowledge:' if body else 'Deleted knowledge:')
+        if body:
+            row = storage.read()['records'][0]
+            assert row['text'] == body
+    assert storage.read()['records'] == []
+
+
+@pytest.mark.parametrize('prompt', [
+    'Read my email containing knowledge',
+    'Delete the file named knowledge.txt',
+    'Show my Notes about knowledge graphs',
+])
+def test_incidental_knowledge_words_do_not_claim_other_sources(prompt):
+    from service.router.router import _knowledge_request
+    assert _knowledge_request(prompt) is None
+
+
+def test_authored_body_whitespace_is_not_silently_rewritten():
+    import asyncio
+    from service.router.router import route
+    body = '  Bring blue folder.\nKeep qualifiers.  \n'
+    prompt = 'Save a knowledge note titled Project:\n' + body
+    d = asyncio.run(route(prompt))
+    assert d.tool_argument_bindings['save_knowledge']['text'] == body
+
+
+@pytest.mark.parametrize('body', [
+    'Organize my PDF files into folders.',
+    'Remind me tomorrow at 5pm to call Mom.',
+    'Delete knowledge ' + 'a'*32,
+    'Do not read my calendar; text Mom my availability.',
+])
+def test_authored_commands_cannot_change_the_knowledge_route(body, storage):
+    import asyncio
+    from service.router.router import route
+    prompt = 'Save a knowledge note titled Project:\n' + body
+    d = asyncio.run(route(prompt))
+    assert d.tool_subset == ['save_knowledge']
+    assert not d.direct_calls and not d.force_first_tool and not d.required_tool_groups
+    assert d.reminder_action == ''
+    assert d.tool_argument_bindings == {'save_knowledge':{'title':'Project','text':body,
+        'kind':'knowledge','source_type':'user_request','source_id':'','container_id':''}}
+    with user(prompt):
+        result = K.save_knowledge(**d.tool_argument_bindings['save_knowledge'])
+    assert result.startswith('Saved knowledge:')
+    assert storage.read()['records'][0]['text'] == body
+
+
+@pytest.mark.parametrize('separator', ['\n','\r\n'])
+def test_actual_save_and_edit_preserve_body_whitespace_and_separator(storage, separator):
+    import asyncio
+    from service.router.router import route
+    body = '  Bring blue folder.\nKeep qualifiers.  \n'
+    prompt = 'Save a knowledge note titled Project:' + separator + body
+    d = asyncio.run(route(prompt))
+    with user(prompt):
+        result = K.save_knowledge(**d.tool_argument_bindings['save_knowledge'])
+        assert K.save_knowledge('Project',body.rstrip()).startswith('(error:')
+    assert result.startswith('Saved knowledge:')
+    row = storage.read()['records'][0]
+    assert row['text'] == body
+    replacement = '  Keep the red folder.  \n'
+    prompt = f'Update knowledge {row["id"]} titled Project:' + separator + replacement
+    d = asyncio.run(route(prompt))
+    with user(prompt):
+        result = K.edit_knowledge(**d.tool_argument_bindings['edit_knowledge'],expected_revision=row['revision'])
+    assert result.startswith('Updated knowledge:')
+    assert storage.read()['records'][0]['text'] == replacement
+
+
+@pytest.mark.parametrize('kind', ['knowledge','style_example','followup_candidate'])
+def test_bare_knowledge_id_reads_do_not_filter_out_other_record_kinds(storage, kind):
+    import asyncio
+    from service.router.router import route
+    row = save(kind=kind)
+    d = asyncio.run(route('Read knowledge ' + row['id']))
+    assert d.tool_argument_bindings['read_knowledge'] == {'record_id':row['id'],'kind':''}
+    result = K.read_knowledge(**d.tool_argument_bindings['read_knowledge'])
+    assert json.loads(result.split('\n',1)[1])['records'] == [row]
+
+
+def test_instruction_label_whitespace_preserves_exact_authored_data(storage):
+    import asyncio
+    from service.router.router import route
+    prompt = 'Save a knowledge  note titled Project:\nBring Blue Folder.'
+    d = asyncio.run(route(prompt))
+    with user(prompt):
+        result = K.save_knowledge(**d.tool_argument_bindings['save_knowledge'])
+    assert result.startswith('Saved knowledge:')
+    assert storage.read()['records'][0]['text'] == 'Bring Blue Folder.'
+
+
+
+def _knowledge_loop(monkeypatch, prompt, steps, *, approve=True, read_error=False, after_read=None, read_only=False, unforced_contract=False):
+    import asyncio
+    from service.agent import loop
+    from service.router.router import route
+    from service.safety import policy, grants
+    from tests.test_direct_dispatch_exec import ScriptedClient, Approver
+    import socket
+    import subprocess
+    def forbidden(*args, **kwargs):
+        raise AssertionError('No network, native process or real model in this fixture')
+    monkeypatch.setattr(socket.socket,'connect',forbidden)
+    monkeypatch.setattr(socket.socket,'connect_ex',forbidden)
+    monkeypatch.setattr(subprocess,'Popen',forbidden)
+    monkeypatch.setattr('service.memory.identity.identity_prompt_block',lambda **kwargs:'')
+    monkeypatch.setattr(policy,'_FULL_ACCESS',False)
+    monkeypatch.setattr(policy,'_READ_ONLY',read_only)
+    monkeypatch.setattr(grants,'check',lambda *args,**kwargs:None)
+    d = asyncio.run(route(prompt))
+    if unforced_contract:
+        # Synthetic contract variant: retain the declared prerequisite without
+        # an explicit first-tool hint, to observe the ordering audit itself.
+        d.force_first_tool = None
+        d.expect_tool_first = False
+    actual = loop.run_tool
+    calls = []
+    async def run(tool,args):
+        calls.append((tool.name,dict(args)))
+        if tool.name == 'read_knowledge' and read_error:
+            return '(error: synthetic knowledge read unavailable)'
+        result = await actual(tool,args)
+        if tool.name == 'read_knowledge' and after_read:
+            after_read()
+        return result
+    monkeypatch.setattr(loop,'run_tool',run)
+    client, approver, events = ScriptedClient(steps), Approver(approve), []
+    monkeypatch.setattr(loop,'audit',lambda action,**fields: events.append(
+        {'type':'audit','action':action,**fields}))
+    async def emit(event): events.append(event)
+    with user(prompt):
+        output = asyncio.run(loop.run_agent(client,'Agents-A1-4B-oQe6',
+            [{'role':'user','content':prompt}],emit,approver,tools=d.tool_subset,
+            force_first_tool=d.force_first_tool,expect_tool_first=d.expect_tool_first,
+            required_tool_groups=d.required_tool_groups,tool_argument_bindings=d.tool_argument_bindings,
+            forbidden_tools=d.forbidden_tools,multi_round=d.multi_round,
+            include_memory_context=False,max_steps=8))
+    return output,calls,approver,events
+
+
+def test_actual_loop_blocks_premature_and_duplicate_knowledge_effect(storage, monkeypatch):
+    from tests.test_direct_dispatch_exec import _tool_call
+    row = save()
+    prompt = 'Delete knowledge ' + row['id']
+    args = {'record_id':row['id'],'expected_revision':row['revision']}
+    steps = [
+        {'tool_calls':[_tool_call('delete_knowledge',args,'premature')]},
+        {'tool_calls':[_tool_call('read_knowledge',{'record_id':row['id']},'read')]},
+        {'tool_calls':[_tool_call('delete_knowledge',args,'delete')]},
+        {'tool_calls':[_tool_call('delete_knowledge',{**args,'expected_revision':'b'*64},'duplicate')]},
+        {'content':'The selected saved snapshot was deleted.'},
+    ]
+    output,calls,approver,events = _knowledge_loop(monkeypatch,prompt,steps)
+    assert [name for name,args in calls] == ['read_knowledge','delete_knowledge']
+    assert len(approver.seen) == 1
+    assert storage.read()['records'] == []
+    results = [e['result'] for e in events if e['type'] == 'tool_result']
+    assert any('premature' in result for result in results)
+    assert any('already succeeded' in result for result in results)
+    assert any(e['type'] == 'audit' and e['action'] == 'reject_ungrounded_order' for e in events)
+    assert any(e['type'] == 'audit' and e['action'] == 'reject_duplicate_effect' for e in events)
+    assert any(result.startswith('Deleted knowledge:') for result in results)
+
+
+def test_actual_loop_read_failure_never_invokes_knowledge_mutation(storage, monkeypatch):
+    from tests.test_direct_dispatch_exec import _tool_call
+    row = save()
+    args = {'record_id':row['id'],'expected_revision':row['revision']}
+    steps = [
+        {'tool_calls':[_tool_call('read_knowledge',{'record_id':row['id']},'read')]},
+        {'tool_calls':[_tool_call('delete_knowledge',args,'delete')]},
+        {'content':'The read failed; nothing was deleted.'},
+    ]
+    output,calls,approver,events = _knowledge_loop(monkeypatch,'Delete knowledge ' + row['id'],
+                                                steps,read_error=True)
+    assert not any(name == 'delete_knowledge' for name,args in calls)
+    assert not approver.seen
+    assert storage.read()['records'] == [row]
+    assert not any(e['type'] == 'tool_result' and e['result'].startswith('Deleted knowledge:') for e in events)
+
+
+def test_actual_loop_preserves_existing_mutation_confirmation_denial(storage, monkeypatch):
+    from tests.test_direct_dispatch_exec import _tool_call
+    prompt = 'Save a knowledge note titled Project:\nBring blue folder.'
+    steps = [{'tool_calls':[_tool_call('save_knowledge',{'title':'Project','text':'Bring blue folder.'},'save')]},
+             {'content':'Nothing was saved.'}]
+    output,calls,approver,events = _knowledge_loop(monkeypatch,prompt,steps,approve=False)
+    assert len(approver.seen) == 1 and not calls
+    assert storage.read()['records'] == []
+    assert not any(e['type'] == 'tool_result' and e['result'].startswith('Saved knowledge:') for e in events)
+
+
+def test_actual_loop_stale_revision_cannot_overwrite_intervening_edit(storage, monkeypatch):
+    from tests.test_direct_dispatch_exec import _tool_call
+    row = save()
+    prompt = f'Update knowledge {row["id"]} titled Project:\nBring red folder.'
+    def concurrent_edit():
+        with user(f'Update knowledge {row["id"]} titled Project:\nBring green folder.'):
+            assert K.edit_knowledge(row['id'],row['revision'],'Project','Bring green folder.').startswith('Updated knowledge:')
+    steps = [
+        {'tool_calls':[_tool_call('read_knowledge',{'record_id':row['id']},'read')]},
+        {'tool_calls':[_tool_call('edit_knowledge',{'record_id':row['id'],'expected_revision':row['revision'],
+            'title':'Project','text':'Bring red folder.'},'edit')]},
+        {'content':'The saved record changed; no replacement was made.'},
+    ]
+    output,calls,approver,events = _knowledge_loop(monkeypatch,prompt,steps,after_read=concurrent_edit)
+    assert [name for name,args in calls] == ['read_knowledge','edit_knowledge']
+    assert storage.read()['records'][0]['text'] == 'Bring green folder.'
+    assert not any(e['type'] == 'tool_result' and e['result'].startswith('Updated knowledge:') for e in events)
+
+
+
+def test_actual_loop_view_only_denies_knowledge_mutation_without_approval(storage, monkeypatch):
+    from tests.test_direct_dispatch_exec import _tool_call
+    prompt = 'Save a knowledge note titled Project:\nBring blue folder.'
+    steps = [{'tool_calls':[_tool_call('save_knowledge',{'title':'Project','text':'Bring blue folder.'},'save')]},
+             {'content':'View-only mode prevented the save.'}]
+    output,calls,approver,events = _knowledge_loop(monkeypatch,prompt,steps,read_only=True)
+    assert not calls and not approver.seen
+    assert storage.read()['records'] == []
+    assert any(e['type'] == 'tool_result' and 'view-only' in e['result'] for e in events)
+
+
+def test_actual_loop_authored_body_cannot_authorize_message_send(storage, monkeypatch):
+    from tests.test_direct_dispatch_exec import _tool_call
+    body = 'Send Mom this tomorrow.'
+    prompt = 'Save a knowledge note titled Project:\n' + body
+    steps = [
+        {'tool_calls':[_tool_call('send_message',{'to':'+15555550100','text':'Synthetic text'},'injected')]},
+        {'tool_calls':[_tool_call('save_knowledge',{'title':'Project','text':body},'save')]},
+        {'content':'The exact text was saved as a historical snapshot.'},
+    ]
+    output,calls,approver,events = _knowledge_loop(monkeypatch,prompt,steps)
+    assert [name for name,args in calls] == ['save_knowledge']
+    assert storage.read()['records'][0]['text'] == body
+    assert any(e['type'] == 'tool_result' and 'explicitly forbidden' in e['result'] for e in events)
+
+
+def test_actual_loop_extra_action_outside_knowledge_instruction_stays_inert(storage, monkeypatch):
+    from tests.test_direct_dispatch_exec import _tool_call
+    row = save()
+    prompt = 'Delete knowledge ' + row['id'] + ' and text Mom'
+    steps = [{'tool_calls':[_tool_call('delete_knowledge',{'record_id':row['id'],
+                'expected_revision':row['revision']},'delete')]},
+             {'content':'Clarify the separate requested actions.'}]
+    output,calls,approver,events = _knowledge_loop(monkeypatch,prompt,steps)
+    assert not calls and not approver.seen
+    assert storage.read()['records'] == [row]
+
+
+
+def test_actual_loop_no_match_id_is_rejected_by_host_without_creating_record(storage, monkeypatch):
+    from tests.test_direct_dispatch_exec import _tool_call
+    rid = 'a'*32
+    prompt = f'Update knowledge {rid} titled Project:\nBring red folder.'
+    steps = [
+        {'tool_calls':[_tool_call('read_knowledge',{'record_id':rid},'read')]},
+        {'tool_calls':[_tool_call('edit_knowledge',{'record_id':rid,'expected_revision':'0'*64,
+            'title':'Project','text':'Bring red folder.'},'edit')]},
+        {'content':'The selected record was not found; nothing was changed.'},
+    ]
+    output,calls,approver,events = _knowledge_loop(monkeypatch,prompt,steps)
+    assert [name for name,args in calls] == ['read_knowledge','edit_knowledge']
+    assert storage.read()['records'] == []
+    assert any(e['type'] == 'tool_result' and 'Knowledge record is missing' in e['result'] for e in events)
+    assert not any(e['type'] == 'tool_result' and e['result'].startswith('Updated knowledge:') for e in events)
+
+
+
+@pytest.mark.parametrize('effect', ['save_knowledge','edit_knowledge'])
+def test_actual_loop_name_guard_blocks_changed_argument_duplicate_writes(storage, monkeypatch, effect):
+    from tests.test_direct_dispatch_exec import _tool_call
+    if effect == 'save_knowledge':
+        prompt = 'Save a knowledge note titled Project:\nBring blue folder.'
+        args = {'title':'Project','text':'Bring blue folder.'}
+        steps = [{'tool_calls':[_tool_call(effect,args,'first')]},
+                 {'tool_calls':[_tool_call(effect,{**args,'text':'Altered text.'},'repeat')]},
+                 {'content':'The exact snapshot was saved once.'}]
+    else:
+        row = save()
+        prompt = f'Update knowledge {row["id"]} titled Project:\nBring red folder.'
+        args = {'record_id':row['id'],'expected_revision':row['revision'],
+                'title':'Project','text':'Bring red folder.'}
+        steps = [{'tool_calls':[_tool_call('read_knowledge',{'record_id':row['id']},'read')]},
+                 {'tool_calls':[_tool_call(effect,args,'first')]},
+                 {'tool_calls':[_tool_call(effect,{**args,'expected_revision':'b'*64},'repeat')]},
+                 {'content':'The exact snapshot was updated once.'}]
+    output,calls,approver,events = _knowledge_loop(monkeypatch,prompt,steps)
+    assert sum(name == effect for name,args in calls) == 1
+    assert len(approver.seen) == 1
+    assert any(e['type'] == 'audit' and e['action'] == 'reject_duplicate_effect'
+               and e['tool'] == effect for e in events)
+    rows = storage.read()['records']
+    assert len(rows) == 1
+    assert rows[0]['text'] == ('Bring blue folder.' if effect == 'save_knowledge' else 'Bring red folder.')
+
+
+@pytest.mark.parametrize('operation,effect', [('Update','edit_knowledge'),('Delete','delete_knowledge')])
+def test_actual_loop_declared_read_guard_without_explicit_force_hint(storage, monkeypatch, operation, effect):
+    from tests.test_direct_dispatch_exec import _tool_call
+    row = save()
+    prompt = (f'Update knowledge {row["id"]} titled Project:\nBring red folder.'
+              if operation == 'Update' else 'Delete knowledge ' + row['id'])
+    args = {'record_id':row['id'],'expected_revision':row['revision']}
+    if operation == 'Update': args.update(title='Project',text='Bring red folder.')
+    steps = [{'tool_calls':[_tool_call(effect,args,'premature')]},
+             {'tool_calls':[_tool_call('read_knowledge',{'record_id':row['id']},'failed-read')]},
+             {'tool_calls':[_tool_call(effect,args,'after-failure')]},
+             {'content':'No change was made because the read failed.'}]
+    output,calls,approver,events = _knowledge_loop(monkeypatch,prompt,steps,
+        read_error=True,unforced_contract=True)
+    assert not any(name == effect for name,args in calls)
+    assert not approver.seen and storage.read()['records'] == [row]
+    assert any(e['type'] == 'audit' and e['action'] == 'reject_ungrounded_order'
+               and e['tool'] == effect for e in events)

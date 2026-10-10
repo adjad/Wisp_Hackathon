@@ -10,7 +10,7 @@ Wisp_Hackathon repository; original Wisp main remains unchanged.
 |---|---|---|
 | 01 Overview | Personal compound source constraints; single-source shortcut cannot swallow another requested source | Source-backed final answer and partial-source end-to-end grading |
 | 02 Daily summary | Bounded composite daily_brief with source exclusions, current receipts, today Calendar and separate overdue/upcoming/undated reminders; shared daily/date-first briefing grammar and Calendar-only brief | Full summary content/coverage and local-model qualification |
-| 03 Time ranges | Exact calendar ranges, week/month availability and ongoing/overnight overlap regressions | Full end-to-end final answer grading and real-source validation |
+| 03 Time ranges | Exact calendar ranges, noun-position cal/weekend questions resolve to Saturday–Sunday ISO ranges; week/month availability and ongoing/overnight overlap regressions | Full end-to-end final answer grading and real-source validation |
 | 04 CA weather | 20 city names, aliases/four typo repairs, provider city/state/country validation; 175 focused offline tests | Real provider/network behavior; arbitrary misspellings remain unsupported |
 | 05 Priorities | Bounded priorities route uses the requested daily_brief window plus separate overdue/undated tasks and Notes evidence | Structured task ownership/due-date extraction, ranking and source-backed final answer |
 | 06 Contact said | Strict query/conversation misses; retrospective email/text questions stay reads; relationship questions remain private without saved contact metadata | All contact/time/topic/sender phrase binding and final answer verification |
@@ -22,7 +22,7 @@ Wisp_Hackathon repository; original Wisp main remains unchanged.
 | 12 Draft/send/schedule | Existing grounded workflows and durable approval-bound effects; recipient-before-channel drafts; source/dispatch dates separated; ambiguous/nonexistent DST clocks reject before queue/Contacts | Cross-source composition qualification, revised recipient approval tests; scheduled threaded replies unsupported |
 | 13 Unsubscribe | Truthful sender/account-bound unverified candidate preparation; no false success | Actual verified unsubscribe provider and historical-open evidence unavailable |
 | 14 Files | Extension/debug-filename-date grouping, content-bound previews, protected derived paths and atomic no-replace moves pass disposable filesystem tests; late source replacement reports unknown | Exact approved bytes require stable source entries through execution; full workflow grading, semantic content categorization and durable crash recovery remain unsupported |
-| 15 Personal knowledge/followups | Bounded explicit saved notes, user-authored style examples and inert follow-up candidates; exact selected cached source IDs, editable revisions and delete receipts | Broad source indexing, automatic preparation and context/style-guided draft qualification remain incomplete; Mail imports now require one immutable eligible cache generation; cross-source draft qualification remains pending |
+| 15 Personal knowledge/followups | Explicit knowledge routes precede Notes; bounded saved notes, style examples and inert follow-up candidates; exact cached source IDs and editable revisions; actual synthetic loop checks enforce prior reads, duplicate-effect guards and existing policy | Broad source indexing, automatic preparation and context/style-guided draft qualification remain incomplete; Mail imports now require one immutable eligible cache generation; cross-source draft qualification remains pending |
 | 16 Meeting | Checked private proposals use real event ends, exact duration and coherent fresh snapshots; bearer token remains host-only behind a turn-local one-use inert model reference; interactive approval precedes refreshed conflict/reference checks and strict native receipt | Actual native creation qualification and attendee invitation provider; generic meetings cannot silently become private blocks or invitations |
 | 17 Fuzzy test time | Bounded subject typo/test-exam synonyms; quiz/midterm/final distinctions; multiple identities retained | Natural request binding and end-to-end ambiguity/answer tests |
 | 18 Unread catchup | Actual unread Messages filtering; unknown-state/partial coverage; unread+date email intersection; shared basic direct reads | All qualified scope bindings and complete grounded catchup grading |
@@ -69,6 +69,33 @@ qualification. The original Catch PR's required CI failed on five fixed-clock
 fixtures; the failures were reproduced under UTC and repaired here by freezing
 the test store clock. Production expiry and all assertions remain unchanged.
 UTC and Pacific focused regressions pass; fresh committed-head CI is pending.
+
+## Regression repair evidence
+
+The first frozen PR3 candidate `0bb920222a364066e047db091a40eec41145a390`
+failed its isolated full Python run: 189 of 198 gates passed, nine failed,
+27,172 assertions passed and 20 failed. One gate supplied an incomplete count;
+`counts_complete=false` is retained. That commit and its report are preserved.
+
+The successor repairs arrival aliases, ordinary Calendar scope/context isolation,
+exact weekend ranges, and public-weather voice classification. Explicit knowledge
+instructions now remain separate from Apple Notes and from commands inside their
+authored text. Edit/delete require the selected record read; current revision,
+trusted request and existing mutation policy remain host checks. Authored text
+preserves case, CRLF and trailing whitespace.
+
+Actual synthetic loop tests reproduced failed-read deletion and changed-argument
+repeat dispatch before the three knowledge mutation names joined the existing
+effect guards. After the change, 83 focused knowledge cases pass, including
+ordering, changed-argument duplicates, confirmation refusal, view-only denial,
+missing records, stale revisions and stored-command isolation. These are fake
+model traces with isolated storage; they do not qualify real model behavior.
+Source-import instructions still require canonical single-space kind labels.
+An empty saved-record read does not prove a record exists; the host refuses a
+missing-ID mutation even if the model tries it after that read.
+Fresh committed-head full checks, required CI and independent review remain
+necessary. Priority body evidence/ranking and all listed native/provider gaps
+remain open.
 
 ## Family 15 reference scope
 

@@ -68,12 +68,12 @@ def save_knowledge(title: str, text: str = "", kind: str = "knowledge",
         if label is None or not all(isinstance(value, str) for value in (title, text, source_type, source_id, container_id)):
             raise ValueError("Provide supported knowledge fields.")
         if source_type == "user_request":
-            pattern = r"(?:save|store|remember)\s+(?:a\s+)?" + re.escape(label) + r"\s+titled\s+" + _literal(title) + r":\r?\n" + _literal(text)
-            if source_id or container_id or not _exact(pattern, source["quote"]):
+            pattern = r"(?:save|store|remember)\s+(?:a\s+)?" + r"\s+".join(map(re.escape, label.split())) + r"\s+titled\s+" + _literal(title) + r":\r?\n" + _literal(text)
+            if source_id or container_id or re.fullmatch(
+                    r"\s*(?:please\s+)?" + pattern, source["quote"], re.I) is None:
                 raise ValueError("Ask the user for the complete exact title and text to save; nothing changed.")
-            # Case-insensitive instruction words must not permit altered text.
-            if not source["quote"].strip().endswith(title + ":\n" + text):
-                raise ValueError("Copy the title and full user text exactly, including case and qualifications.")
+            # _literal preserves case and every authored byte; no trailing
+            # whitespace wildcard may accept a truncated body.
             evidence = _user_evidence(source, text)
         else:
             container_label = "account" if source_type == "email" else "chat"
@@ -117,7 +117,7 @@ def edit_knowledge(record_id: str, expected_revision: str, title: str, text: str
         source = _request()
         pattern = (r"(?:update|edit|replace)\s+knowledge\s+" + _literal(record_id)
                    + r"\s+titled\s+" + _literal(title) + r":\r?\n" + _literal(text))
-        if not _exact(pattern, source["quote"]) or not source["quote"].strip().endswith(title + ":\n" + text):
+        if re.fullmatch(r"\s*(?:please\s+)?" + pattern, source["quote"], re.I) is None:
             raise ValueError("A complete exact user edit with the knowledge ID is required; nothing changed.")
         rows = _store.read(record_id=record_id)["records"]
         if len(rows) != 1:

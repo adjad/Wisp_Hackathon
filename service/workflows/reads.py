@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from service.router.router import calendar_is_excluded
 from service.utterance_shape import deliberate
@@ -224,9 +224,9 @@ def _calendar_read_args(text: str, period: str, today: date | None = None,
     # interpretation; keyword blacklists cannot enumerate every second action.
     match = re.fullmatch(
         r"(?:please\s+|can\s+you\s+|could\s+you\s+)?(?:"
-        r"what(?:[’']s|\s+is|\s+are)\s+(?:on|in)\s+|"
+        r"what(?:[’']s|\s+is|\s+are)\s+(?:on|in)\s+|is\s+there\s+anything\s+(?:on|in)\s+|"
         r"(?:show(?:\s+me)?|check|list)\s+|(?:why\s+)?are\s+there\s+no\s+)"
-        r"(?:my\s+|the\s+)?(?:calendar(?:\s+events)?|schedule)\b(?P<tail>.*)",
+        r"(?:my\s+|the\s+)?(?:cal(?:endar)?(?:\s+events)?|schedule)\b(?P<tail>.*)",
         text.strip(" .!?"), re.I)
     if not match:
         return None
@@ -253,6 +253,10 @@ def _calendar_read_args(text: str, period: str, today: date | None = None,
         args: dict = {"days": default_days}
     elif re.fullmatch(r"today\s+and\s+tomorrow|tomorrow\s+and\s+today", scope, re.I):
         args = {"period": "today and tomorrow"}
+    elif re.fullmatch(r"this\s+weekend", scope, re.I):
+        saturday = today - timedelta(days=today.weekday()) + timedelta(days=5)
+        sunday = saturday + timedelta(days=1)
+        args = {"period": f"{saturday.isoformat()}..{sunday.isoformat()}"}
     elif (exact := _named_date(scope, today)) is not None:
         args = {"period": exact}
     elif re.fullmatch(r"today|tomorrow|(?:this|next)\s+(?:week|month)", scope, re.I):

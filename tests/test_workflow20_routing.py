@@ -63,6 +63,9 @@ def test_tomorrow_todo_actual_batch_reads_every_source_before_narration(monkeypa
 
 
 @pytest.mark.parametrize('prompt', [
+    'plan arrival using traffic',
+    'work backward from my arrival deadline',
+    'get me there by tonight',
     'When should I leave home to reach SFO by 10:30 tonight?',
     'What time should I leave home to reach SFO by 10:30 tonight?',
     'How early should we leave home to reach SFO by 10:30 tonight?',
@@ -77,6 +80,7 @@ def test_tomorrow_todo_actual_batch_reads_every_source_before_narration(monkeypa
     'Plan arrival at SFO from 123 Example Road by 2026-10-12T23:00:00-07:00 with a 181-minute buffer',
 ])
 def test_personal_arrival_clarifies_without_public_search_or_effect(prompt):
+    assert R.rule_route(prompt) is None
     decision = asyncio.run(R.route(prompt))
     assert decision.direct_calls == []
     assert not decision.force_first_tool
@@ -751,3 +755,72 @@ def test_which_unread_arrived_today_keeps_both_filters():
 def test_new_typed_read_grammars_decline_unconsumed_constraints(prompt):
     from service.workflows.workflow20 import weather_read,calendar_question
     assert weather_read(prompt) is None and calendar_question(prompt) is None
+
+
+@pytest.mark.parametrize('suffix', ['without reminders', 'skip reminders',
+    'excluding reminders', 'leave out reminders', 'do not include reminders'])
+def test_calendar_exclusion_synonyms_remain_exact_verified_reads(suffix):
+    prompt = f"Show my calendar this week {suffix}"
+    decision = asyncio.run(R.route(prompt))
+    assert decision.direct_calls == [('get_upcoming', {'period':'this week','calendar_only':True})]
+    assert decision.verified_results_only
+    assert decision.tool_subset == ['get_upcoming']
+
+
+def test_generic_calendar_keeps_established_scope_and_context_isolation():
+    from service import main
+    prompt = "what is on my calendar"
+    decision = asyncio.run(R.route(prompt))
+    assert decision.direct_calls == [('get_upcoming', {'days':60})]
+    assert main._current_schedule_source_route(decision, prompt)
+    assert not decision.narration_after
+
+
+@pytest.mark.parametrize('day, expected', [
+    ('2026-10-09', '2026-10-10..2026-10-11'),
+    ('2026-10-10', '2026-10-10..2026-10-11'),
+    ('2026-10-11', '2026-10-10..2026-10-11'),
+    ('2026-10-12', '2026-10-17..2026-10-18'),
+    ('2026-10-31', '2026-10-31..2026-11-01'),
+    ('2026-12-31', '2027-01-02..2027-01-03'),
+])
+def test_weekend_calendar_alias_has_executable_exact_private_range(monkeypatch, day, expected):
+    from datetime import date, datetime
+    from service.workflows import reads
+    from service.tools import timeranges
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromisoformat(day + 'T12:00:00')
+    monkeypatch.setattr(reads, 'datetime', Clock)
+    prompt = 'is there anything on my cal this weekend'
+    args = reads._calendar_read_args(prompt, '', date.fromisoformat(day))
+    assert args == {'period': expected}
+    from datetime import timedelta
+    start, end, _ = timeranges.resolve_span(expected)
+    first, last = expected.split('..')
+    assert start == datetime.fromisoformat(first).timestamp()
+    assert end == (datetime.fromisoformat(last) + timedelta(days=1)).timestamp()
+    decision = asyncio.run(R.route(prompt))
+    assert decision.direct_calls == [('get_upcoming', args)]
+    assert decision.tool_subset == ['get_upcoming']
+    assert decision.verified_results_only
+    assert {'web_search', 'web_fetch', 'http_request'} <= decision.forbidden_tools
+
+
+@pytest.mark.parametrize('prompt', [
+    'is there anything on my cal this weekend and text Mom',
+    'is there anything on my cal this weekend about physics',
+    'is there anything on my cal next weekend',
+    'is there anything on my cal this weekend then open Maps',
+])
+def test_weekend_calendar_parser_declines_unrepresented_constraints(prompt):
+    from service.workflows.reads import _calendar_read_args
+    assert _calendar_read_args(prompt, '') is None
+
+
+def test_public_weather_does_not_use_personal_data_voice():
+    decision = asyncio.run(R.route('What is the weather in Tokyo?'))
+    assert decision.direct_calls == [('get_weather', {'location':'Tokyo','period':''})]
+    assert decision.tool_subset == ['get_weather']
+    assert not decision.light_read

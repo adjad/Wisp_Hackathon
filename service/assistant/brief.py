@@ -1,0 +1,2131 @@
+"""Daily brief composer — one combined summary of calendar + email + iMessage.
+
+Powers both the on-demand "Daily Summary" button and the scheduled 8am/8pm
+digest.
+
+NO MODEL. The Daily Summary is rendered deterministically from the same caches
+the chat tools read. Standalone email and Messages summaries may use bounded
+Ling calls with validated identifier-only schemas, but no model output writes
+or rewrites any part of this brief.
+
+This keeps the safety lessons from the earlier fully generative path:
+
+  * a model-written brief misattributed the user's own outgoing messages
+    (_messages_rundown's measurements), so the sections became grounded
+    excerpts;
+  * the excerpt version then pasted the SOURCE TOOLS' return values together,
+    and those are written for a model — the user's brief opened three of its
+    four sections with prompt scaffolding (reported 2026-09-08);
+  * so the sections are composed here, in the shape a person reads, and the
+    model-facing renderings stay where they belong: in the tool output a model
+    consumes.
+
+The prompt-and-two-passes machinery below (`_BRIEF_SYS`, `_MSG_SYS`,
+`_messages_rundown`, `_split_brief`, `_assemble_full`, the `_*_block` builders)
+has no live Daily Summary path; it remains for regression coverage of the
+historical failures it documents.
+
+Calendar is deterministic (from the commitments store); email and messages come
+from the caches the Swift MailReader/MessagesReader push. Everything degrades
+gracefully: a source with no data (e.g. Messages before Full Disk Access is
+granted) just says so in its own section instead of breaking the brief, and a
+source that has not completed its current-launch read holds the whole brief back
+rather than passing restored rows off as today's (see `_sections`).
+"""
+from __future__ import annotations
+
+import asyncio
+import functools
+import re
+import time
+import traceback
+from datetime import datetime, timedelta
+
+from service.config import role_to_model, user_facing_summary_kwargs
+from service.inference.omlx_client import OMLXClient
+from service.assistant.store import assistant_store
+
+_client: OMLXClient | None = None
+
+
+def _c() -> OMLXClient:
+    global _client
+    if _client is None:
+        _client = OMLXClient()
+    return _client
+
+
+def _calendar_block(now: float) -> str:
+    """Calendar context, PARTITIONED into today vs. the rest of the week.
+
+    The brief's headline line is "what's on today", but this block used to hand
+    the model a flat 7-day list of bare "Thu Aug 6"-style dates and leave it to
+    work out which of them was today. the summarizer doesn't reliably do that date
+    arithmetic — it promotes a *future* event into "Today's Focus", which reads
+    as a hallucinated appointment. get_upcoming already fixed this class of bug
+    for chat (see assistant_tools._day_tag); the brief never got the same
+    treatment. Now the split is computed in Python, every row carries its own
+    TODAY/TOMORROW/weekday tag, and an empty today is stated explicitly rather
+    than left as an absence the model can fill in.
+    """
+    from service.assistant.sync_status import source_status
+    states = [source_status(source) for source in ("calendar", "reminders")]
+    if any(source["state"] == "syncing" for source in states):
+        return "CALENDAR: Wisp is still syncing calendar/reminder data. The schedule cannot yet be confirmed."
+    unavailable = [source["label"] for source in states if source["state"] == "unavailable"]
+    unavailable_ids = {source["id"] for source in states if source["state"] == "unavailable"}
+    unavailable_note = ("\nSOURCE UNAVAILABLE: " + " and ".join(unavailable)
+                        + ". Say this source could not be checked; never call "
+                          "its missing items an empty schedule.") if unavailable else ""
+    # _fmt renders the same TODAY-anchored row the chat tools use — one
+    # rendering of a commitment across every surface.
+    from service.tools.assistant_tools import (
+        _collapse_schedule_rows, _fmt, _local_day_bounds,
+        _without_holiday_calendars)
+    day_str = datetime.fromtimestamp(now).strftime("%A, %B %-d, %Y")
+    day_start, day_end = _local_day_bounds(now)
+    day_calendar = assistant_store.calendar_events_overlapping(day_start, day_end)
+    events = _collapse_schedule_rows(
+        day_calendar + assistant_store.upcoming(now=now, days=7))
+    events = [event for event in events if event.get("source") not in unavailable_ids]
+    events = _without_holiday_calendars(events, include_holidays=False)
+    if not events:
+        if unavailable:
+            return (f"CALENDAR — TODAY IS {day_str}.{unavailable_note}\n"
+                    "No scheduled items in sources that could be checked. The full schedule is unknown.")
+        return (f"CALENDAR — TODAY IS {day_str}.{unavailable_note}\n"
+                "Nothing scheduled today or in the next 7 days. Say the day is "
+                "clear; do NOT invent an event.")
+    show_account = len({c.get("account") for c in events if c.get("account")}) > 1
+    today_rows, later_rows = [], []
+    for c in events:
+        when_ts = float(c["when_ts"])
+        is_today = (day_start <= when_ts < day_end or
+                    (when_ts < day_start and float(c.get("end_ts") or 0) > day_start))
+        bucket = today_rows if is_today else later_rows
+        bucket.append(_fmt(c, now, show_account=show_account,
+                           day_start=day_start if when_ts < day_start else None))
+
+    blocks = [f"CALENDAR — TODAY IS {day_str}.{unavailable_note}"]
+    if today_rows:
+        blocks.append(f"ON THE CALENDAR TODAY ({len(today_rows)} item(s)) — these "
+                      "and ONLY these are today's:\n" + "\n".join(today_rows))
+    else:
+        blocks.append("ON THE CALENDAR TODAY: no items in the sources that could be checked. "
+                      + ("The full schedule is unknown." if unavailable else "The day is clear.")
+                      + " Do NOT describe anything below as happening today.")
+    if later_rows:
+        blocks.append("LATER THIS WEEK (NOT today — never present these as "
+                      "today's):\n" + "\n".join(later_rows))
+    return "\n\n".join(blocks)
+
+
+def _mail_window(now: float) -> dict:
+    """Choose Daily's header window and disclose when it uses older mail."""
+    from service.tools import email_tools
+    from service.tools.email_tools import (
+        email_sync_state, header_rows, header_scan_coverage)
+    # Never let restored pre-launch rows masquerade as a current Daily Summary.
+    # _sections requests a live sync first; if it has not landed, the user gets
+    # the explicit sync notice there rather than stale mail here.
+    if email_sync_state() != "ready":
+        return {"rows": [], "label": "last 24 hours", "scanned": 0,
+                "truncated": 0, "requested": (now - 86400, now),
+                "scan_cap_accounts": [], "scan_incomplete_accounts": [], "scan_skipped": 0,
+                "scan_attempted": 0}
+    # A lower bound alone is not a time window. The live cache in the
+    # 2026-08-28 report contained three future-dated rows (2027/2030); all are
+    # >= "24 hours ago", so they entered the brief and crowded out current
+    # mail. Cap at now before choosing either the 24-hour set or fallback.
+    cached = header_rows()
+    coverage = header_scan_coverage(
+        cached, raw_headers=email_tools._headers)
+    eligible = [r for r in cached if r["ts"] <= now]
+    recent = [r for r in eligible if r["ts"] >= now - 24 * 3600]
+    if recent:
+        return {"rows": recent, "label": "last 24 hours", "scanned": len(recent),
+                "truncated": 0, "requested": (now - 86400, now),
+                "scan_cap_accounts": coverage["cap_accounts"],
+                "scan_incomplete_accounts": coverage["incomplete_accounts"],
+                "scan_skipped": coverage["skipped"],
+                "scan_attempted": coverage["attempted"]}
+    fallback = eligible[:20]
+    return {"rows": fallback, "label": "recent fallback — no mail in last 24 hours",
+            "scanned": len(eligible), "truncated": len(eligible) - len(fallback),
+            "requested": None, "scan_cap_accounts": coverage["cap_accounts"],
+            "scan_incomplete_accounts": coverage["incomplete_accounts"],
+            "scan_skipped": coverage["skipped"],
+            "scan_attempted": coverage["attempted"]}
+
+
+def _mail_rows(now: float) -> list[dict]:
+    """Shape-stable Daily header rows, newest first."""
+    return _mail_window(now)["rows"]
+
+
+def _empty_mail_coverage(window: dict) -> str:
+    """Describe an empty Daily window without hiding a saturated native scan."""
+    if window["scan_cap_accounts"] or window["scan_skipped"] or window["scan_incomplete_accounts"]:
+        names = ", ".join(_clean(name, 40) for name in window["scan_cap_accounts"])
+        cap_note = (f"The recent scan reached its 200-message-per-account cap for {names}; "
+                    "messages may be outside the cache."
+                    if window["scan_cap_accounts"] else "")
+        skip_note = (f" Native scan attempted {window['scan_attempted']} headers and "
+                     f"skipped {window['scan_skipped']} malformed headers."
+                     if window["scan_skipped"] else "")
+        incomplete_names = ", ".join(_clean(name, 40) for name in window["scan_incomplete_accounts"])
+        incomplete_note = (f" Recent header scan did not complete for {incomplete_names}; "
+                           "messages may be outside the cache."
+                           if window["scan_incomplete_accounts"] else "")
+        total = ("known truncation is 0, but total truncation is unknown"
+                 if window["scan_cap_accounts"] or window["scan_incomplete_accounts"] else
+                 "truncated 0 known matching messages; skipped headers have unknown dates")
+        return ("No matching headers in the available Mail snapshot for the last 24 hours. "
+                "Scanned 0 matching cached headers; represented 0 messages; "
+                f"{total}. {cap_note}{skip_note}{incomplete_note}")
+    return ("No messages in the available Mail snapshot. Scanned 0 headers; "
+            "represented 0 messages; truncated 0 messages.")
+
+
+def _email_block(now: float) -> str:
+    """Header-only Daily email context with the same sender grouping as tools."""
+    from service.tools.email_tools import (
+        email_sync_state, email_freshness_warning, sender_digest)
+    state = email_sync_state()
+    if state == "syncing":
+        return "EMAIL: Wisp is still syncing mail after launch."
+    if state == "unavailable":
+        return "EMAIL: Mail is unavailable in this launch."
+    window = _mail_window(now)
+    if not window["rows"]:
+        return "EMAIL: " + _empty_mail_coverage(window)
+    text = sender_digest(window["rows"], window["label"],
+                         scanned=window["scanned"], truncated=window["truncated"],
+                         requested=window["requested"],
+                         scan_cap_accounts=window["scan_cap_accounts"],
+                         scan_incomplete_accounts=window["scan_incomplete_accounts"],
+                         scan_skipped=window["scan_skipped"],
+                         scan_attempted=window["scan_attempted"],
+                         layout="flat")   # model input: keep the stable one-line-per-sender form
+    warning = email_freshness_warning()
+    return "EMAIL — " + text + ("\n" + warning if warning else "")
+
+
+# How many of the most-recently-active conversations get a slot in the brief,
+# and how many of that conversation's own lines it gets to bring. Both exist
+# for the same reason: _messages_block used to hand the model 30 raw lines
+# taken newest-first across ALL conversations combined, unsorted by thread. A
+# single busy group chat (e.g. a family group) fills most or all of that
+# window on an active day, so a genuinely separate 1:1 conversation could be
+# down to its actual 2 real lines while sitting in a prompt that looks, in
+# aggregate, like there's plenty of material to work with. Asked for "one line
+# per conversation" against that backdrop, the model reached past what was
+# there and invented a second topic for the thin thread — seen live
+# 2026-08-08: a 2-line exchange that was only "measurements: 21x15x12" /
+# "got it thanks" came back as also having "asked about a code snippet you
+# shared", which appears nowhere in the actual messages. Grouping by
+# conversation FIRST (deterministic, in Python) means the model is handed
+# "Trishe: 2 lines" as a visibly small, complete block instead of 2 lines
+# lost inside a 30-line multi-thread stream — it has no interleaved material
+# left to misread as belonging to Trishe, and nothing to pad with.
+_MAX_CONVERSATIONS = 6
+_MAX_LINES_PER_CONVERSATION = 8
+
+
+def _messages_block() -> str:
+    # render_for_summary, not a plain join: it tags each group message with the
+    # member it is addressed to, so "@Trishe - How is the AI conference going?"
+    # can't be read as the user's conference. See imessage_tools._addressee.
+    from service.tools.imessage_tools import (
+        messages_sync_state, render_for_summary, recent_priority_message_rows)
+    if messages_sync_state() == "syncing":
+        return "MESSAGES: Wisp is still syncing messages after launch."
+    if messages_sync_state() == "unavailable":
+        return "MESSAGES: unavailable in this launch."
+    rows = recent_priority_message_rows()
+    if not rows:
+        return "MESSAGES: no important recent messages requiring attention."
+    recent = rows
+    # _parse_lines returns newest-first, so grouping in this order and taking
+    # the first _MAX_CONVERSATIONS distinct contexts naturally picks the most
+    # recently active conversations — not just the most recent raw lines,
+    # which would silently favor whichever single thread is busiest.
+    groups: dict[str, list[tuple[float, str, str]]] = {}
+    order: list[str] = []
+    for r in recent:
+        ctx = r[1]
+        if ctx not in groups:
+            if len(order) >= _MAX_CONVERSATIONS:
+                continue
+            groups[ctx] = []
+            order.append(ctx)
+        if ctx in groups and len(groups[ctx]) < _MAX_LINES_PER_CONVERSATION:
+            groups[ctx].append(r)
+    blocks = []
+    for ctx in order:
+        group_rows = sorted(groups[ctx], key=lambda r: r[0])  # chronological within the thread
+        rendered = render_for_summary(group_rows)
+        blocks.append(f"CONVERSATION {len(blocks) + 1}: {ctx} "
+                      f"({len(rendered)} message(s)):\n"
+                      + "\n".join(f"- {line}" for line in rendered))
+    # The arrow rule is restated HERE, touching the data, even though
+    # identity.attribution_rules already states it in the system prompt. In the
+    # brief that rule is ~6k characters up, behind _BRIEF_SYS and the profile
+    # block, and it loses: measured 2026-08-07, 6/6 briefs still reported "Mom
+    # sent a warm hello" and "Chetan shared his to-do list" for messages the
+    # USER sent to them — even with the renderer already emitting arrows, which
+    # on its own fixed the standalone message summarizer 12/12. Proximity is
+    # doing real work; the shorter message-summary prompt doesn't need it.
+    from service.memory.identity import user_name
+    me = f"{user_name()} (you)" if user_name() else "you (the user)"
+    return ("MESSAGES (recent iMessage/SMS), GROUPED BY CONVERSATION — each "
+            "block below is one conversation, already separated out for you. "
+            "Each line is `[Sender -> Recipient] text` — the name BEFORE the "
+            f"arrow WROTE it, the name after it RECEIVED it. A line starting "
+            f"`[{me} ->` is the user's OWN outgoing message: never credit it "
+            "to the person it was sent to.\n\n" + "\n\n".join(blocks))
+
+
+# Rebuilt 2026-08-14. The previous version described the output in prose and
+# left the model to infer the shape from it; this one SHOWS the shape as a
+# skeleton and states the rules as a flat checklist. Two reasons:
+#
+#  1. The role moved. Every measurement in this file's older comments was taken
+#     on LFM2.5-2.6B, and the `fast` role is now Agents-A1-4B (qwen3 lineage) —
+#     a model that follows a literal template far more reliably than it follows
+#     a paragraph about one, and that does not need instructions repeated three
+#     ways to comply.
+#  2. Prose rules hide their own violations. "Skip promotional mail" and "use
+#     bullets when there are several items" were both conditionals the model had
+#     to evaluate mid-write. The promotional one is now decided in Python before
+#     the prompt exists (see _email_block), and what's left is stated as rules
+#     that are true or false about the finished text, not judgment calls.
+#
+# What did NOT change: the grounding rules. Those earn their length — each one
+# is a specific hallucination that was observed live, not general caution.
+_BRIEF_SYS = (
+    "You are Wisp, the user's personal assistant, writing their daily brief "
+    "from their calendar and inbox. Write like a thoughtful friend handing them "
+    "the day over coffee: warm, specific, and short.\n"
+    "\n"
+    "Output EXACTLY these two marked sections, in this order. Each marker sits "
+    "alone on its own line, written exactly as shown. Write nothing before the "
+    "first marker and nothing after the last section.\n"
+    "\n"
+    "===TODAY===\n"
+    "<2-4 short lines, PLAIN TEXT, for a phone notification>\n"
+    "\n"
+    "===FULL===\n"
+    "<a warm 1-2 line greeting with one emoji>\n"
+    "\n"
+    "**📅 Today**\n"
+    "<what is on today, or that the day is clear>\n"
+    "\n"
+    "**📧 Worth a look**\n"
+    "<the email that actually matters>\n"
+    "\n"
+    "**🔭 Coming up**\n"
+    "<OPTIONAL, and only for items the material lists under LATER THIS WEEK. "
+    "Skip this section entirely when today already has plenty on it.>\n"
+    "\n"
+    # Angle-bracket slots, never a worked example. A version of the sibling
+    # prompt below shipped with realistic sample content and the model copied it
+    # into the answer as if it were the user's data — see the note in _MSG_SYS.
+    # Nothing in this prompt may be mistakable for material.
+    "Each **bold header** goes on its own line, with its text on the line "
+    "BELOW it — never run a header and its text together on one line.\n"
+    "\n"
+    "IMPORTANT rules for ===TODAY===:\n"
+    "- Plain text ONLY: no markdown, no asterisks, no bullets, no section "
+    "headers, no emoji.\n"
+    "- Line one is the shape of the day: how many things are on, and what the "
+    "next one is.\n"
+    "- Then anything in the inbox that is time-sensitive or waiting on a reply.\n"
+    "- Nothing going on? Say that in one line. Do not pad it.\n"
+    "\n"
+    "IMPORTANT rules for ===FULL===:\n"
+    "- The skeleton's headers are the ONLY headers you may write, spelled "
+    "exactly as shown. Never invent a section of your own — not for automated "
+    "mail, not for anything else. Two or three sections, that is the whole "
+    "brief.\n"
+    "- Two or more items in a section: one '- ' bullet each, one line each, the "
+    "key thing in **bold**. A single item: one or two sentences, no bullet.\n"
+    "- Say what an item actually IS, not that it exists: what the sender wants "
+    "and what it means for the user, not '<sender> — email received'.\n"
+    "- The material marks unread mail with a leading •. That bullet is a label "
+    "for you, not text: never copy a • into the brief. Say 'unread' in words if "
+    "it matters.\n"
+    "- Keep it scannable. A section is at most a few lines; the whole brief is "
+    "well under a screen.\n"
+    "\n"
+    "IMPORTANT — never do these:\n"
+    "- Never write a messages, texts, or iMessage section, and never mention "
+    "their texts at all. A separate, already-written messages summary is "
+    "attached directly after your text; anything you add about messages "
+    "duplicates it with worse attribution.\n"
+    "- Never write a closing line, sign-off, or 'let me know if...' offer. Your "
+    "final line is the end of the email section. The closing is added after the "
+    "messages summary.\n"
+    "- Never repeat the material back verbatim, and never copy a label, header, "
+    "or instruction out of the material into the brief.\n"
+    "- Never write about anything that is not in the material below. No invented "
+    "events, people, subject lines, deadlines, or weather.\n"
+    "\n"
+    "GROUNDING RULE FOR PEOPLE: the identity block above says who the user is "
+    "and how to tell their own mail from everyone else's. A brief is written in "
+    "the second person, so every 'you' you write is a claim about the user "
+    "specifically — only make it when the material actually supports it.\n"
+    "\n"
+    "GROUNDING RULE FOR DATES: the calendar section states today's date and "
+    "splits the items into ON THE CALENDAR TODAY and LATER THIS WEEK, and tags "
+    "every row TODAY / TOMORROW / a weekday. Use those tags verbatim — never "
+    "work out a date yourself. Only rows under ON THE CALENDAR TODAY may be "
+    "described as today's. If that section says nothing is on today, say the "
+    "day is clear; an empty day is a good thing to report, not a gap to fill "
+    "with something from later in the week.\n"
+    "\n"
+    "GROUNDING RULE FOR EMAIL: the inbox section is already filtered to "
+    "meaningful mail from people and important automated notices. OTPs, "
+    "marketing, newsletters, and repeated notifications are absent on purpose; "
+    "never mention their absence or invent them."
+)
+
+# Markers the model is asked to emit; splits its single response into the
+# three pieces above. If the model drops a marker (small local models
+# occasionally do), that section falls back to empty and callers degrade
+# gracefully rather than showing garbled output.
+_MARKERS = ("TODAY", "MESSAGES", "FULL")
+
+
+# Stage one of two is the only writer of the brief's Messages prose; stage two
+# never sees the raw text (see _generate_brief).  It deliberately asks for a
+# digest across the threads rather than one formatted entry per thread: the
+# latter looked like a transcript in the daily brief even when every entry was
+# individually accurate.
+_MSG_SYS = (
+    "You are Wisp, the user's personal assistant, catching them up on their "
+    "recent texts for their daily brief — the way a close friend who scrolled "
+    "through their messages would fill them in, not a machine report.\n"
+    "\n"
+    "Write ONE short integrated digest, two to four natural sentences in one "
+    "paragraph. Combine related threads into the few themes, decisions, plans, "
+    "or open questions that matter. Lead with anything needing the user's reply "
+    "or attention. It is fine to omit a trivial acknowledgement or automated "
+    "alert.\n"
+    "\n"
+    "This is a summary, NOT a conversation-by-conversation recap: do not list "
+    "the conversations, messages, senders, or timestamps; do not write a "
+    "header, bullets, numbering, quotes, or a sign-off. Do not restate messages "
+    "one at a time or copy their wording.\n"
+    "\n"
+    "IMPORTANT rules:\n"
+    "- Synthesize only what the material supports. Do not invent a plan, "
+    "deadline, feeling, person, or detail.\n"
+    "- Keep each conversation's facts in its own block; do not transfer a topic "
+    "or detail between blocks.\n"
+    "- Clearly say who did what. A line is `[Sender -> Recipient] text`: the "
+    "name before the arrow wrote it. If the user sent it, write 'you sent' or "
+    "'you asked', never as if the recipient said it.\n"
+    "- Write directly to the user: call them 'you', never their own name.\n"
+    "- Start with the digest and stop after it."
+    "\n"
+    "GETTING THE DIRECTION RIGHT IS THE WHOLE JOB. Every line says who WROTE it "
+    "and who RECEIVED it: `[Sender -> Recipient] text`. A message the user sent "
+    "is something THEY said — write 'you asked...', 'you sent...', never as "
+    "though the recipient said it.\n"
+    "\n"
+    "WRITE TO THE USER, NOT ABOUT THEM. You are talking to them directly, so "
+    "they are always 'you' and never their own name. The material spells their "
+    "name out on every line they wrote so you can tell it is them — that is a "
+    "label to read, not a name to use. 'You asked if you could bring a friend', "
+    "never '<their name> asked if they could bring a friend'.\n"
+    "\n"
+    "STAY INSIDE THE BLOCK. Summarize each conversation using ONLY the lines in "
+    "its own block. Never pull a topic, question, or detail across from another "
+    "block, and never add one that appears in no block at all. A block with one "
+    "or two short lines gets a one-clause summary of exactly those lines — a "
+    "short exchange is a complete thing to report, not a gap to fill in to "
+    "sound more substantial. If a block is genuinely just 'ok' or 'thanks', say "
+    "that plainly rather than inventing what it replied to.\n"
+    "\n"
+    "The `[Name -> Name]` markers are routing labels for you to READ, not text "
+    "to repeat. Never copy one into your answer — write plain prose about who "
+    "did what.\n"
+    "\n"
+    # Ported from imessage_tools._SYS 2026-08-18. That rule was added for the
+    # standalone summarize_messages tool and measurably helped there — but the
+    # brief runs its OWN prompt over the SAME rendered lines, and never got it.
+    # Measured here before porting, 10 runs of _messages_rundown against the
+    # live Mom block: 4/10 said "Mom sent a stock update", 0/10 got it right.
+    "A GREETING NAMES WHO IT'S FOR, NOT WHO'S SPEAKING. A line like "
+    "'[Adi Jain (you) -> Mom] Hi Mom! Here are today's stock updates...' is "
+    "written BY the name before the arrow, TO the name after it — the "
+    "greeting 'Hi Mom' does not change that, no matter how naturally it reads "
+    "as something Mom would say. Measured failure: this exact line was "
+    "summarized as 'Mom sent a stock update' — flipping an outgoing message "
+    "from the user INTO Mom, because its own opening words happened to name "
+    "her. The arrow, not the wording of the message, is what tells you who "
+    "sent it."
+)
+
+# Emoji for an assembled header. Deliberately only two cases: a group and
+# everything else. The old prompt offered 👩/👨/🧑 for one-to-one chats, which
+# asked the model to guess a stranger's gender off their name — 👤 is the
+# honest version and it costs nothing.
+_GROUP_EMOJI = "👥"
+_PERSON_EMOJI = "👤"
+
+# "1. text" / "1) text" / "[1] text" — the model's entry number. Tolerant on
+# purpose: which of those it picks varies run to run, and the number is the
+# only part that has to be read correctly.
+_ENTRY_RE = re.compile(r"^\s*[\[(]?(\d{1,2})[\])]?[.):]?\s+(.*)$")
+
+
+def _assemble_sections(raw: str, names: list[str]) -> str:
+    """The model's numbered bodies + Python-built headers -> the rundown.
+
+    Pairs each entry with names[n-1]. An entry whose number doesn't match a
+    real block is DROPPED rather than guessed at: a body with no conversation
+    behind it is exactly the "summarized a conversation that isn't there"
+    failure the numbering exists to prevent. Two entries claiming the same
+    number keep the first, which is what _clean_message_sections did for
+    duplicate headers.
+
+    Falls back to `raw` when nothing parses, so a run that ignores the format
+    still shows the user something rather than a blank Messages section.
+    """
+    if not names:
+        return raw.strip()
+    bodies: dict[int, list[str]] = {}
+    current: int | None = None
+    for line in raw.split("\n"):
+        m = _ENTRY_RE.match(line)
+        if m:
+            current = int(m.group(1))
+            if current in bodies:      # duplicate number — keep the first
+                current = None
+                continue
+            bodies[current] = [m.group(2).strip()]
+        elif current is not None and line.strip():
+            bodies[current].append(line.strip())
+    if not bodies:
+        return raw.strip()
+    out = []
+    for n in sorted(bodies):
+        if not 1 <= n <= len(names):
+            continue
+        body = " ".join(x for x in bodies[n] if x).strip()
+        if not body:
+            continue
+        name = names[n - 1]
+        # A bare arrow fragment at the head of the body — "-> Mom You sent a
+        # plain morning check-in…". _ROUTING_ECHO only matches a full
+        # `[A -> B]` marker, so a half-copied one survives it. Seen live
+        # 2026-08-18, roughly one run in ten. Only stripped when what follows
+        # the arrow is this block's OWN name, which is the only shape it takes.
+        body = re.sub(rf"^(?:->|→)\s*{re.escape(name)}\s*", "", body).strip()
+        if not body:
+            continue
+        emoji = _GROUP_EMOJI if name.strip().lower().startswith("group") else _PERSON_EMOJI
+        out.append(f"**{emoji} {name}**\n{body}")
+    # Anything the model flagged as waiting on a reply goes first — the one
+    # ordering decision worth keeping from the old prompt, now applied to the
+    # assembled sections instead of asked for.
+    urgent = [x for x in out if "⏰" in x or "needs a reply" in x.lower()]
+    rest = [x for x in out if x not in urgent]
+    return "\n\n".join(urgent + rest).strip() or raw.strip()
+
+
+# A `[Someone -> Someone]` marker at the head of an output line. The prompt
+# tells the model not to echo these; this is the guarantee it didn't. Seen live
+# 2026-08-07: one run in six emitted the rendered lines back nearly verbatim,
+# markers and all, which reaches the user as visible plumbing.
+_ROUTING_ECHO = re.compile(r"^(\s*[-*]?\s*)\[[^\]\n]{1,120}->[^\]\n]{1,120}\]\s*",
+                           re.MULTILINE)
+
+
+# The unread dot _email_block puts in front of a row. Same category of problem
+# as _ROUTING_ECHO: a marker written for the model to READ that it sometimes
+# copies into the answer, where it reaches the user as "• Arnav M wants to
+# connect" — a stray glyph in the middle of prose, or a bullet character the
+# renderer doesn't treat as a list. Seen 2026-08-14, one run in three, with the
+# rule against it already in _BRIEF_SYS.
+#
+# Rewritten to "- " rather than deleted: at the head of a line the model may
+# well have meant it as a bullet, and normalizing gives a real markdown list
+# either way. Mid-sentence dots are left alone — a • there is the model's own
+# punctuation, not an echo of ours.
+_UNREAD_DOT = re.compile(r"^([ \t]*)(?:[-*][ \t]*)?•[ \t]+", re.MULTILINE)
+
+# Two closely-related failures in the skeleton's bracketed placeholder slots
+# (e.g. "<a warm 1-2 line greeting with one emoji>"), both caught by looking
+# at what's INSIDE the brackets rather than assuming "brackets around short
+# text at the top of a section = the model filled the slot in and forgot to
+# unwrap it":
+#
+# 1. The model fills the slot in but keeps the angle brackets, e.g.
+#    "<Good afternoon ☀️>" instead of "Good afternoon ☀️" — real content, just
+#    needs unwrapping.
+# 2. The model never fills the slot in and instead echoes the INSTRUCTION that
+#    describes it. Seen live 2026-08-15: one run's ===FULL=== opened with
+#    "<2-4 short lines, PLAIN TEXT, for a phone notification>" — the
+#    ===TODAY=== placeholder's text, copied verbatim into the wrong slot —
+#    and a second run put TWO such lines back to back: that same copied
+#    ===TODAY=== placeholder, then "<3 line greeting with one emoji>", a
+#    paraphrase of the real ===FULL=== placeholder rather than a fill-in.
+#    Reproduced against the live engine (scripted repeats of the stage-two
+#    call, busy synthetic calendar/email/messages to lengthen the prompt):
+#    2/20 runs. Debracketing case 2 the same way as case 1 is exactly the old
+#    bug — it made the brackets invisible and left the raw instruction text
+#    sitting at the top of the user's brief.
+#
+# The two are told apart by content: a real greeting never describes its own
+# line count or spells out the word "emoji" (it just uses one), so those
+# markers are treated as proof of a leaked instruction rather than content.
+# Words that only ever appear inside a PROMPT slot, never inside real content.
+# "conversation name" / "next conversation" joined the list 2026-08-18, when
+# _MSG_SYS still asked the model to write its own section headers and it copied
+# the header skeleton through verbatim. That prompt no longer exists — headers
+# are built in Python now (see _assemble_sections) — so these two are belt and
+# braces rather than the live fix they started as. Kept deliberately narrow:
+# each entry has to be something the user's own calendar, mail or texts would
+# never say, because anything looser starts deleting real content.
+_LEAKED_PLACEHOLDER_MARKERS = re.compile(
+    r"\bemoji\b|\bplain text\b|\bphone notification\b|"
+    r"\bconversation name\b|\bnext conversation\b|"
+    r"\d+(?:-\d+)?\s*(?:short\s+)?lines?\b",
+    re.IGNORECASE)
+
+# One bracketed line at the very start of the text — anchored to `\A`, one
+# line, no nested brackets. Deliberately does NOT eat the newline(s) after the
+# `>`: a kept (real-content) bracket needs that blank line preserved between
+# the greeting and the section that follows it, and only a dropped
+# (leaked-instruction) bracket should also take its trailing blank line with it
+# — handled explicitly below rather than baked into the regex.
+_LEADING_BRACKET = re.compile(r"\A[ \t]*<([^\n<>]{1,100})>[ \t]*")
+
+
+def _strip_leading_placeholder_leaks(text: str) -> str:
+    """Drop consecutive leaked-instruction brackets at the start of a section,
+    then unwrap one real bracketed greeting if what's left starts with one.
+    Loops rather than matching once because the live failure produced two
+    leaked lines back to back — stopping after the first left the second
+    sitting in the output."""
+    while True:
+        m = _LEADING_BRACKET.match(text)
+        if not m:
+            return text
+        if _LEAKED_PLACEHOLDER_MARKERS.search(m.group(1)):
+            text = text[m.end():].lstrip("\n")
+            continue
+        return m.group(1) + text[m.end():]
+
+
+# Same leak as _LEADING_BRACKET/case 2 above, but NOT anchored to `\A` — for
+# when the model writes real content FIRST, drops the leaked instruction into
+# the middle, then continues with more real content.
+#
+# MEASURED FAILURE (2026-08-18): ===FULL=== opened with real prose ("Good
+# afternoon. Today is Tuesday, August 18, 2026.") THEN
+# "<2-4 short lines, PLAIN TEXT, for a phone notification>" verbatim, THEN
+# more real content, then the normal **📅 Today** section. The leaked bracket
+# sat well past position 0, so _LEADING_BRACKET's `\A` anchor never saw it —
+# the 2026-08-15 fix only covers a leak that's the very first thing written.
+#
+# No case-1 (unwrap real content) branch here on purpose: a bracket that
+# isn't at the start of the text was never a greeting slot, so a match here is
+# ALWAYS the leaked-instruction case — remove it outright, never keep its
+# contents.
+_ANY_BRACKET = re.compile(r"[ \t]*<([^\n<>]{1,150})>[ \t]*\n?")
+
+
+def _strip_leaked_brackets_anywhere(text: str) -> str:
+    def repl(m: re.Match) -> str:
+        return "" if _LEAKED_PLACEHOLDER_MARKERS.search(m.group(1)) else m.group(0)
+    text = _ANY_BRACKET.sub(repl, text)
+    # A removed bracket can leave a run of 3+ blank lines where it used to
+    # separate two real paragraphs — collapse back to one blank line, same
+    # normalization _split_brief's caller already applies elsewhere.
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+def _strip_prompt_glyphs(text: str) -> str:
+    text = _strip_leading_placeholder_leaks(text)
+    text = _strip_leaked_brackets_anywhere(text)
+    return _UNREAD_DOT.sub(r"\1- ", _ROUTING_ECHO.sub(r"\1", text))
+
+
+# Kept as the old name for the message path and its tests, which only ever had
+# routing markers to worry about.
+def _strip_routing_markers(text: str) -> str:
+    return _ROUTING_ECHO.sub(r"\1", text)
+
+
+# A section header line in _messages_rundown's output — alone on its own line,
+# nothing else on it. Matches BOTH the bold form the prompt asks for and a
+# markdown `#` heading: measured 2026-08-18, the model picks the heading form
+# in roughly half of runs, and while the prompt now names that explicitly, a
+# backstop that only knew about `**bold**` silently did nothing on exactly the
+# runs whose headers were malformed — the ⏰ strip and the duplicate-section
+# drop below both no-oped there.
+_SECTION_HEADER = re.compile(r"^(?:\*\*(.+?)\*\*|#{1,6}\s+(.+?))\s*$")
+
+# A leading run of non-word characters — emoji, punctuation, whitespace — at the
+# front of a header's text, stripped off before comparing two headers by name.
+# ⏰ is included by construction: it's a non-word character, so a header that
+# starts "⏰ Group \"Grad GC\"" and one that starts "👥 Group \"Grad GC\"" both
+# normalize to the same bare name.
+_HEADER_LEADING_SYMBOLS = re.compile(r"^[^\w\"']+")
+
+
+def _clean_message_sections(text: str) -> str:
+    """Backstop for two failure modes _MSG_SYS asks the model not to produce,
+    kept here because asking is not the same as guaranteeing:
+
+    1. ⏰ landing IN a header, e.g. "**⏰ Group "Grad GC"**" — seen live
+       2026-08-14, one run in five, despite the header shape in the prompt
+       showing only a person/group emoji. Deleted wherever it appears on a
+       header line; the rule already sends the model to say 'needs a reply' in
+       the body instead, so nothing is lost.
+    2. The SAME conversation getting two sections — seen the same day, both as
+       an exact repeat of a header string and as a group split into its own
+       section plus a stray section for one member's phone number. Caught by
+       comparing header text with emoji/punctuation stripped off: the second
+       and later sections whose stripped name matches an earlier one are
+       dropped whole, keeping the first (fullest) telling of that conversation.
+
+    Operates on _messages_rundown's raw output, section by section, so a
+    conversation's own prose is never touched — only the header lines and which
+    whole sections survive.
+    """
+    lines = text.split("\n")
+    idxs = [i for i, l in enumerate(lines) if _SECTION_HEADER.match(l.strip())]
+    if not idxs:
+        return text
+    for i in idxs:
+        lines[i] = re.sub(r"⏰\s*", "", lines[i])
+    bounds = [(i, idxs[n + 1] if n + 1 < len(idxs) else len(lines))
+              for n, i in enumerate(idxs)]
+    seen: set[str] = set()
+    out: list[str] = []
+    for start, end in bounds:
+        header = lines[start].strip().strip("*").lstrip("#").strip()
+        name = _HEADER_LEADING_SYMBOLS.sub("", header).strip().lower()
+        if name and name in seen:
+            continue
+        if name:
+            seen.add(name)
+        out.extend(lines[start:end])
+    return "\n".join(out).strip()
+
+
+_USER_FACING_SUMMARY_TIMEOUT_SECONDS = 12.0
+# Ling spends part of this compact completion budget on reasoning.  The remaining
+# space is enough for a short, user-visible summary without the former 4,000-token
+# / server-default request.
+_USER_FACING_SUMMARY_MAX_TOKENS = 512
+_USER_FACING_SUMMARY_MAX_CHARS = 2_800
+
+
+async def _brief_synthesis(system: str, material: str, *, model: str | None = None) -> str:
+    """Run a bounded, user-facing summary request or raise for the fallback."""
+    model = model or role_to_model("fast")
+
+    async def request() -> dict:
+        client = _c()
+        await client.ensure_only(model)
+        return await client.chat(
+            model,
+            [{"role": "system", "content": system},
+             {"role": "user", "content": material}],
+            max_tokens=_USER_FACING_SUMMARY_MAX_TOKENS,
+            temperature=0,
+            **user_facing_summary_kwargs(model),
+        )
+
+    response = await asyncio.wait_for(
+        request(), timeout=_USER_FACING_SUMMARY_TIMEOUT_SECONDS)
+    choice = response["choices"][0]
+    if choice.get("finish_reason") != "stop":
+        raise ValueError("summary response did not complete")
+    content = choice["message"].get("content")
+    if not isinstance(content, str):
+        raise ValueError("summary response did not contain text")
+    content = content.strip()
+    if not content or len(content) > _USER_FACING_SUMMARY_MAX_CHARS:
+        raise ValueError("summary response was empty or oversized")
+    return content
+
+
+async def _messages_rundown(now: float) -> str:
+    """Stage one: a single synthesized digest, from a messages-only prompt.
+
+    Split out because attribution accuracy is a function of prompt length on
+    this model, and the brief's prompt is long. Measured 2026-08-07 against the
+    live engine, on the same rendered lines, scoring whether the user's own
+    outgoing messages were credited to their recipients:
+
+        full brief prompt (system + calendar + email + messages)   ~1/6 clean
+        same, minus the profile block                               2/4 clean
+        messages-only context                                       3/4 clean
+
+    Same model, same data, same renderer — only the surrounding prompt changed.
+    So the messages are summarized alone here, and stage two composes the brief
+    around this text instead of re-deriving attribution from raw lines.
+
+    Returns "" when there's nothing to summarize or the model comes back empty;
+    the caller then gives an explicit unavailable-digest state rather than
+    exposing raw messages as if they were a summary.
+    """
+    block = _messages_block()
+    # Any source-status sentence is deterministic plumbing, not message
+    # material for the model. The plain fallback below renders the matching
+    # user-facing empty/unavailable state without spending a model call or
+    # risking a restored cache being narrated as current.
+    if block.startswith("MESSAGES:"):
+        return ""
+    from service.memory.identity import identity_prompt_block
+    text = await _brief_synthesis(
+        (identity_prompt_block().strip() + "\n\n" + _MSG_SYS).strip(), block)
+    # _strip_prompt_glyphs runs HERE, not only in _generate_brief. That caller
+    # applies it to stage two's `sections` and then immediately overwrites
+    # sections["MESSAGES"] with this rundown and concatenates it into FULL —
+    # so anything this text leaked went straight to the screen unstripped.
+    # That bypass is how the 2026-08-18 "**<emoji> … <conversation name>**"
+    # headers survived a stripper that was already in the codebase and already
+    # matched "emoji". Stripping at the source closes it for both consumers.
+    digest = _message_digest(text)
+    return _message_digest(_strip_prompt_glyphs(_strip_routing_markers(digest).strip()))
+
+
+def _message_digest(text: str) -> str:
+    """Make an imperfect model response read as one digest, never a transcript.
+
+    The prompt asks for a paragraph, but local models occasionally decorate a
+    perfectly good answer with bullets or a heading.  Flattening those cosmetic
+    choices here keeps the daily brief's Messages section a summary instead of
+    a list.  A direct source-line echo is rejected before its routing markers
+    are stripped, so it cannot be mistaken for prose.
+    """
+    # A direct echo of the model-facing source rows is not an imperfect digest;
+    # it is a transcript.  Omit it so the caller can show the honest degraded
+    # state instead.  Test before _strip_routing_markers removes the evidence.
+    if _ROUTING_ECHO.search(text):
+        return ""
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Drop a standalone heading such as "Messages"; the enclosing brief
+        # already supplies that heading.
+        plain = line.strip("*# ").strip().lower().rstrip(":")
+        if plain in {"messages", "message summary", "recent messages"}:
+            continue
+        line = re.sub(r"^(?:[-*•]|\d+[.)])\s+", "", line)
+        lines.append(line)
+    return " ".join(lines).strip()
+
+
+def _split_brief(raw: str, fallback: str) -> dict[str, str]:
+    pattern = "|".join(_MARKERS)
+    parts = re.split(rf"===({pattern})===\s*", raw)
+    sections = {m: t.strip() for m, t in zip(parts[1::2], parts[2::2])}
+    if not sections.get("FULL"):
+        # No ===FULL=== marker, so the whole response becomes the brief. Strip
+        # any OTHER markers it did emit rather than showing them: seen live
+        # 2026-08-07, a run that opened "===TODAY===" and never reached
+        # ===FULL=== put that marker at the top of the user's brief.
+        sections["FULL"] = re.sub(rf"===({pattern})===\s*", "", raw).strip() or fallback
+    return sections
+
+
+def _greeting(now: float) -> str:
+    """"Good morning"/"afternoon"/"evening" for the actual clock time `now`
+    falls in — not the twice-daily `part_of_day` schedule flag ("morning" for
+    the 8am run, "evening" for the 8pm one), which is a fine label for which
+    of the two scheduled pushes this is but was wrongly reused as the greeting
+    itself: pressing the on-demand button at 2pm inherited the scheduler's
+    binary morning/evening split and said "Good evening" hours early."""
+    hour = datetime.fromtimestamp(now).hour
+    return ("Good morning" if hour < 12 else
+            "Good afternoon" if hour < 18 else "Good evening")
+
+
+# ---------------------------------------------------------------------------
+# The rendered brief — what the user actually reads.
+#
+# Every section below is composed HERE, in Python, from the same caches the chat
+# tools read. It deliberately does NOT concatenate those tools' return values,
+# which is what `_generate_brief` used to do and what the brief looked like on
+# 2026-09-08:
+#
+#   "Upcoming (today, 3 item(s)) — each row is tagged relative to today:"
+#   "Calendar events: 0; Wisp/Apple reminders: 3. A calendar event alone is
+#    not a reminder."
+#   "Source excerpts (not inferred outcomes); names, accounts and relative
+#    dates below are quoted from the original messages."
+#
+# Those strings are written FOR A MODEL — they are get_upcoming's and
+# grounded_digest's prompt scaffolding, doing a job (anchoring dates, blocking
+# invented attribution) that matters when a model reads them and is noise when a
+# person does. Three of the brief's four section openings were instructions
+# addressed to something else, every row carried a "[Apple Reminder]" tag, and a
+# reminder titled "send my vaccine report to UCSC.**" opened a stray bold run.
+#
+# Rendering here also removes three tool-level source ensures per press (each of
+# which asks the Swift app for another Mail/Messages read) on top of the single
+# readiness wait `_sections` already does.
+# ---------------------------------------------------------------------------
+
+# `*` and backtick open Markdown runs in the panel's renderer, and titles,
+# subjects and message bodies are written by other people — a stray one in a
+# reminder title bolded the rest of the section.
+_MD_RUN_CHARS = re.compile(r"[*`]+")
+
+
+def _clean(text: object, limit: int = 0) -> str:
+    """A title/subject/body as one Markdown-safe line, optionally truncated."""
+    out = _MD_RUN_CHARS.sub("", " ".join(str(text or "").split())).strip()
+    if limit and len(out) > limit:
+        out = out[:limit - 1].rstrip(" ,.;:-—") + "…"
+    return out
+
+
+def _clock(ts: float, now: float) -> str:
+    """A wall-clock time, marked "Yesterday" when it isn't today's.
+
+    The mail and message windows are the last 24 HOURS, so a bare "10:53 PM"
+    sat in the same list as this morning's rows with nothing to separate them.
+    """
+    when = datetime.fromtimestamp(ts)
+    label = when.strftime("%-I:%M %p")
+    return label if when.date() == datetime.fromtimestamp(now).date() else f"Yesterday {label}"
+
+
+def _account_label(account: object) -> str:
+    """A linked account as a short tag: "adnjain@ucsc.edu" -> "ucsc".
+
+    Shown on every row when more than one account is in play, so the full
+    address would be most of the line.
+    """
+    name = _clean(account, 40)
+    if "@" in name:
+        domain = name.rsplit("@", 1)[1]
+        return domain.rsplit(".", 2)[0] if domain.count(".") > 1 else domain.split(".")[0]
+    return name
+
+
+def _kinds(item: dict) -> set[str]:
+    return {item.get("source") or ""} | set(item.get("duplicate_sources") or [])
+
+
+def _is_reminder(item: dict) -> bool:
+    """A reminder (Apple Reminders or one Wisp added), not a calendar event.
+
+    Checked by source first and `kind` second: the source is authoritative for
+    real rows, and `kind` covers a manually added commitment that never carried
+    one.
+    """
+    return bool(_kinds(item) & {"reminders", "manual"}) or item.get("kind") == "reminder"
+
+
+def _wisp_only_reminder(item: dict) -> bool:
+    sources = _kinds(item)
+    return (_is_reminder(item) and "manual" in sources
+            and not ({"reminders", "calendar"} & sources))
+
+
+def _reminder_title(item: dict, limit: int) -> str:
+    title = _clean(item["title"], limit)
+    if _wisp_only_reminder(item):
+        return title + " [Wisp-only; Apple status unverified]"
+    return title
+
+
+def _agenda(now: float) -> dict:
+    """Today's calendar events and reminders, plus each source's readiness.
+
+    One accessor for both the section the user reads and the notification card,
+    so the two can never disagree about what is on today.
+    """
+    from service.assistant.sync_status import source_status
+    from service.tools.assistant_tools import (
+        _collapse_schedule_rows, _local_day_bounds, _without_holiday_calendars)
+    states = {source: source_status(source) for source in ("calendar", "reminders")}
+    skip = {source for source, state in states.items() if state["state"] == "unavailable"}
+    day_start, day_end = _local_day_bounds(now)
+    today_calendar = assistant_store.calendar_events_overlapping(day_start, day_end)
+    items = _collapse_schedule_rows(
+        today_calendar + assistant_store.upcoming(now=now, days=7))
+    today_items = []
+    for item in items:
+        when_ts = float(item["when_ts"])
+        is_today = (day_start <= when_ts < day_end or
+                    (when_ts < day_start and float(item.get("end_ts") or 0) > day_start))
+        if item.get("source") in skip or not is_today:
+            continue
+        if skip.intersection(item.get("duplicate_sources") or []):
+            # A deduped Wisp winner must not inherit unavailable Apple
+            # provenance in either the Daily section or notification card.
+            item = dict(item)
+            item["duplicate_sources"] = [source for source in
+                                         item.get("duplicate_sources") or []
+                                         if source not in skip]
+            item.pop("duplicate_ids", None)
+        today_items.append(item)
+    items = _without_holiday_calendars(today_items, include_holidays=False)
+    items.sort(key=lambda item: item["when_ts"])
+    return {
+        "events": [item for item in items if not _is_reminder(item)],
+        "reminders": [item for item in items if _is_reminder(item)],
+        "states": states,
+        "show_account": len({item.get("account") for item in items
+                             if item.get("account")}) > 1,
+    }
+
+
+def _agenda_row(item: dict, now: float, *, show_account: bool,
+                day_start: float | None = None) -> str:
+    when = datetime.fromtimestamp(item["when_ts"])
+    delta = item["when_ts"] - now
+    continued_from_prior_day = (
+        day_start is not None
+        and float(item["when_ts"]) < day_start
+        and float(item.get("end_ts") or 0) > day_start
+        and "calendar" in _kinds(item))
+    if item.get("all_day"):
+        clock, rel = "All day", ""
+        if continued_from_prior_day:
+            rel = "continued into today"
+    else:
+        if continued_from_prior_day:
+            clock = f"Started {when.strftime('%a %-I:%M %p')}"
+            rel = "continued into today"
+        elif delta < -300:
+            clock = when.strftime("%-I:%M %p")
+            # "(now)" for something that was due two hours ago is what the old
+            # rows said, and it read as "happening right now".
+            rel = "overdue" if _is_reminder(item) else "earlier today"
+        elif delta < 300:
+            clock = when.strftime("%-I:%M %p")
+            rel = "now"
+        elif delta < 3600:
+            clock = when.strftime("%-I:%M %p")
+            rel = f"in {int(delta // 60)} min"
+        else:
+            clock = when.strftime("%-I:%M %p")
+            hours = delta / 3600
+            rel = f"in {hours:.0f} h" if hours >= 2 else f"in {hours:.1f} h"
+    extras = []
+    if item.get("kind") in ("exam", "assignment"):
+        extras.append("exam" if item["kind"] == "exam" else "due")
+    if item.get("organizer"):
+        extras.append(f"with {_clean(item['organizer'], 40)}")
+    if item.get("location"):
+        extras.append(f"at {_clean(item['location'], 40)}")
+    if show_account and item.get("account"):
+        extras.append(_clean(item["account"], 24))
+    tail = f" ({', '.join(extras)})" if extras else ""
+    title = (_reminder_title(item, 90) if _is_reminder(item)
+             else _clean(item["title"], 90))
+    return (f"- **{clock}** · {title}{tail}"
+            + (f" — {rel}" if rel else ""))
+
+
+def _schedule_section(now: float) -> str:
+    """Calendar events and reminders as two labelled groups.
+
+    Separated structurally rather than by tagging every row "[Apple Reminder]"
+    and appending "A calendar event alone is not a reminder." — the distinction
+    the tool output was spending a sentence on is a heading here.
+    """
+    from service.tools.assistant_tools import _local_day_bounds
+    day_start, _ = _local_day_bounds(now)
+    agenda = _agenda(now)
+    states, show_account = agenda["states"], agenda["show_account"]
+    lines = ["**📅 Today**"]
+    if agenda["events"]:
+        lines += [_agenda_row(item, now, show_account=show_account,
+                              day_start=day_start)
+                  for item in agenda["events"]]
+    elif states["calendar"]["state"] == "syncing":
+        lines.append("- Calendar is still syncing.")
+    elif states["calendar"]["state"] == "unavailable":
+        lines.append("- Calendar couldn't be read — check Wisp's access in Settings.")
+    else:
+        lines.append("- Nothing on your calendar. ✅")
+    blocks = ["\n".join(lines)]
+    if agenda["reminders"]:
+        blocks.append("**✅ Reminders due today**\n"
+                      + "\n".join(_agenda_row(item, now, show_account=show_account,
+                                               day_start=day_start)
+                                  for item in agenda["reminders"]))
+    if states["reminders"]["state"] == "unavailable":
+        blocks.append("**✅ Reminders source**\n- Reminders couldn't be read — check "
+                      "Wisp's access in Settings. Wisp reminders are shown "
+                      "without a confirmed Apple copy; they may still be active.")
+    elif any("reminders" in _kinds(item) for item in agenda["reminders"]):
+        blocks.append("Apple Reminders deletion status is unverified; "
+                      "Recently Deleted status cannot be confirmed here.")
+    return "\n\n".join(blocks)
+
+
+def _mail_split(now: float) -> dict:
+    """Today's header snapshot, retaining coverage and account identity."""
+    from service.tools.email_tools import email_freshness_warning, is_machine_sender
+    from service.assistant.sync_status import source_status
+    window = _mail_window(now)
+    rows = window["rows"]
+    return {
+        "state": source_status("email")["state"],
+        "rows": rows,
+        "people": [r for r in rows if not is_machine_sender(r["sender"])],
+        "automated": [r for r in rows if is_machine_sender(r["sender"])],
+        "show_account": len({r["account"] for r in rows if r["account"]}) > 1,
+        "warning": email_freshness_warning(),
+        "label": window["label"], "scanned": window["scanned"],
+        "truncated": window["truncated"], "requested": window["requested"],
+        "scan_cap_accounts": window["scan_cap_accounts"],
+        "scan_incomplete_accounts": window["scan_incomplete_accounts"],
+        "scan_skipped": window["scan_skipped"],
+        "scan_attempted": window["scan_attempted"],
+    }
+
+
+_MAIL_JOB = re.compile(r"\b(?:jobs?|hiring|hire you|apply now|job alert)\b", re.I)
+_MAIL_NEWS = re.compile(r"nytimes|new york times|substack|devpost|newsletter|digest", re.I)
+_MAIL_REFERENCE = re.compile(
+    r"\b(?:appointment booked|booking confirmed|meeting confirmed|meeting confirmation)\b", re.I)
+_MAIL_SIGNAL = re.compile(
+    r"\b(?:deadlines?|due|extend(?:ed|sion)?|office hours|receipts?|invoices?|"
+    r"account|verif(?:y|ied|ication)|security|password|fraud|"
+    r"payment failed|action required|invitation|rsvp)\b", re.I)
+_MAIL_URGENT = re.compile(
+    r"\b(?:urgent|action required|deadlines?|due|expires?|fraud|suspicious|"
+    r"security alert|payment (?:failed|due)|past due|respond by|reply requested|rsvp)\b", re.I)
+_MAIL_ACTION_REQUEST = re.compile(
+    r"\b(?:review|approve|confirm|submit|sign|verify|respond|reply|complete|"
+    r"approval\s+required)\b", re.I)
+_MAIL_URL = re.compile(r"\b(?:https?://|www\.)[^\s,;]+", re.I)
+_MAIL_OLD_SUBJECT_LABEL = re.compile(r"\b(?:old|prior|previous)\s+subject\s*:\s*", re.I)
+_MAIL_OLD_UNQUOTED = re.compile(r"(?:(?!\b(?:but|however)\b)[^;—.,!?\n])*", re.I)
+_MAIL_OLD_TITLE_LABEL = r"(?:new|current|updated|revised)\s+(?:subject|title)\s*:"
+_MAIL_OLD_CURRENT_TITLE = re.compile(rf"\b{_MAIL_OLD_TITLE_LABEL}", re.I)
+_MAIL_OLD_CURRENT_CONNECTOR = re.compile(
+    r"[.!?;—]\s*|"
+    rf",\s*{_MAIL_OLD_TITLE_LABEL}|"
+    rf"{_MAIL_OLD_TITLE_LABEL}\s*[\"'“‘]", re.I)
+_MAIL_OLD_CONTRAST = re.compile(r"(?:but|however)\b", re.I)
+_MAIL_OLD_HISTORICAL_TAIL = re.compile(
+    r"\s+(?:was|were|is|are|has|have|had|will|would)(?:\s+been)?\s+"
+    r"(?:cancelled|canceled|rescinded|withdrawn|renamed|changed|replaced)\b", re.I)
+_MAIL_CAUSAL_DUE = re.compile(r"\bdue\s+to\b", re.I)
+_MAIL_CHANGE_VERBS = (
+    r"(?:changed|changing|extended|extending|modified|modifying|adjusted|"
+    r"adjusting|revised|revising|moved|moving|postponed|postponing)\b")
+_MAIL_DEADLINE_CHANGE = (
+    r"(?:(?:extensions?|changes?|modifications?|adjustments?|revisions?|"
+    r"updates?|delays?|postponements?)\b|"
+    r"(?:(?:has|have|had|is|are|was|were|will|would)\s+"
+    r"(?:(?:been|be)\s+)?)?" + _MAIL_CHANGE_VERBS + r")")
+# Denying a change to a deadline affirms that the deadline still exists.
+_MAIL_NEGATED_PRIORITY = re.compile(
+    r"\b(?:(?:no|without)\s+(?:further\s+)?action\s+(?:is\s+)?required|"
+    r"action\s+(?:is\s+)?not\s+required|"
+    r"(?:no|without)\s+approval\s+required|"
+    r"approval\s+(?:is\s+)?not\s+required|"
+    r"(?:no|without)\s+(?:upcoming\s+)?deadlines?\s+"
+    r"(?:(?:is|are|was|were)\s+)?due|"
+    r"(?:no|without)\s+(?:upcoming\s+)?deadlines?"
+    rf"(?!\s+{_MAIL_DEADLINE_CHANGE})|"
+    r"(?:deadlines?|due\s+dates?)\s+"
+    r"(?:(?:(?:has|have|had)\s+(?:been\s+)?|(?:is|are|was|were)\s+))?"
+    r"(?:cancelled|canceled|rescinded|withdrawn|"
+    r"no\s+longer\s+(?:appl(?:y|ies)|due|required)|"
+    r"not\s+(?:applicable|due|required))|"
+    r"(?:do\s+not|don['’]t)\s+"
+    r"(?:review|approve|confirm|submit|sign|verify|respond|reply|complete)|"
+    r"no\s+need\s+to\s+"
+    r"(?:review|approve|confirm|submit|sign|verify|respond|reply|complete)|"
+    r"nothing\s+(?:is\s+)?due|"
+    r"(?:is|are|was|were)\s+not\s+due)\b", re.I)
+_MAIL_DEADLINE_CUE = re.compile(r"\b(?:deadlines?|due)\b", re.I)
+_MAIL_ACTION_CUE = re.compile(
+    r"\b(?:action|approval|review|approve|confirm|submit|sign|verify|respond|"
+    r"reply|complete)\b", re.I)
+_MAIL_REPORT_HEAD = re.compile(r"\s*(?:(?:notice|message|subject|title)\b|:)", re.I)
+_MAIL_REPORT_END = re.compile(
+    r"[.;!?\n]|\b(?:but|however|and|while|whereas|yet)\b", re.I)
+_MAIL_CORRECTION = re.compile(
+    r"\b(?:no|not|never|without|cancelled|canceled|rescinded|withdrawn)\b|\w+n['’]t\b", re.I)
+_MAIL_UNCHANGED_DEADLINE = re.compile(
+    rf"no\s+(?:upcoming\s+)?deadlines?\s+{_MAIL_DEADLINE_CHANGE}|"
+    rf"(?:not|never|\w+n['’]t)\s+{_MAIL_CHANGE_VERBS}", re.I)
+_MAIL_NOMINAL_OWNER = re.compile(
+    r"\b(?:the|a|an|your|my|our|their)\s+([a-z]+(?:[- ][a-z]+){0,3}?)\s+"
+    r"(?:now\s+)?(?:has|have|had|is|are|was|were)\b|"
+    r"\bfrom\s+(?:the\s+)?([a-z]+)\b", re.I)
+_MAIL_DENIAL_TARGET = re.compile(r"\b(?:for|to|on|about|regarding)\s+(.+)", re.I)
+_MAIL_DENIED_VERB = re.compile(r"(?:do\s+not|don['’]t)\s+(\w+)", re.I)
+_DAILY_MAIL_SUBJECT_LIMIT = 220
+
+
+def _mail_text_apostrophe(value: str, index: int) -> bool:
+    """Distinguish word/possessive apostrophes from quote delimiters."""
+    if (value[index - 1:index].isalpha() and
+            value[index + 1:index + 2].isalpha()):
+        return True
+    tail = value[index + 1:]
+    return bool(value[index - 1:index].lower() == "s" and
+                re.match(r"\s+\w", tail) and
+                not _MAIL_OLD_HISTORICAL_TAIL.match(tail) and
+                not _MAIL_OLD_CONTRAST.match(tail.lstrip()))
+
+
+def _mail_rank_apostrophe(value: str, index: int) -> bool:
+    """Allow ordinary numeric and quoted-noun possessives in final ranking."""
+    if _mail_text_apostrophe(value, index):
+        return True
+    before, tail = value[index - 1:index], value[index + 1:]
+    return bool((before.isdigit() and tail[:1].isalpha()) or
+                (before.lower() == "s" and re.match(r"\s+['\"“‘]\w", tail)))
+
+
+def _mail_denial_target_matches(quoted: str, denial: str, suffix: str) -> bool:
+    """False requires a different explicit target, not unrecognized syntax."""
+    tail = suffix
+    verb = _MAIL_DENIED_VERB.fullmatch(denial)
+    if verb:
+        action = re.search(r"\b" + re.escape(verb.group(1)) + r"\b", quoted, re.I)
+        if not action:
+            return False
+        quote_target, denied_target = quoted[action.end():], tail
+    else:
+        target = _MAIL_DENIAL_TARGET.search(tail)
+        if not target:
+            return True
+        quote_target_match = _MAIL_DENIAL_TARGET.search(quoted)
+        quote_target = quote_target_match.group(1) if quote_target_match else ""
+        denied_target = target.group(1)
+    ignored = {"a", "an", "the", "your", "my", "our", "their", "its", "his", "her",
+               "now", "today", "tomorrow", "tonight", "this", "next", "again",
+               "week", "month", "year", "term", "semester", "time", "being", "please"}
+    def target_words(text: str) -> list[str]:
+        return [word for word in re.findall(r"[a-z]+", text.lower()) if word not in ignored]
+    denied_words = target_words(denied_target)
+    words = re.findall(r"[a-z]+", denied_target.lower())
+    # Only an explicit nominal target establishes independence. Pronouns,
+    # timing and conditional tails are unresolved references even if their
+    # words differ from the quote ("it anymore", "unless requested").
+    nominal = bool(words and words[0] in {"a", "an", "the", "your", "my", "our", "their"})
+    if not nominal:
+        return True
+    return not denied_words or bool(set(denied_words) & set(target_words(quote_target)))
+
+
+def _mail_distinct_denial(quoted: str, denial: str, suffix: str) -> bool:
+    """Positive evidence that a recognized denial concerns another request."""
+    if not _mail_denial_target_matches(quoted, denial, suffix):
+        return True
+    verb = _MAIL_DENIED_VERB.fullmatch(denial)
+    if verb:
+        return verb.group(1).lower() not in {
+            word.lower() for word in _MAIL_ACTION_CUE.findall(quoted)}
+    if re.search(r"\bapproval\b", denial, re.I):
+        return not re.search(r"\b(?:approve|approval)\b", quoted, re.I)
+    return not (
+        (_MAIL_DEADLINE_CUE.search(quoted) and
+         _MAIL_DEADLINE_CUE.search(denial)) or
+        (_MAIL_ACTION_CUE.search(quoted) and
+         _MAIL_ACTION_CUE.search(denial)))
+
+
+# Nouns that refer back to a quoted notice, its request or its timing. An
+# owner named with one of them is the same or an unknown notice, never
+# independent evidence.
+_MAIL_REFERENCE_WORDS = frozenset({
+    "deadline", "due", "date", "time", "action", "approval", "request",
+    "requirement", "reminder", "notice", "message", "email", "mail", "alert",
+    "notification", "subject", "title", "status", "update", "correction",
+    "document", "form", "file", "event", "item", "task", "it", "this", "that",
+    "one", "same", "above", "earlier", "previous", "prior", "original", "stated"})
+
+
+def _mail_words_overlap(words: list[str], known: set[str] | frozenset[str]) -> bool:
+    """Match exact words, or plural/derived forms sharing a 4+ letter stem."""
+    for word in words:
+        for other in known:
+            if word == other or (
+                    min(len(word), len(other)) >= 4 and
+                    (word.startswith(other) or other.startswith(word))):
+                return True
+    return False
+
+
+def _mail_report_correction_end(quoted: str, following: str) -> int:
+    """Return the end of a disputed report; zero means keep its quoted cue.
+
+    Ranking contract: a quote plus a reported correction is background unless
+    an explicit different owner/target/action establishes independence. SAME
+    and UNKNOWN attribution both lose priority. This is deliberately not an
+    English grammar: punctuation, modifiers and unresolved references cannot
+    promote uncertain text into the five actionable source slots. Scope ends
+    before independent clauses so their current requests keep their own rank.
+    """
+    if not _MAIL_REPORT_HEAD.match(following):
+        return 0
+    boundary = _MAIL_REPORT_END.search(following)
+    end = boundary.start() if boundary else len(following)
+    report = following[:min(end, 512)]
+    corrections = list(_MAIL_CORRECTION.finditer(report))
+    if not corrections:
+        return 0
+    # Reporting punctuation before the correction belongs to this report;
+    # a comma/dash after it starts an independently ranked continuation.
+    continuation = re.search(r"[,—–]|\s-\s", report[corrections[0].end():])
+    if continuation:
+        end = corrections[0].end() + continuation.start()
+        report = following[:end]
+        corrections = list(_MAIL_CORRECTION.finditer(report))
+    quoted_words = set(re.findall(r"[a-z]+", quoted.lower())) | _MAIL_REFERENCE_WORDS
+    for correction in corrections:
+        if (_MAIL_DEADLINE_CUE.search(quoted) and
+                _MAIL_UNCHANGED_DEADLINE.match(report, correction.start())):
+            continue
+        # A named nominal owner is distinct only when absent from the quote.
+        # Deadline/action nouns and pronouns are references, not new owners.
+        denial = next((match for match in _MAIL_NEGATED_PRIORITY.finditer(report)
+                       if match.start() <= correction.start() < match.end()), None)
+        # Any explicit owner before the correction ("the office party is
+        # not happening") can establish independence, whether or not the
+        # correction is a recognized denial; an owner inside the denial
+        # ("the deadline is cancelled") cannot.
+        owners = _MAIL_NOMINAL_OWNER.finditer(report[:correction.start()])
+        if any((owner.group(2) or not denial or owner.end() <= denial.start()) and
+               not _mail_words_overlap(
+                   re.findall(r"[a-z]+", (owner.group(1) or owner.group(2)).lower()),
+                   quoted_words)
+               for owner in owners):
+            continue
+        if denial and _mail_distinct_denial(quoted, denial.group(), report[denial.end():]):
+            continue
+        return end
+    return 0
+
+
+def _mail_clean_current_clauses(subject: str, *, ordinary: bool = False) -> str:
+    """Remove negated cues within each current clause, including quoted cues."""
+    quotes = {'"': '"', "'": "'", "“": "”", "‘": "’"}
+    quote_tokens = set()
+    for opener, closing in quotes.items():
+        tokens, paired = _mail_current_quote_tokens(
+            subject, 0, len(subject) - 1, opener, closing,
+            rank_possessives=ordinary)
+        if ordinary:
+            # A lone quote in an ordinary subject is text, not a reason to
+            # discard its remaining deadline or merge separate clauses.
+            matched, opening = set(), None
+            for position in tokens:
+                if opening is None:
+                    if subject[position] == opener:
+                        opening = position
+                elif position in paired:
+                    matched.update((opening, position))
+                    opening = None
+            tokens = matched
+        quote_tokens.update(tokens)
+    clauses, current, close, quote_start = [], [], None, None
+    skip_until = 0
+    for index, char in enumerate(subject):
+        if index < skip_until:
+            continue
+        if char in "'’" and index not in quote_tokens:
+            current.append(char)
+            continue
+        if close:
+            if char == close:
+                close = None
+                report_end = _mail_report_correction_end(
+                    "".join(current[quote_start:]), subject[index + 1:])
+                if report_end:
+                    current = current[:quote_start]
+                    skip_until = index + 1 + report_end
+                current.append(" ")
+            else:
+                current.append(char)
+            continue
+        if char in ".;—!?\n":
+            clauses.append("".join(current))
+            current = []
+            continue
+        if char in quotes:
+            if ordinary and index not in quote_tokens:
+                current.append(char)
+                continue
+            close, quote_start = quotes[char], len(current)
+            current.append(" ")
+            continue
+        if char in "”’":
+            if not ordinary:
+                break
+        current.append(char)
+    if close and not ordinary:
+        current = current[:quote_start]
+    clauses.append("".join(current))
+    cleaned = []
+    for current_clause in clauses:
+        cleaned.append(_MAIL_CAUSAL_DUE.sub(
+            "", _MAIL_NEGATED_PRIORITY.sub("", current_clause)))
+    return "; ".join(cleaned)
+
+
+def _mail_old_clause_priority(clause: str) -> bool:
+    """Check bounded current clauses with the Daily polarity and tier cues."""
+    current = _mail_clean_current_clauses(clause[:512])
+    return bool(_MAIL_URGENT.search(current) or
+                _MAIL_ACTION_REQUEST.search(current) or
+                _MAIL_SIGNAL.search(current))
+
+
+def _mail_old_request_clause(tail: str) -> bool:
+    """Use Daily priority cues in the current clause after but/however."""
+    clause = tail.lstrip()
+    if clause.startswith(","):
+        clause = clause[1:].lstrip()
+    connector = _MAIL_OLD_CONTRAST.match(clause)
+    return bool(connector and _mail_old_clause_priority(clause[connector.end():]))
+
+
+def _mail_old_current_clause(tail: str) -> bool:
+    """Recognize one independent clause after the historical title or status."""
+    return bool(_MAIL_OLD_CURRENT_CONNECTOR.match(tail.lstrip()) or
+                _mail_old_request_clause(tail))
+
+
+def _mail_old_status_followon(tail: str) -> bool:
+    """Find a current clause after modifiers on a historical status."""
+    if _mail_old_current_clause(tail):
+        return True
+    window = tail[:512]
+    for index, char in enumerate(window):
+        if char in "\"“”‘" or (char in "'’" and not (
+                _mail_text_apostrophe(window, index))):
+            break
+        if _MAIL_OLD_CURRENT_TITLE.match(window, index):
+            return True
+        if char in ".;—!?\n" and _mail_old_clause_priority(window[index + 1:]):
+            return True
+        if ((char == "," or
+             (char.lower() in "bh" and
+              (index == 0 or not window[index - 1].isalnum()))) and
+                _mail_old_request_clause(window[index:])):
+            return True
+    return False
+
+
+def _mail_current_quote_tokens(subject: str, start: int, end: int,
+                               opener: str, close: str, *,
+                               rank_possessives: bool = False) -> tuple[list[int], set[int]]:
+    """Pair current quotes without treating possessive apostrophes as closes."""
+    tokens, possible_possessives = [], []
+    for position in range(start, end + 1):
+        char = subject[position]
+        if char not in (opener, close):
+            continue
+        if char in "'’" and (_mail_rank_apostrophe(subject, position)
+                            if rank_possessives else
+                            _mail_text_apostrophe(subject, position)):
+            if not (subject[position - 1:position].isalpha() and
+                    subject[position + 1:position + 2].isalpha()):
+                possible_possessives.append(position)
+            continue
+        tokens.append(position)
+
+    def pair() -> tuple[set[int], bool, int | None]:
+        paired, opened, nested_opener = set(), False, None
+        for position in tokens:
+            char = subject[position]
+            if opener == close:
+                if opened:
+                    paired.add(position)
+                opened = not opened
+            elif char == opener:
+                if opened and nested_opener is None:
+                    nested_opener = position
+                opened = True
+            elif char == close:
+                if opened:
+                    paired.add(position)
+                opened = False
+        return paired, opened, nested_opener
+
+    paired, opened, nested_opener = pair()
+    while tokens and (opened or nested_opener is not None):
+        # Reinterpret an s-ending close when treating every possible
+        # possessive as text would leave a quote open or nest an opener.
+        limit = nested_opener if nested_opener is not None else end + 1
+        restored = next((position for position in possible_possessives
+                         if tokens[0] < position < limit), None)
+        if restored is None:
+            break
+        possible_possessives.remove(restored)
+        tokens.append(restored)
+        tokens.sort()
+        paired, opened, nested_opener = pair()
+    return tokens, paired
+
+
+def _mail_without_old_subject(subject: str) -> str:
+    """Remove an old title without consuming the request after its closing quote."""
+    parts, cursor = [], 0
+    quotes = {'"': '"', "'": "'", "“": "”", "‘": "’"}
+    for label in _MAIL_OLD_SUBJECT_LABEL.finditer(subject):
+        if label.start() < cursor:
+            continue
+        parts.append(subject[cursor:label.start()])
+        start = label.end()
+        opener = subject[start:start + 1]
+        close = quotes.get(opener)
+        if close:
+            candidates = [i for i in range(start + 1, len(subject)) if subject[i] == close]
+            end = None
+            for index, candidate in enumerate(candidates):
+                later = candidates[index + 1:]
+                tail = subject[candidate + 1:]
+                if (close in ("'", "’") and
+                        subject[candidate - 1].isalpha() and
+                        subject[candidate + 1:candidate + 2].isalpha()):
+                    continue  # Today's: word-internal apostrophe, not a close.
+                historical = _MAIL_OLD_HISTORICAL_TAIL.match(tail)
+                suffix = tail[historical.end():] if historical else tail
+                boundary = (_mail_old_status_followon(suffix) if historical else
+                            _mail_old_current_clause(suffix))
+                possessive = (close in ("'", "’") and
+                              subject[candidate - 1].lower() == "s" and
+                              re.match(r"(?:\s+|,\s*)\w", tail))
+                if possessive:
+                    next_label = _MAIL_OLD_SUBJECT_LABEL.search(subject, candidate + 1)
+                    quote_end = (next_label.start() - 1 if next_label else len(subject) - 1)
+                    quote_tokens, paired_closes = _mail_current_quote_tokens(
+                        subject, candidate + 1, quote_end, opener, close)
+                    later_status = next((other for other in later
+                                         if (next_label is None or other < next_label.start()) and
+                                         _MAIL_OLD_HISTORICAL_TAIL.match(subject[other + 1:])), None)
+                    if (later_status is not None and
+                            not (boundary and later_status in paired_closes)):
+                        continue  # An ambiguous apostrophe still belongs to the old title.
+                if boundary or (historical and not later):
+                    if boundary and possessive and quote_tokens and not paired_closes:
+                        continue
+                    # The remainder is a separate current clause. Its quotes and
+                    # possessives cannot change this historical closing span.
+                    end = candidate + 1
+                    break
+                if historical:
+                    continue
+                if not later:
+                    end = candidate + 1
+                    break
+                if possessive or any(_MAIL_OLD_HISTORICAL_TAIL.match(
+                        subject[other + 1:]) for other in later):
+                    continue
+                end = candidate + 1
+                break
+            # An unmatched old-title quote is ambiguous; suppress its remainder.
+            cursor = end if end is not None else len(subject)
+            continue
+        match = _MAIL_OLD_UNQUOTED.match(subject, start)
+        cursor = match.end() if match else start
+    parts.append(subject[cursor:])
+    return "".join(parts)
+
+
+# Ranking reads at most this much of a subject. Subjects arrive unbounded from
+# the native header parse, and the clause parser grows super-linearly with
+# length: one crafted 16 KB subject stalled the event loop for ~30s per Daily
+# run. Anything past the display limit is never shown anyway.
+_MAIL_PRIORITY_TEXT_LIMIT = 512
+
+
+def _mail_priority_text(subject: str) -> str:
+    """Ignore local negative cues, retaining any separate positive clause."""
+    return _mail_priority_text_bounded(subject[:_MAIL_PRIORITY_TEXT_LIMIT])
+
+
+@functools.lru_cache(maxsize=1024)
+def _mail_priority_text_bounded(subject: str) -> str:
+    # Pure and called several times per row (group rank, in-group rank, bucket
+    # filters, rollup), so each distinct subject is parsed once.
+    subject = _MAIL_URL.sub("", subject)
+    subject = _mail_without_old_subject(subject)
+    return _mail_clean_current_clauses(subject, ordinary=True)
+
+
+def _mail_source(row: dict) -> str:
+    """A short source name, never the full sender address or linked account."""
+    sender = _clean(row.get("sender", ""), 38)
+    address = str(row.get("sender_address", "") or "").lower()
+    if address.endswith("@zybooks.com"):
+        return "zyBooks"
+    if sender and "@" not in sender:
+        return sender
+    domain = address.partition("@")[2]
+    return _clean(domain.split(".")[0], 28) or "Unknown sender"
+
+
+def _mail_bucket(row: dict) -> str:
+    """Classify header text for display; no subject is treated as an instruction."""
+    from service.tools.email_tools import is_machine_sender
+    subject = _mail_priority_text(str(row.get("subject", "") or ""))
+    source = f"{row.get('sender', '')} {row.get('sender_address', '')}"
+    if (_MAIL_URGENT.search(subject) or _MAIL_ACTION_REQUEST.search(subject) or
+            _MAIL_SIGNAL.search(subject)):
+        return "worth"
+    if _MAIL_REFERENCE.search(subject):
+        return "reference"
+    machine = is_machine_sender(source)
+    # A job word in a person's subject ("Hiring committee notes") is not a job
+    # alert; only a job-board source or an automated sender rolls up that way.
+    if _MAIL_JOB.search(source) or (machine and _MAIL_JOB.search(subject)):
+        return "jobs"
+    # Same gate as the job words: a person's "newsletter piece" is not a newsletter.
+    if _MAIL_NEWS.search(source) or (machine and _MAIL_NEWS.search(subject)):
+        return "news"
+    if not machine:
+        return "worth"
+    return "updates"
+
+
+def _mail_subject(subject: str, source: str) -> str:
+    """Quote a complete, bounded header subject without changing its meaning."""
+    subject = _clean(subject)
+    suffix = ": " + source
+    if source and subject[-len(suffix):].casefold() == suffix.casefold():
+        # Compare the exact-length tail: casefolding can change length (ß → ss).
+        subject = subject[:-len(suffix)]
+    if len(subject) > _DAILY_MAIL_SUBJECT_LIMIT:
+        # Arbitrary clipping can hide a decisive clause anywhere in a header.
+        # Show no fragment when the full subject will not fit this view.
+        return "Subject too long to display here (see Mail)"
+    return f"“{subject or '(no subject)'}”"
+
+
+def _mail_rollup(rows: list[dict]) -> str:
+    """One line for lower-priority mail, retaining only source-backed categories."""
+    buckets: dict[str, list[str]] = {"jobs": [], "news": [], "updates": []}
+    for row in rows:
+        kind = _mail_bucket(row)
+        if kind not in buckets:
+            kind = "updates"
+        name = _mail_source(row)
+        if name not in buckets[kind]:
+            buckets[kind].append(name)
+    parts = []
+    for kind, label in (("jobs", "Job alerts"), ("news", "Newsletters and updates"),
+                        ("updates", "Other updates")):
+        names = buckets[kind]
+        if names:
+            shown = ", ".join(names[:3])
+            parts.append(f"{label}: {shown}" + (f" +{len(names) - 3} more" if len(names) > 3 else ""))
+    return "; ".join(parts) + "." if parts else ""
+
+
+def _mail_scan_caveat(mail: dict) -> str:
+    """Short incomplete-scan note naming the affected accounts when known."""
+    names: list[str] = []
+    for name in [*mail["scan_cap_accounts"], *mail["scan_incomplete_accounts"]]:
+        name = _clean(name, 40)
+        if name and name not in names:
+            names.append(name)
+    where = f" for {', '.join(names[:3])}" if names else ""
+    if len(names) > 3:
+        where += f" +{len(names) - 3} more"
+    skipped = mail["scan_skipped"]
+    skip = (f" ({skipped} unreadable header{'s' if skipped != 1 else ''} skipped)"
+            if skipped else "")
+    return f"Mail scan incomplete{where}{skip}; other messages may be missing."
+
+
+def _email_section(now: float) -> str:
+    """A compact Daily Mail view grounded only in synced header subjects."""
+    from service.tools.email_tools import (
+        _MARKETING_SUBJECT, header_importance, is_machine_sender)
+    mail = _mail_split(now)
+    if mail["state"] == "syncing":
+        return "**📧 Inbox**\n- Mail is still syncing; ask again in a moment."
+    if mail["state"] == "unavailable":
+        return "**📧 Inbox**\n- Email couldn't be read in this launch."
+    incomplete = bool(mail["scan_cap_accounts"] or mail["scan_skipped"] or
+                      mail["scan_incomplete_accounts"])
+    caveat = "\n" + _mail_scan_caveat(mail) if incomplete else ""
+    if not mail["rows"]:
+        text = "**📧 Inbox**\n- No messages in the available Mail snapshot."
+        if mail["label"].startswith("recent fallback"):
+            text = "**📧 Inbox**\n- No matching headers in the available Mail snapshot for the last 24 hours."
+        text += caveat
+        return text + ("\n\n" + mail["warning"] if mail["warning"] else "")
+    groups: dict[str, list[dict]] = {}
+    for index, row in enumerate(mail["rows"]):
+        address = str(row.get("sender_address", "") or "").casefold()
+        key = "zybooks.com" if address.endswith("@zybooks.com") else (address or f"unknown:{index}")
+        groups.setdefault(key, []).append(row)
+    newest = max(row["ts"] for row in mail["rows"])
+    def daily_rank(row: dict) -> tuple[int, bool, int, float]:
+        # Broad display signals include routine receipts and account notices.
+        # Keep explicit urgency and action requests ahead of those subjects.
+        # A person's plain message shares the routine-signal tier and wins it:
+        # a receipt or account notice must not push mail from people out of
+        # the five named sources.
+        original_subject = str(row.get("subject", "") or "")
+        subject = _mail_priority_text(original_subject)
+        person = not is_machine_sender(
+            f"{row.get('sender', '')} {row.get('sender_address', '')}")
+        # Generic urgency or action words in promotional mail ("offer expires",
+        # "confirm your subscription") are not requests; a marketing subject
+        # from an automated sender ranks below routine notices.
+        promo = not person and bool(_MARKETING_SUBJECT.search(subject))
+        tier = (0 if promo else
+                3 if _MAIL_URGENT.search(subject) else
+                2 if _MAIL_ACTION_REQUEST.search(subject) else
+                1 if person or _MAIL_SIGNAL.search(subject) else 0)
+        scored_row = row if subject == original_subject else {**row, "subject": subject}
+        return tier, person, header_importance(scored_row, newest_ts=newest), row["ts"]
+    ordered = sorted(groups.values(), key=lambda group: max(daily_rank(row) for row in group),
+                     reverse=True)
+    worth, other, references = [], [], []
+    fallback = mail["label"].startswith("recent fallback")
+    def shown_subject(row: dict, source: str) -> str:
+        subject = _mail_subject(str(row.get("subject", "") or ""), source)
+        if fallback:
+            received = datetime.fromtimestamp(row["ts"]).strftime("%b %-d, %Y at %-I:%M %p")
+            subject += f" (received {received})"
+        return subject
+    for group in ordered:
+        source = _mail_source(group[0])
+        reference_rows = [row for row in group if _mail_bucket(row) == "reference"]
+        for row in sorted(reference_rows, key=lambda item: -item["ts"]):
+            references.append(f"- For reference, {source}: " + shown_subject(row, source))
+        active_rows = [row for row in group if _mail_bucket(row) != "reference"]
+        kinds = {_mail_bucket(row) for row in active_rows}
+        if "worth" in kinds:
+            subjects = []
+            seen_subjects = set()
+            for row in sorted(active_rows, key=daily_rank, reverse=True):
+                raw_subject = _clean(row.get("subject", ""))
+                if raw_subject not in seen_subjects:
+                    seen_subjects.add(raw_subject)
+                    subjects.append(shown_subject(row, source))
+            worth.append((f"- {source}: " + "; ".join(subjects[:2]) +
+                          (f"; +{len(subjects) - 2} more subjects" if len(subjects) > 2 else ""),
+                          not is_machine_sender(
+                              f"{group[0].get('sender', '')} {group[0].get('sender_address', '')}")))
+        else:
+            other.extend(active_rows)
+    count = len(mail["rows"])
+    unread = sum(row.get("unread") is True for row in mail["rows"])
+    unread_label = (f"{unread} unread"
+                    if all(row.get("unread") is not None for row in mail["rows"])
+                    else f"{unread} marked unread")
+    sampled = incomplete or mail["label"].startswith("recent fallback")
+    quantity = f"{count} email{'s' if count != 1 else ''}" + (" shown" if sampled else "")
+    heading = f"**📧 Inbox — {quantity} · {unread_label}{' among them' if sampled else ''}**"
+    sections = [heading]
+    if mail["label"].startswith("recent fallback"):
+        sections.append("No matching headers in the available snapshot for the last 24 hours.")
+    if worth:
+        # Reserve up to two of the five named slots for people: automated mail
+        # that only looks urgent must not hide them behind an unnamed count.
+        picked = list(range(min(5, len(worth))))
+        rest = [i for i in range(5, len(worth)) if worth[i][1]]
+        droppable = [i for i in reversed(picked) if not worth[i][1]]
+        while rest and droppable and sum(worth[i][1] for i in picked) < 2:
+            picked.remove(droppable.pop(0))
+            picked.append(rest.pop(0))
+        picked.sort()
+        sections.append("**Worth a look**\n" + "\n".join(worth[i][0] for i in picked))
+        if len(worth) > len(picked):
+            sections.append(f"{len(worth) - len(picked)} more sources in the available snapshot.")
+    other_lines = references[:2]
+    if len(references) > 2:
+        other_lines.append(f"- {len(references) - 2} more booking confirmations in the available snapshot.")
+    rollup = _mail_rollup(other)
+    if rollup:
+        other_lines.append("- " + rollup)
+    if other_lines:
+        sections.append("**Other mail**\n" + "\n".join(other_lines))
+    text = "\n".join(sections) + caveat
+    if mail["warning"]:
+        text += "\n\n" + mail["warning"]
+    return text
+
+
+# How many conversations the section names, and how many messages each one is
+# counted from. One line PER CONVERSATION, not per message: rendering every
+# recent message put twelve lines in the brief, nine of them one group chat's
+# back-and-forth, and buried the 1:1 that actually wanted an answer. The same
+# imbalance _MAX_CONVERSATIONS documents for the model prompt, in the output.
+_MAX_BRIEF_CONVERSATIONS = 6
+_MAX_MESSAGE_ROWS = 200
+
+
+def _message_rows(now: float, limit: int = 0) -> list[tuple[float, str, str, str]]:
+    """Recent texts as (ts, conversation, speaker, body), newest first.
+
+    Rendered from the cache directly rather than through
+    `imessage_tools.render_for_summary`, whose `[Sender -> Recipient] body` shape
+    and "'you' in this message means X, NOT the user" annotations exist to hold a
+    2.6B model's attribution steady and are not text to show a person.
+    """
+    from service.tools.imessage_tools import recent_priority_message_rows
+    recent = recent_priority_message_rows(now=now)
+    out = []
+    for ts, context, text in (recent[:limit] if limit else recent):
+        sender, sep, body = text.partition(":")
+        sender, body = sender.strip(), (body if sep else text).strip()
+        context = _clean(context, 40)
+        group = context.startswith("Group ")
+        label = context[len("Group "):].strip('"') if group else context
+        if sender == "Me":
+            speaker = "you"
+        elif group or sender.lower() != label.lower():
+            speaker = _clean(sender, 30)
+        else:
+            speaker = ""      # 1:1 incoming — the conversation label IS the sender
+        out.append((ts, label, speaker, _clean(body, 110)))
+    return out
+
+
+def _conversations(now: float) -> list[dict]:
+    """Recent texts grouped by conversation, most recently active first."""
+    grouped: dict[str, dict] = {}
+    for ts, label, speaker, body in _message_rows(now, limit=_MAX_MESSAGE_ROWS):
+        convo = grouped.setdefault(label, {"label": label, "count": 0,
+                                           "ts": ts, "speaker": speaker, "body": body})
+        convo["count"] += 1
+    return list(grouped.values())
+
+
+def _messages_section(now: float) -> str:
+    """One line per conversation: who, how many, and the latest message verbatim.
+
+    Quoted rather than re-narrated, for the reason `_messages_rundown` documents
+    at length: at this model size a written digest reported the user's own
+    outgoing messages as something the other person said. A quote with its
+    speaker named cannot be misattributed.
+    """
+    from service.tools.imessage_tools import messages_sync_state
+    state = messages_sync_state()
+    if state == "syncing":
+        return "- Messages are still syncing; ask again in a moment."
+    if state == "unavailable":
+        return "- Messages couldn't be read in this launch."
+    convos = _conversations(now)
+    if not convos:
+        return "- No important recent messages requiring attention."
+    lines = []
+    for convo in convos[:_MAX_BRIEF_CONVERSATIONS]:
+        count = convo["count"]
+        tally = f"{count} message{'s' if count != 1 else ''}"
+        who = f"{convo['speaker']}: " if convo["speaker"] else ""
+        lines.append(f"- **{convo['label']}** · {tally}, latest "
+                     f"{_clock(convo['ts'], now)} — {who}“{convo['body']}”")
+    if len(convos) > _MAX_BRIEF_CONVERSATIONS:
+        lines.append(f"- …and {len(convos) - _MAX_BRIEF_CONVERSATIONS} other conversation(s).")
+    return "\n".join(lines)
+
+
+def _render_brief(now: float, messages_section: str) -> str:
+    """Greeting + the three sections + the sign-off. The brief's only shape."""
+    when = datetime.fromtimestamp(now)
+    parts = [f"{_greeting(now)} — {when.strftime('%A, %B %-d')}. ☀️",
+             _schedule_section(now),
+             _email_section(now),
+             "**💬 Messages**\n" + (messages_section.strip() or "- Nothing new. ✅"),
+             _CLOSING_LINE]
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _today_card(now: float) -> str:
+    """The "📅 Today" notification body: plain text, a few short lines.
+
+    Built from `_agenda`/`_mail_split` rather than from the brief's Markdown,
+    because a notification renders none of it — the old card carried
+    get_upcoming's raw output, asterisks and "A calendar event alone is not a
+    reminder." included.
+    """
+    agenda = _agenda(now)
+    events, reminders = agenda["events"], agenda["reminders"]
+    counts = []
+    calendar_state = agenda["states"]["calendar"]["state"]
+    if calendar_state == "unavailable":
+        counts.append("Calendar couldn't be read")
+    elif calendar_state == "syncing":
+        counts.append("Calendar is still syncing")
+    elif events:
+        counts.append(f"{len(events)} event{'s' if len(events) != 1 else ''} on your calendar")
+    else:
+        counts.append("nothing on your calendar")
+    if reminders:
+        counts.append(f"{len(reminders)} reminder{'s' if len(reminders) != 1 else ''} due")
+    lines = [f"Today: {', '.join(counts)}."]
+    if agenda["states"]["reminders"]["state"] == "unavailable":
+        lines.append("Reminders couldn't be read; check Wisp's access in Settings.")
+    if any(_wisp_only_reminder(item) for item in reminders):
+        lines.append("Wisp-only reminders: Apple status unverified; "
+                     "they may still be active, so keep them unless you pick one to delete."
+                     if agenda["states"]["reminders"]["state"] != "ready" else
+                     "Wisp-only reminders: Apple status unverified; some may be "
+                     "older Apple mirrors, others live Wisp reminders.")
+    if any("reminders" in _kinds(item) for item in reminders):
+        lines.append("Apple Reminders deletion status is unverified; "
+                     "Recently Deleted status cannot be confirmed here.")
+    upcoming = [item for item in events + reminders if item["when_ts"] >= now]
+    upcoming.sort(key=lambda item: item["when_ts"])
+    if upcoming:
+        nxt = upcoming[0]
+        clock = ("all day" if nxt.get("all_day")
+                 else datetime.fromtimestamp(nxt["when_ts"]).strftime("%-I:%M %p"))
+        title = (_reminder_title(nxt, 60) if _is_reminder(nxt)
+                 else _clean(nxt["title"], 60))
+        lines.append(f"Next: {title} at {clock}.")
+    overdue = [item for item in reminders if item["when_ts"] < now - 300]
+    if overdue:
+        lines.append(f"{len(overdue)} reminder{'s' if len(overdue) != 1 else ''} already past due.")
+    mail = _mail_split(now)
+    if mail["state"] == "ready":
+        people, automated = len(mail["people"]), len(mail["automated"])
+        if (mail["scan_cap_accounts"] or mail["scan_skipped"] or
+                mail["scan_incomplete_accounts"]):
+            lines.append("Mail: scan incomplete; messages may be missing.")
+        elif people or automated:
+            lines.append(f"Mail: {people} from people, {automated} automated.")
+    return "\n".join(lines)
+
+
+def _messages_card(now: float) -> str:
+    """The "💬 Messages" notification body: plain text, a few short lines."""
+    from service.tools.imessage_tools import messages_sync_state
+    if messages_sync_state() != "ready":
+        return ""
+    convos = _conversations(now)
+    if not convos:
+        return ""
+    total = sum(convo["count"] for convo in convos)
+    named = ", ".join(convo["label"] for convo in convos[:4]) + (
+        f", +{len(convos) - 4} more" if len(convos) > 4 else "")
+    lines = [f"{total} recent message{'s' if total != 1 else ''} in {named}."]
+    latest = convos[0]
+    who = f"{latest['speaker']}: " if latest["speaker"] else ""
+    lines.append(f"Latest in {latest['label']} — {who}{latest['body']}")
+    return "\n".join(lines)
+
+
+def _plain_brief(now: float) -> str:
+    """Last-resort brief: the same rendered sections, with the Messages digest
+    stated as unavailable instead of shown.
+
+    Reached when `_generate_brief` itself raises. It shares `_render_brief` with
+    the primary path deliberately — the two used to be separate renderers, and
+    the degraded one was the better-looking of the pair (the primary path was
+    concatenating model-facing tool output, see `_render_brief`'s comment). One
+    renderer means the brief cannot change shape depending on which path
+    produced it.
+    """
+    from service.assistant.sync_status import daily_syncing_message, summary_snapshot
+    snapshot = summary_snapshot()
+    if snapshot["syncing"]:
+        return daily_syncing_message(snapshot)
+    return _render_brief(now, _plain_messages_section(now))
+
+
+_CLOSING_LINE = ("Let me know if you'd like me to dig into any of these or "
+                 "help draft a reply. 🙂")
+
+# A `**💬 Messages**`-style header (or any texts/iMessage wording) that stage
+# two emitted despite being told not to. _BRIEF_SYS forbids it, but a 2.6B
+# model follows a negative instruction imperfectly, and one that slips through
+# would sit right above the real messages section as a duplicate — with the
+# vaguer, unchecked attribution of the two. Cutting from the offending header
+# to the end is safe because the messages section is the LAST thing stage two
+# would write: _BRIEF_SYS orders the sections and forbids a sign-off after.
+_STRAY_MESSAGES_HEADER = re.compile(
+    r"\n[ \t]*(?:\*\*|##+\s*)?[^\n]{0,4}\s*(?:messages?|texts?|imessages?)\b[^\n]{0,40}"
+    r"(?:\*\*|:)?[ \t]*\n.*\Z",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _plain_messages_section(now: float) -> str:
+    """Model-free Messages state for a degraded brief.
+
+    A semantic digest needs the summarizer.  The old fallback exposed every
+    message verbatim, turning a Daily *Summary* into a transcript precisely
+    when the model was unavailable. Keep the fallback friendly and truthful
+    without exposing implementation or degradation status.
+    """
+    from service.tools.imessage_tools import messages_sync_state, recent_priority_message_rows
+    state = messages_sync_state()
+    if state == "syncing":
+        return "- Wisp is still syncing Messages; this section is not ready yet."
+    if state == "unavailable":
+        return "- Messages could not be checked in this launch."
+    recent = recent_priority_message_rows(now=now)
+    if not recent:
+        return "- No important recent messages requiring attention."
+    return "- Your messages are ready whenever you'd like to catch up. 💬"
+
+
+def _assemble_full(body: str, messages_section: str) -> str:
+    """Stage two's calendar+email prose + the messages summary + the sign-off.
+
+    Joined here rather than generated in one pass so the messages section that
+    reaches the user is byte-for-byte the one stage one produced and stage
+    one's short, attribution-focused prompt vouched for. Every version of this
+    that let stage two write or "reuse" that section lost detail or
+    re-attributed it (see _MSG_SYS and _generate_brief).
+    """
+    body = _STRAY_MESSAGES_HEADER.sub("", body.strip()).strip()
+    messages_section = messages_section.strip()
+    # The header is supplied here, not by the model, which keeps the three
+    # brief sections visually parallel and leaves stage one free to write only
+    # the integrated Messages digest.
+    if messages_section:
+        messages_section = f"**💬 Messages**\n\n{messages_section}"
+    parts = [p for p in (body, messages_section) if p]
+    if not parts:
+        return ""
+    return "\n\n".join(["\n\n".join(parts), _CLOSING_LINE])
+
+
+async def _generate_brief(part_of_day: str) -> dict[str, str]:
+    """Render the user-facing brief from grounded, already-synced sections."""
+    now = time.time()
+    return {"TODAY": _today_card(now),
+            "MESSAGES": _messages_card(now),
+            "FULL": _render_brief(now, _messages_section(now))}
+
+
+# One wait for the app's Calendar/Reminders/Mail/Messages reads, in one place.
+# It used to be four: the endpoint ensured, `_sections` ensured again, and then
+# summarize_emails and summarize_messages each ensured their own source from
+# inside `_generate_brief`. Every one of those publishes a sync request the Swift
+# readers answer with a fresh (AppleScript, serialized) read of the same source,
+# so a single press queued several overlapping Mail scans and waited out
+# 8+8+2.5+2.5s of separate deadlines. One longer wait is both faster in practice
+# and far more likely to return a real brief on the first press instead of
+# "try again in a moment".
+_SOURCE_WAIT_S = 20.0
+
+
+async def _sections(part_of_day: str, snapshot: dict | None = None) -> dict[str, str]:
+    """The entry point both callers below go through. NEVER raises, and FULL is
+    never empty.
+
+    Pass `snapshot` when the caller has already awaited `ensure_daily_sources`
+    (the endpoint has, so it can report per-source progress) — that skips the
+    second, duplicate wait.
+
+    The returned dict carries ``READY`` = "1" only when the brief reflects
+    confirmed source data. A hold-back message is a brief the user should see but
+    NOT one the scheduler may count as the day's delivered brief, and telling
+    those apart is what stops the false "your daily summary is ready" pings (see
+    `run_scheduled_brief`).
+
+    It is written this way because of how the failure actually presented. One
+    ValueError deep in _email_block (the mail cache grew an `unread` field and
+    this module still unpacked four) became a 500 from /assistant/daily_summary,
+    which the Swift client turns into a nil result, which the overlay renders as
+    "Couldn't build a summary right now." Neither path surfaced a traceback
+    anywhere the user would look, so a feature that had been dead for days read
+    as a model having an off morning.
+
+    A brief that reaches the user is worth more than a correct exception: the
+    calendar, mail, and messages are all on disk and `_plain_brief` needs no
+    model to render them. So anything thrown below degrades to that instead of to
+    nothing, and the traceback goes to stderr for whoever is debugging.
+    """
+    # Restored caches are intentionally not enough for any Daily Summary
+    # source. Ask the Swift app for current Calendar, Reminders, Mail, and
+    # Messages reads, then name anything still in flight deterministically.
+    try:
+        from service.assistant.sync_status import (
+            daily_syncing_message, ensure_daily_sources)
+        if snapshot is None:
+            snapshot = await ensure_daily_sources(timeout_seconds=_SOURCE_WAIT_S)
+        if snapshot["syncing"]:
+            return {"FULL": daily_syncing_message(snapshot)}
+    except Exception:  # noqa: BLE001 — other brief sources should still work
+        traceback.print_exc()
+    try:
+        from service.tools.email_tools import (
+            email_freshness_warning, with_email_freshness_note)
+        # Captured BEFORE composing: a Mail sync that lands mid-brief must not
+        # remove the caveat that applies to the snapshot the brief was built from.
+        warning = email_freshness_warning()
+        sections = await _generate_brief(part_of_day)
+        if sections.get("FULL", "").strip():
+            # with_email_freshness_note is a no-op when the text already says it,
+            # so the rendered mail section keeps its own inline copy and only the
+            # notification card (which has no section to put it in) gains one.
+            for key in ("FULL", "TODAY"):
+                if sections.get(key, "").strip():
+                    sections[key] = with_email_freshness_note(sections[key], warning)
+            sections["READY"] = "1"
+            return sections
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+    try:
+        return {"FULL": _plain_brief(time.time()), "READY": "1"}
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return {"FULL": ("I couldn't pull your calendar, mail, and messages "
+                         "together just now — try again in a moment.")}
+
+async def build_daily_brief(part_of_day: str = "morning") -> str:
+    """The Daily Summary button's entry point (see _sections). Never raises."""
+    return (await _sections(part_of_day))["FULL"]
+
+
+def brief_without_model() -> str:
+    """The rendered brief, for callers that already know no model is coming —
+    currently the endpoint's engine-down path. Synchronous and never raises."""
+    try:
+        return _plain_brief(time.time())
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return ("Wisp's local model isn't running right now, so I couldn't put "
+                "your brief together. Try again once it's back up.")
+
+
+async def run_scheduled_brief(part_of_day: str) -> bool:
+    """Scheduler entry: compose the brief and push it to the app as a
+    'daily_brief' event carrying the full text plus two notification bodies —
+    one for the schedule, one for messages.
+
+    Returns True only when a REAL brief was queued for acknowledgement, and publishes nothing
+    otherwise. Both halves of that matter. A brief that held back because the
+    launch sync was still running is not the day's brief: publishing it made the
+    app post "Your daily summary is ready in Wisp." over a body that actually
+    said Wisp was still syncing, and the scheduler then marked the day done, so
+    the real brief never followed. Because the backend is a child of Wisp.app and
+    the fired-date used to live only in memory, every relaunch inside the
+    schedule's window repeated that — which is where the run of false "ready"
+    pings came from (see scheduler._maybe_daily_brief for the persisted date).
+    """
+    day = datetime.now().date().isoformat()
+    if assistant_store.event_by_key("daily_brief:" + day):
+        return True
+    sections = await _sections(part_of_day)
+    if not sections.get("READY") or not sections.get("FULL", "").strip():
+        return False
+    from service.assistant.hub import hub
+    from service import diagnostics
+    await hub.publish({
+        "trace_id": diagnostics.current_id(),
+        "type": "daily_brief",
+        "part_of_day": part_of_day,
+        "text": sections["FULL"],
+        "today_summary": sections.get("TODAY", ""),
+        "messages_summary": sections.get("MESSAGES", ""),
+    }, dedupe_key="daily_brief:" + day, target={"type": "brief", "date": day})
+    return True

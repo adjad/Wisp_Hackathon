@@ -1,0 +1,543 @@
+import AppKit
+import Foundation
+import CryptoKit
+
+/// Recovery reservations are synchronous: one monitor tick consumes the pending
+/// launch before any health check or credential read can suspend the manager.
+struct BackendRecoveryState {
+    private(set) var launchedGeneration: String?
+    private(set) var blocked = false
+    private var rejectedGenerations: Set<String> = []
+    private var reservedGeneration: String?
+
+    mutating func observe(_ current: String?) -> Bool {
+        let valid = current.map { $0 == "absent" || BackendCredentials.valid($0) } ?? false
+        let expected = launchedGeneration ?? reservedGeneration
+        if !valid || (expected != nil && expected != current) {
+            quarantine()
+        }
+        return valid && !blocked
+    }
+
+    mutating func quarantine() {
+        if let expected = launchedGeneration ?? reservedGeneration {
+            rejectedGenerations.insert(expected)
+        }
+        blocked = true
+    }
+
+    mutating func reserveRecovery(current: String?, processRunning: Bool, starting: Bool) -> Bool {
+        guard blocked, !processRunning, !starting, let current,
+              BackendCredentials.valid(current), !rejectedGenerations.contains(current) else { return false }
+        launchedGeneration = nil
+        reservedGeneration = current
+        blocked = false
+        return true
+    }
+
+    mutating func didLaunch(generation: String) {
+        launchedGeneration = generation
+        reservedGeneration = nil
+    }
+}
+
+@MainActor
+final class BackendManager {
+    private var monitor: Task<Void, Never>?
+    private var credentialState = BackendRecoveryState()
+    private var starting = false
+    private var lifecycle = UUID()
+    /// A10 WP3 bootstrap seams. Both default to no-ops so this file stays free of
+    /// the browser bridge: AppDelegate supplies them, and they do nothing unless a
+    /// browser is enabled. The variable carries only a socket path, never a secret.
+    var extraEnvironment: () -> [String: String] = { [:] }
+    var didLaunchBackend: (pid_t) -> Void = { _ in }
+    /// Where this manager records, in memory only, which process it launched (see BackendOwnership).
+    var receiptStore = BackendLaunchReceiptStore.shared
+    /// Called once, on the main actor, when something that is not this manager's own
+    /// backend answers on the backend port. AppDelegate shows the conflict alert.
+    var onPortConflict: () -> Void = {}
+
+    private func enforceCredentialState() -> Bool {
+        let allowed = credentialState.observe(try? BackendCredentials.generation())
+        if !allowed, let process, process.isRunning { process.terminate() }
+        return allowed
+    }
+
+    private func startMonitor() {
+        guard monitor == nil else { return }
+        monitor = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard !Task.isCancelled, let self else { return }
+                _ = self.enforceCredentialState()
+                if self.credentialState.reserveRecovery(
+                    current: try? BackendCredentials.generation(),
+                    processRunning: self.process?.isRunning == true, starting: self.starting
+                ) {
+                    self.process = nil
+                    await self.startIfNeeded(freshRecovery: true)
+                }
+            }
+        }
+    }
+    private var process: Process?
+    private var recoveryAlertShown = false
+    /// Set when a program that is not this manager's own backend holds the backend
+    /// port (seen at app startup, or answering /mode with no live child of ours). The
+    /// manager then neither starts a second backend (which would only fail to bind)
+    /// nor treats the stranger's /mode reply as a healthy Wisp.
+    var portConflict = false
+    private let readyURL = URL(string: "http://127.0.0.1:8765/mode")!
+
+    func startIfNeeded() async {
+        await startIfNeeded(freshRecovery: false)
+    }
+
+    /// The directory this manager launches the backend from: the bundled backend in a
+    /// release build. Exposed so ownership of the port can be judged against the same
+    /// location, WITHOUT repeating the developer-checkout path (the release pipeline
+    /// refuses any host path in the shipped binary and neutralises only the one
+    /// fallback in `backendRoot()`).
+    var backendRootPath: String? { backendRoot()?.resolvingSymlinksInPath().path }
+
+    private func startIfNeeded(freshRecovery: Bool) async {
+        guard !portConflict else { return }
+        startMonitor()
+        guard !starting, enforceCredentialState() else { return }
+        starting = true
+        defer { starting = false }
+        let lifecycle = self.lifecycle
+        let healthy = await isHealthy()
+        guard lifecycle == self.lifecycle, enforceCredentialState() else { return }
+        // A reply on the port is ours only from our live child, exactly as recorded.
+        let child = process?.isRunning == true ? process?.processIdentifier : nil
+        switch BackendOwnership.portDecision(healthy: healthy, freshRecovery: freshRecovery, liveChildPID: child,
+                                             receipt: receiptStore.current,
+                                             childFacts: child.flatMap(BackendOwnership.processFacts(pid:))) {
+        case .ownBackendRunning:
+            return
+        case .stranger:
+            reportPortConflict()
+            return
+        case .proceed:
+            break
+        }
+        guard process == nil, let root = backendRoot(), let python = pythonPath(in: root) else {
+            return
+        }
+
+        let proc = Process()
+        proc.executableURL = python
+        proc.currentDirectoryURL = root
+        proc.arguments = [
+            "-m", "uvicorn",
+            "service.main:app",
+            "--host", "127.0.0.1",
+            "--port", "8765",
+        ]
+        let configDigest = Self.configurationDigest()
+        let launchNonce = UUID().uuidString
+        let snapshot: BackendCredentials.Snapshot
+        let credentialPipe = Pipe()
+        defer {
+            try? credentialPipe.fileHandleForReading.close()
+            try? credentialPipe.fileHandleForWriting.close()
+        }
+        do {
+            snapshot = try BackendCredentials.loadForBackend()
+            proc.environment = Self.backendEnvironment(credentials: snapshot.credentials,
+                                                       generation: snapshot.generation)
+            proc.environment?["WISP_CREDENTIAL_PIPE"] = try BackendCredentials.pipeMetadata(credentialPipe)
+            proc.environment?.merge(extraEnvironment()) { _, new in new }
+            // Echoed by /identity; only this launch's receipt carries it.
+            proc.environment?[BackendOwnership.nonceEnvironmentKey] = launchNonce
+            proc.standardInput = credentialPipe
+        } catch {
+            // Re-arm recovery if the marker appeared during the credential read.
+            // Denied/malformed Keychain data remains closed without logging values.
+            if case BackendCredentials.Failure.quarantined = error {
+                credentialState.quarantine()
+            }
+            _ = enforceCredentialState()
+            return
+        }
+
+        let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("moe-backend.log")
+        let logStartOffset = Self.fileSize(at: logURL)
+        if FileManager.default.fileExists(atPath: logURL.path),
+           let handle = try? FileHandle(forWritingTo: logURL) {
+            do {
+                try handle.seekToEnd()
+            } catch {}
+            proc.standardOutput = handle
+            proc.standardError = handle
+        } else if FileManager.default.createFile(atPath: logURL.path, contents: nil),
+                  let handle = try? FileHandle(forWritingTo: logURL) {
+            proc.standardOutput = handle
+            proc.standardError = handle
+        }
+
+        do {
+            guard enforceCredentialState(),
+                  try BackendCredentials.generation() == snapshot.generation else {
+                credentialState.quarantine()
+                _ = enforceCredentialState()
+                return
+            }
+            try proc.run()
+            // Record exactly which process this is before anything can judge the port.
+            // Without that record Wisp could never recognise its own child, so it stops.
+            guard recordLaunchReceipt(pid: proc.processIdentifier, root: root, nonce: launchNonce) else {
+                if proc.isRunning { proc.terminate() }
+                return
+            }
+            // Only this exact child may later connect to the app's bridge socket.
+            didLaunchBackend(proc.processIdentifier)
+            do {
+                try credentialPipe.fileHandleForReading.close()
+                try BackendCredentials.writePipe(credentialPipe, credentials: snapshot.credentials,
+                    generation: snapshot.generation, role: "primary", pid: proc.processIdentifier)
+            } catch {
+                if proc.isRunning { proc.terminate() }
+                return
+            }
+            process = proc
+            credentialState.didLaunch(generation: snapshot.generation)
+            let healthy = await waitUntilHealthy(timeout: 20, process: proc)
+            if healthy { refreshLaunchReceipt(pid: proc.processIdentifier) }
+            if healthy, let configDigest, proc.isRunning, enforceCredentialState() {
+                do {
+                    try Self.publishRuntimeReceipt(generation: snapshot.generation, pid: proc.processIdentifier,
+                                                   configDigest: configDigest)
+                } catch {
+                    credentialState.quarantine()
+                    proc.terminate()
+                }
+            }
+            if !healthy {
+                if !proc.isRunning { process = nil }
+                if let text = Self.logText(at: logURL, after: logStartOffset),
+                   let diagnostic = Self.assistantStoreRecoveryDiagnostic(in: text) {
+                    await presentRecoveryDiagnostic(diagnostic)
+                }
+            }
+        } catch {
+            process = nil
+            if case BackendCredentials.Failure.quarantined = error {
+                credentialState.quarantine()
+            }
+            _ = enforceCredentialState()
+        }
+    }
+
+    /// The receipt names the child by pid, kernel start time and executable path, plus
+    /// the nonce it was given. Held in memory only.
+    private func recordLaunchReceipt(pid: Int32, root: URL, nonce: String) -> Bool {
+        guard let start = BackendOwnership.startTime(pid: pid),
+              let path = PortGuard.executablePath(pid: pid) else { return false }
+        receiptStore.record(.init(pid: pid, start: start, executablePath: path,
+                                  backendRoot: root.resolvingSymlinksInPath().path, nonce: nonce))
+        return true
+    }
+
+    /// A framework Python re-executes itself at startup, which changes the executable
+    /// path the kernel reports but not the pid or start time. The readiness probe is itself
+    /// gated on that path matching, so the path is re-recorded BEFORE every probe, not after
+    /// a healthy answer: for the SAME incarnation only, never for a different process.
+    private func refreshLaunchReceipt(pid: Int32) {
+        _ = Self.refreshReceipt(receiptStore, pid: pid)
+    }
+
+    /// Re-records the executable path for the receipt's own pid and kernel start time and
+    /// nothing else: a different pid, a different start time (a reused pid), unreadable
+    /// facts, a relative path, or no launch recorded all change nothing (fail closed).
+    @discardableResult
+    nonisolated static func refreshReceipt(
+        _ store: BackendLaunchReceiptStore, pid: Int32,
+        start: (Int32) -> BackendOwnership.StartTime? = BackendOwnership.startTime(pid:),
+        path: (Int32) -> String? = PortGuard.executablePath(pid:)
+    ) -> Bool {
+        guard let begun = start(pid), let current = path(pid) else { return false }
+        return store.refreshExecutablePath(pid: pid, start: begun, executablePath: current)
+    }
+
+    /// Something that is not our backend answers on the port: start nothing, signal
+    /// nothing, and report it once. Main-actor isolated, so the flag needs no lock.
+    private func reportPortConflict() {
+        guard !portConflict else { return }
+        portConflict = true
+        onPortConflict()
+    }
+
+    func stop() {
+        guard let process = detachForStop() else { return }
+        if process.isRunning {
+            process.terminate()
+        }
+    }
+
+    /// Quit path: stops the monitor, signals the child this manager spawned, and returns only
+    /// once that child has exited (bounded; see `terminateAndWait`). A relaunch right after
+    /// quit therefore finds the port free instead of a backend still shutting down, which
+    /// would otherwise read as a foreign holder.
+    func stopAndWait(timeout: TimeInterval = 5) async {
+        guard let process = detachForStop() else { return }
+        _ = await Self.terminateAndWait(process, timeout: timeout)
+    }
+
+    private func detachForStop() -> Process? {
+        lifecycle = UUID()
+        monitor?.cancel()
+        monitor = nil
+        credentialState = BackendRecoveryState()
+        let current = process
+        process = nil
+        return current
+    }
+
+    /// SIGTERM, then wait for exit; if the child outlives `timeout`, SIGKILL it and wait
+    /// briefly again. Only ever signals the `Process` object this app spawned (its pid is
+    /// not reused while the object still reports running), never a pid looked up by port.
+    /// Returns true when it left on SIGTERM alone.
+    nonisolated static func terminateAndWait(_ process: Process, timeout: TimeInterval = 5,
+                                             interval: TimeInterval = 0.05) async -> Bool {
+        guard process.isRunning else { return true }
+        process.terminate()
+        let sleep: (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
+        if await waitForExit(timeout: timeout, interval: interval, isRunning: { process.isRunning }, sleep: sleep) {
+            return true
+        }
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        _ = await waitForExit(timeout: 1, interval: interval, isRunning: { process.isRunning }, sleep: sleep)
+        return false
+    }
+
+    /// Polls `isRunning` every `interval` for at most `timeout`; true once it reports false.
+    nonisolated static func waitForExit(timeout: TimeInterval, interval: TimeInterval,
+                                        isRunning: () -> Bool,
+                                        sleep: (TimeInterval) async -> Void) async -> Bool {
+        let polls = max(0, Int((timeout / interval).rounded(.up)))
+        for attempt in 0...polls {
+            if !isRunning() { return true }
+            if attempt < polls { await sleep(interval) }
+        }
+        return false
+    }
+
+    /// Startup judgment of who holds the backend port, tolerant of a previous run's backend
+    /// that is still shutting down. At startup nothing in this process's memory vouches for
+    /// any holder (no child spawned, no receipt), so a conflict is retried for a bounded
+    /// window (`retries` x `interval`, 3 s by default) and is reported only if some holder is
+    /// still there at the end. The holder is never adopted, reclaimed or signalled either way.
+    /// Blocking: run it off the main thread.
+    nonisolated static func settledStartupVerdict(
+        retries: Int = 12, interval: TimeInterval = 0.25,
+        check: () -> PortGuard.Verdict,
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+    ) -> PortGuard.Verdict {
+        var verdict = check()
+        var remaining = retries
+        while case .conflict = verdict, remaining > 0 {
+            sleep(interval)
+            remaining -= 1
+            verdict = check()
+        }
+        return verdict
+    }
+
+    private func waitUntilHealthy(timeout: TimeInterval, process: Process) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            guard enforceCredentialState() else { return false }
+            refreshLaunchReceipt(pid: process.processIdentifier)
+            let healthy = await isHealthy()
+            guard enforceCredentialState() else { return false }
+            if !process.isRunning { return false }
+            if healthy { return true }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return false
+    }
+
+    /// Receipt attests only a fresh owned process, its listener, and unchanged
+    /// overlay bytes. It never attests model health or a different process.
+    nonisolated static func acceptableRuntimeGeneration(_ generation: String) -> Bool {
+        generation == "absent" || BackendCredentials.valid(generation)
+    }
+
+    nonisolated static func listenerPIDs(_ data: Data) -> [Int32]? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        guard !lines.isEmpty else { return [] }
+        let values = lines.compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+        return values.count == lines.count ? values : nil
+    }
+
+    nonisolated static func configurationDigest(home: String = NSHomeDirectory()) -> String? {
+        let path = home + "/.moe/config.yaml"
+        let fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == getuid(), info.st_nlink == 1,
+              info.st_mode & 0o022 == 0, info.st_size >= 0, info.st_size <= 1048576 else { return nil }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        guard let data = try? handle.readToEnd(), data.count == info.st_size else { return nil }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    nonisolated static func publishRuntimeReceipt(generation: String, pid: Int32, configDigest: String) throws {
+        guard acceptableRuntimeGeneration(generation), pid > 0,
+              configurationDigest() == configDigest,
+              try BackendCredentials.generation() == generation else { throw BackendCredentials.Failure.quarantined }
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-nP", "-a", "-iTCP:8765", "-sTCP:LISTEN", "-t"]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let deadline = Date().addingTimeInterval(3)
+        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+        guard !process.isRunning else {
+            process.terminate()
+            throw BackendCredentials.Failure.unavailable
+        }
+        let owners = listenerPIDs(output.fileHandleForReading.readDataToEndOfFile())
+        guard process.terminationStatus == 0, owners == [pid],
+              configurationDigest() == configDigest,
+              try BackendCredentials.generation() == generation else { throw BackendCredentials.Failure.quarantined }
+        let receipt = URL(fileURLWithPath: NSHomeDirectory() + "/.moe/backend-runtime.json")
+        let data = try JSONSerialization.data(withJSONObject: ["schema_version": 1, "generation": generation,
+                "pid": pid, "config_sha256": configDigest], options: [.sortedKeys])
+        var info = stat()
+        if lstat(receipt.path, &info) == 0 {
+            guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(),
+                  info.st_nlink == 1, info.st_mode & 0o7777 == 0o600 else {
+                throw BackendCredentials.Failure.quarantined
+            }
+        } else if errno != ENOENT { throw BackendCredentials.Failure.quarantined }
+        let temporary = receipt.path + "." + UUID().uuidString
+        let fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { throw BackendCredentials.Failure.unavailable }
+        defer { close(fd); unlink(temporary) }
+        let count = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+        guard count == data.count, fsync(fd) == 0,
+              try BackendCredentials.generation() == generation,
+              rename(temporary, receipt.path) == 0 else { throw BackendCredentials.Failure.quarantined }
+    }
+
+    private func isHealthy() async -> Bool {
+        var req = URLRequest(url: readyURL)
+        req.timeoutInterval = 1
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            return (resp as? HTTPURLResponse)?.statusCode == 200
+        } catch {
+            return false
+        }
+    }
+
+    /// Return only the actionable AssistantStore message from a new log
+    /// segment. Tracebacks and unrelated backend failures must never be shown
+    /// as migration instructions.
+    nonisolated static func assistantStoreRecoveryDiagnostic(in logText: String) -> String? {
+        let marker = "AssistantStore startup stopped:"
+        guard let markerRange = logText.range(of: marker, options: .backwards) else {
+            return nil
+        }
+        let suffix = logText[markerRange.lowerBound...]
+        guard let line = suffix.split(whereSeparator: { $0.isNewline }).first else {
+            return nil
+        }
+        return String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Environment for the packaged backend.
+    ///
+    /// Bytecode must be cached outside the bundle: writing .pyc beside the
+    /// packaged sources adds unsealed files to Wisp.app and invalidates its
+    /// code signature on first launch. Caching outside preserves import speed.
+    nonisolated static func backendEnvironment(
+        base: [String: String] = ProcessInfo.processInfo.environment,
+        home: String = NSHomeDirectory(),
+        credentials: [String: String] = [:],
+        generation: String = "absent"
+    ) -> [String: String] {
+        // The bridge endpoint is chosen by the app for each launch; an inherited one is ignored.
+        BackendCredentials.injecting(credentials, into: base.filter {
+            $0.key != "WISP_BROWSER_BRIDGE_CONTROL" && $0.key != BackendOwnership.nonceEnvironmentKey
+        }).merging([
+            "WISP_CREDENTIAL_GENERATION": generation,
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONPYCACHEPREFIX": (home as NSString)
+                .appendingPathComponent(".moe/cache/pycache"),
+        ]) { _, new in new }
+    }
+
+    nonisolated static func fileSize(at url: URL) -> UInt64 {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber else { return 0 }
+        return size.uint64Value
+    }
+
+    nonisolated static func logText(at url: URL, after offset: UInt64) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        do {
+            try handle.seek(toOffset: offset)
+            guard let data = try handle.readToEnd(), !data.isEmpty else { return nil }
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
+    }
+
+    private func presentRecoveryDiagnostic(_ diagnostic: String) async {
+        guard !recoveryAlertShown else { return }
+        recoveryAlertShown = true
+        await MainActor.run {
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Wisp needs help recovering assistant data"
+            alert.informativeText = diagnostic
+            alert.addButton(withTitle: "Copy recovery instructions")
+            alert.addButton(withTitle: "Close")
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(diagnostic, forType: .string)
+            }
+        }
+    }
+
+    private func backendRoot() -> URL? {
+        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("backend"),
+           FileManager.default.fileExists(atPath: bundled.appendingPathComponent("service/main.py").path) {
+            return bundled
+        }
+
+        let devRoot = URL(fileURLWithPath: "/Users/adijain/Desktop/MOE_Project")
+        if FileManager.default.fileExists(atPath: devRoot.appendingPathComponent("service/main.py").path) {
+            return devRoot
+        }
+
+        return nil
+    }
+
+    private func pythonPath(in root: URL) -> URL? {
+        let bundledPython = root.appendingPathComponent(".venv/bin/python")
+        if FileManager.default.fileExists(atPath: bundledPython.path) {
+            return bundledPython
+        }
+
+        let systemPython = URL(fileURLWithPath: "/usr/bin/python3")
+        if FileManager.default.fileExists(atPath: systemPython.path) {
+            return systemPython
+        }
+
+        return nil
+    }
+}

@@ -1,0 +1,3541 @@
+"""Offline route/async/backend regressions for SIM-ROUTE-1..4 and ROUTE19-1..9."""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import AsyncMock, patch
+
+# Import-time service stores must be disposable even when this file is run
+# directly, rather than through the independently isolated simulation runner.
+_scratch = tempfile.TemporaryDirectory(prefix="wisp-routing-imports-")
+os.environ["WISP_HOME"] = _scratch.name
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import service.tools  # noqa: F401
+from service.reminder_intent import (
+    has_alert_time, has_unsupported_alert_clock, reminder_temporal_text, resolve_alert_datetime,
+)
+from service.router import router as R
+from service.assistant.store import AssistantStore
+from service.memory.store import SessionStore
+from service.tasks.compiler import compile_reminder_create, compile_reminder_update, compile_task
+from service.tasks.engine import prepare_task_turn
+from service.tasks.reply_engine import prepare_task_turn_async
+from service.workflows.engine import prepare_news_selector_guard, prepare_turn as prepare_legacy_turn
+from service.workflows.reads import compile_read
+from service.tasks.planner import InvalidTaskPlan, plan_task
+from service.agent import loop
+from service.tools.registry import (
+    EVENT_UPDATE_UNAVAILABLE, REGISTRY, UNAVAILABLE_TOOL_REASONS,
+    classify_tool_outcome, run_tool, tool_schemas,
+)
+from service.tools import assistant_tools
+from service.tools.misc_t1 import wisp_capabilities
+
+
+NOW = datetime(2026, 9, 9, 10)
+CREATION = {"add_reminder", "add_calendar_event", "set_alarm"}
+UPDATE_RECEIPT = (
+    'Cancelled “team meeting”.\nAdded “team meeting” to your calendar for Thu Sep 10 at 3:00 PM. '
+    "(If it doesn't appear, make sure the Wisp app is running and has Calendar access.)")
+
+
+class ScriptedClient:
+    def __init__(self, replies):
+        self.replies = iter(replies)
+        self.requests = []
+
+    async def ensure_only(self, *args, **kwargs):
+        pass
+
+    async def stream_events(self, model, messages, *, tools=None, **kwargs):
+        self.requests.append({"tools": tools, **kwargs})
+        reply = next(self.replies, "What exact time should I use for the reminder?")
+        if isinstance(reply, (tuple, list)):
+            calls = [reply] if isinstance(reply, tuple) else reply
+            message = {"role": "assistant", "content": "", "tool_calls": [{
+                "id": f"call-{len(self.requests)}-{index}", "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments)}}
+                for index, (name, arguments) in enumerate(calls)]}
+        else:
+            message = {"role": "assistant", "content": reply}
+        yield {"kind": "final", "message": message}
+
+
+class RoutingContractTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.enterContext(patch.object(R, "models_config", return_value={
+            "tool_retrieval": {"provider": "lexical"}}))
+        self.enterContext(patch.object(R, "resolve_alert_datetime", side_effect=
+            lambda text: resolve_alert_datetime(text, now=NOW)))
+        self.enterContext(patch.object(loop, "audit"))
+
+    async def test_external_keywords_offer_choices_without_forcing_a_lookup(self):
+        pairs = (
+            ("and how did the stock market move today", "web_search"),
+            ("what are the stock prices for Apple and Microsoft", "get_stock_price"),
+            ("what is the forecast for the stock market", "web_search"),
+            ("what is the weather forecast in London", "get_weather"),
+            ("what is stock market volatility", None),
+            ("explain how weather forecasts work", None),
+        )
+        for prompt, selected in pairs:
+            with self.subTest(prompt=prompt):
+                d = await R.route(prompt)
+                self.assertEqual(d.direct_calls, [])
+                self.assertIsNone(d.force_first_tool)
+                self.assertFalse(d.expect_tool_first)
+                self.assertEqual(d.required_tool_groups, ())
+                if selected:
+                    self.assertIn(selected, d.tool_subset)
+                # Synthetic execution proves that the first call comes from
+                # the model's intent choice, including a tool-free answer.
+                arguments = {
+                    "web_search": {"query": "synthetic market overview"},
+                    "get_stock_price": {"symbols": ["AAPL", "MSFT"]},
+                    "get_weather": {"location": "London"},
+                }
+                replies = ([(selected, arguments[selected]),
+                            "Synthetic answer."] if selected else ["Synthetic explanation."])
+                executed = []
+
+                async def fake_run(tool, args, **kwargs):
+                    executed.append(tool.name)
+                    return "Synthetic result."
+
+                with patch.object(loop, "run_tool", side_effect=fake_run):
+                    await self.run_loop(prompt, replies, approve=True)
+                self.assertEqual(executed, [selected] if selected else [])
+
+    async def test_payload_keywords_do_not_turn_local_content_into_stock_quotes(self):
+        for prompt in ("share my notes with Sam", "find my notes about the stock market"):
+            with self.subTest(prompt=prompt):
+                d = await R.route(prompt)
+                self.assertIn("search_notes", d.tool_subset)
+                self.assertNotIn("get_stock_price", d.tool_subset)
+                self.assertFalse(any("get_stock_price" in g for g in d.required_tool_groups))
+        for prompt in (
+            "send mom my stock report by email",
+            "email Sam how my stocks performed today",
+            "send mom a performance report on my stocks by email",
+        ):
+            with self.subTest(prompt=prompt):
+                d = await R.route(prompt)
+                self.assertIn(frozenset({"get_stock_price"}), d.required_tool_groups)
+
+    async def test_high_confidence_direct_routes_and_no_web_constraints_survive(self):
+        for prompt, expected in (
+            ("what is on the news", [("web_search", {"query": "what is on the news"})]),
+            ("what's my battery level", [("get_battery_status", {})]),
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual((await R.route(prompt)).direct_calls, expected)
+        d = await R.route("explain stock market volatility; do not browse")
+        self.assertEqual(d.direct_calls, [])
+        self.assertFalse(d.needs_tools)
+        self.assertTrue({"web_search", "web_fetch", "http_request"}.issubset(d.forbidden_tools))
+
+    async def test_named_stock_metrics_keep_the_ordered_outbound_source(self):
+        for metric in ("returns on", "performance of", "quotes for", "price movements of"):
+            for subject in (
+                "my portfolio", "my AAPL and MSFT stocks", "AAPL stock",
+                "Apple shares", "my Apple and Microsoft stocks", "BRK.B shares",
+                "my aapl,msft stocks", "Advanced Micro Devices shares",
+            ):
+                prompt = f"email Sam the {metric} {subject} today"
+                with self.subTest(prompt=prompt):
+                    self.assertIsNotNone(R._stock_payload_match(prompt))
+                    self.assertEqual(R._outbound_sources(prompt), ["get_stock_price"])
+                    d = await R.route(prompt)
+                    self.assertEqual(d.tool_subset, ["get_stock_price", "lookup_contact", "send_email"])
+                    self.assertIsNone(d.force_first_tool)
+                    self.assertEqual(d.required_tool_groups, (
+                        frozenset({"get_stock_price"}), frozenset({"lookup_contact"}),
+                        frozenset({"send_email"})))
+                    self.assertEqual(d.direct_calls, [])
+
+    async def test_mixed_stock_exclusion_filters_tool_calls_before_fetch(self):
+        prompts = (
+            ("email Sam the prices of Apple shares, not Microsoft shares", "MSFT"),
+            ("show prices of Apple shares but not Microsoft shares and email Sam", "MSFT"),
+            ("email Sam the prices of Apple shares, not Palantir shares", "Palantir"),
+            ("email Sam the prices of Apple shares, not Palantir shares", "PLTR"),
+            ("email Sam the prices of Apple shares, not palantir shares", "PLTR"),
+            ("email Sam the prices of Apple shares, not palantir", "PLTR"),
+            ("email Sam the prices of Apple shares, not Berkshire Hathaway shares", "BRK.B"),
+            ("email Sam the prices of Apple shares, not Microsoft or Tesla shares", "TSLA"),
+            ("email Sam the prices of Apple shares, not palantir or tesla shares", "PLTR"),
+            ("email Sam the prices of Apple shares, not palantir or tesla shares", "TSLA"),
+            ("email Sam the prices of Apple shares, not palantir, tesla stocks", "PLTR"),
+            ("email Sam the prices of Apple shares, not palantir or rivian", "RIVN"),
+            ("email Sam the prices of Apple shares, exclude Microsoft shares", "MSFT"),
+            ("email Sam the prices of Apple shares, not the Microsoft shares", "MSFT"),
+        )
+        contact = ("lookup_contact", {"name": "Sam"})
+        send = ("send_email", {"to": "sam@example.com", "subject": "Apple price",
+                               "body": "AAPL: 100 USD"})
+        for prompt, excluded in prompts:
+            for proposed in ([excluded], ["AAPL", excluded]):
+                with self.subTest(prompt=prompt, proposed=proposed):
+                    d = await R.route(prompt)
+                    self.assertEqual(d.required_tool_groups, (
+                        frozenset({"get_stock_price"}), frozenset({"lookup_contact"}),
+                        frozenset({"send_email"})))
+                    calls = []
+
+                    async def fake_run(tool, args, **kwargs):
+                        calls.append((tool.name, args))
+                        return {"get_stock_price": "AAPL: 100 USD",
+                                "lookup_contact": "Sam: sam@example.com",
+                                "send_email": "Email sent to sam@example.com."}[tool.name]
+
+                    replies = [("get_stock_price", {"symbols": proposed})]
+                    if proposed == [excluded]:
+                        replies.append(("get_stock_price", {"symbols": ["AAPL"]}))
+                    replies.extend((contact, send, "I emailed Sam the Apple price."))
+                    with patch.object(loop, "run_tool", side_effect=fake_run):
+                        result, _, _ = await self.run_loop(
+                            prompt, replies, approve=True, max_steps=7)
+                    self.assertEqual([name for name, _ in calls],
+                                     ["get_stock_price", "lookup_contact", "send_email"])
+                    self.assertEqual(calls[0][1]["symbols"], ["AAPL"])
+                    self.assertIn("emailed", result)
+
+    async def test_stock_exclusion_survives_channel_clarification(self):
+        first = "send Sam the prices of Apple shares, not Microsoft shares"
+        question = "Would you like me to text or email Sam?"
+        initial = await R.route(first)
+        self.assertTrue(initial.clarify_channel)
+        d = await R.route("email", last_user=first, recent_users=[first],
+                          last_assistant=question, last_tools="get_stock_price,lookup_contact")
+        self.assertIn(first, d.resolved_request)
+        self.assertEqual(d.required_tool_groups, (
+            frozenset({"get_stock_price"}), frozenset({"lookup_contact"}),
+            frozenset({"send_email"})))
+        calls = []
+
+        async def fake_run(tool, args, **kwargs):
+            calls.append((tool.name, args))
+            return {"get_stock_price": "AAPL: 100 USD",
+                    "lookup_contact": "Sam: sam@example.com",
+                    "send_email": "Email sent to sam@example.com."}[tool.name]
+
+        client = ScriptedClient([
+            ("get_stock_price", {"symbols": ["MSFT"]}),
+            ("get_stock_price", {"symbols": ["AAPL"]}),
+            ("lookup_contact", {"name": "Sam"}),
+            ("send_email", {"to": "sam@example.com", "subject": "Apple price",
+                            "body": "AAPL: 100 USD"}),
+            "I emailed Sam the Apple price.",
+        ])
+        messages = [{"role": "user", "content": first},
+                    {"role": "assistant", "content": question},
+                    {"role": "user", "content": d.resolved_request}]
+        with patch.object(loop, "run_tool", side_effect=fake_run):
+            result = await loop.run_agent(
+                client, "fixture-model", messages, AsyncMock(),
+                type("Approver", (), {"confirm": AsyncMock(return_value=True)})(),
+                tools=d.tool_subset, required_tool_groups=d.required_tool_groups,
+                forbidden_tools=d.forbidden_tools,
+                tool_argument_bindings=d.tool_argument_bindings,
+                include_memory_context=False, max_steps=7)
+        self.assertEqual([name for name, _ in calls],
+                         ["get_stock_price", "lookup_contact", "send_email"])
+        self.assertEqual(calls[0][1]["symbols"], ["AAPL"])
+        self.assertIn("emailed", result)
+
+    async def test_unknown_company_exclusion_blocks_possible_ticker_alias(self):
+        for ticker, company in (("PLTR", "palantir"), ("RIVN", "rivian"),
+                                ("AAPL", "Apple Inc")):
+            prompt = f"email Sam the prices of {ticker} shares, not {company} shares"
+            with self.subTest(prompt=prompt):
+                d = await R.route(prompt)
+                self.assertIn(frozenset({"get_stock_price"}), d.required_tool_groups)
+                executed = []
+
+                async def fake_run(tool, args, **kwargs):
+                    executed.append((tool.name, args))
+                    return "Synthetic result."
+
+                with patch.object(loop, "run_tool", side_effect=fake_run):
+                    await self.run_loop(prompt, [
+                        ("get_stock_price", {"symbols": [ticker]}),
+                        ("send_email", {"to": "sam@example.com", "subject": "Prices",
+                                        "body": "Unverified quote"}),
+                        "I could not verify the included quote."],
+                        approve=True, max_steps=3)
+                self.assertEqual(executed, [])
+
+                stock = AsyncMock(return_value="Synthetic quote")
+                with patch.object(REGISTRY["get_stock_price"], "func", stock):
+                    await loop.run_agent(
+                        ScriptedClient(["Please clarify the included ticker."]), "fixture-model",
+                        [{"role": "user", "content": prompt}], AsyncMock(),
+                        type("Approver", (), {"confirm": AsyncMock(return_value=True)})(),
+                        tools=["get_stock_price"],
+                        direct_calls=[("get_stock_price", {"symbols": [ticker]})],
+                        include_memory_context=False, max_steps=1)
+                stock.assert_not_awaited()
+
+    async def test_unknown_ticker_exclusion_blocks_possible_company_alias(self):
+        prompts = (
+            "email Sam the prices of Palantir shares, not PLTR shares",
+            "email Sam the prices of Rivian shares, not RIVN shares",
+            "email Sam the prices of these shares, not PLTR shares",
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                prior = "AAPL and Palantir stock prices" if "these shares" in prompt else None
+                d = await R.route(prompt, last_user=prior,
+                                  recent_users=[prior] if prior else None,
+                                  last_tools="get_stock_price" if prior else None)
+                self.assertIn(frozenset({"get_stock_price"}), d.required_tool_groups)
+                calls = []
+
+                async def fake_run(tool, args, **kwargs):
+                    calls.append((tool.name, args))
+                    return "Synthetic result."
+
+                excluded_name = "Rivian" if "RIVN" in prompt else "Palantir"
+                messages = ([{"role": "user", "content": prior},
+                             {"role": "assistant", "content": "AAPL: 100; Palantir: 20"}]
+                            if prior else []) + [{"role": "user", "content": prompt}]
+                with patch.object(loop, "run_tool", side_effect=fake_run):
+                    await loop.run_agent(
+                        ScriptedClient([("get_stock_price", {"symbols": [excluded_name]}),
+                                        "Please clarify the included stock."]),
+                        "fixture-model", messages, AsyncMock(),
+                        type("Approver", (), {"confirm": AsyncMock(return_value=True)})(),
+                        tools=d.tool_subset, required_tool_groups=d.required_tool_groups,
+                        forbidden_tools=d.forbidden_tools,
+                        include_memory_context=False, max_steps=2)
+                self.assertEqual(calls, [])
+
+                stock = AsyncMock(return_value="Synthetic quote")
+                with patch.object(REGISTRY["get_stock_price"], "func", stock):
+                    await loop.run_agent(
+                        ScriptedClient(["Please clarify the included stock."]),
+                        "fixture-model", messages, AsyncMock(),
+                        type("Approver", (), {"confirm": AsyncMock(return_value=True)})(),
+                        tools=["get_stock_price"],
+                        direct_calls=[("get_stock_price", {"symbols": [excluded_name]})],
+                        include_memory_context=False, max_steps=1)
+                stock.assert_not_awaited()
+
+        # A known positive quote remains available to ground the email.
+        prompt = "email Sam the prices of Apple shares, not PLTR shares"
+        calls = []
+
+        async def safe_run(tool, args, **kwargs):
+            calls.append((tool.name, args))
+            return {"get_stock_price": "AAPL: 100 USD",
+                    "lookup_contact": "Sam: sam@example.com",
+                    "send_email": "Email sent to sam@example.com."}[tool.name]
+
+        with patch.object(loop, "run_tool", side_effect=safe_run):
+            result, _, _ = await self.run_loop(prompt, [
+                ("get_stock_price", {"symbols": ["Palantir"]}),
+                ("get_stock_price", {"symbols": ["AAPL"]}),
+                ("lookup_contact", {"name": "Sam"}),
+                ("send_email", {"to": "sam@example.com", "subject": "Apple price",
+                                "body": "AAPL: 100 USD"}),
+                "I emailed Sam the Apple price."], approve=True, max_steps=7)
+        self.assertEqual([name for name, _ in calls],
+                         ["get_stock_price", "lookup_contact", "send_email"])
+        self.assertEqual(calls[0][1]["symbols"], ["AAPL"])
+        self.assertIn("emailed", result)
+
+    async def test_router_direct_stock_exclusion_cannot_fetch_excluded_symbol(self):
+        cases = (
+            ("show prices of Apple shares but not Microsoft shares", ["AAPL", "MSFT"], ["AAPL"]),
+            ("show prices of Apple shares but not Microsoft shares", ["MSFT"], None),
+            ("show prices of Apple shares but not Palantir shares", ["Palantir"], None),
+            ("show prices of Apple shares but not Palantir shares", ["PLTR"], None),
+            ("show prices of Apple shares but not Palantir shares", ["AAPL", "PLTR"], ["AAPL"]),
+            ("show prices of Apple shares but not Microsoft or Tesla shares", ["TSLA"], None),
+            ("show prices of Apple shares but not palantir or tesla shares", ["PLTR"], None),
+            ("show prices of Apple shares but not palantir or tesla shares", ["TSLA"], None),
+            ("show prices of Apple shares but not palantir", ["PLTR"], None),
+            ("show prices of Apple shares but not palantir or rivian", ["RIVN"], None),
+            ("show prices of my portfolio except Palantir shares", ["AAPL"], None),
+            ("show prices of AAPL shares but not Apple Inc shares", ["AAPL"], None),
+        )
+        for prompt, proposed, expected in cases:
+            with self.subTest(prompt=prompt, proposed=proposed):
+                stock = AsyncMock(return_value="AAPL: 100 USD")
+                with patch.object(REGISTRY["get_stock_price"], "func", stock):
+                    await loop.run_agent(
+                        ScriptedClient(["AAPL: 100 USD"]), "fixture-model",
+                        [{"role": "user", "content": prompt}], AsyncMock(),
+                        type("Approver", (), {"confirm": AsyncMock(return_value=True)})(),
+                        tools=["get_stock_price"],
+                        direct_calls=[("get_stock_price", {"symbols": proposed})],
+                        include_memory_context=False, max_steps=2)
+                if expected is None:
+                    stock.assert_not_awaited()
+                else:
+                    stock.assert_awaited_once()
+                    self.assertEqual(stock.await_args.kwargs["symbols"], expected)
+
+    async def test_audited_stock_metric_requests_reach_router_after_handlers_decline(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="wisp-stock-fallthrough-")))
+        sessions = SessionStore(root / "sessions.db")
+        assistant = AssistantStore(root / "assistant.db")
+        self.addCleanup(sessions._db.close)
+        self.addCleanup(assistant._db.close)
+        for prompt, sources in (
+            ("email Sam the returns on my portfolio today", ["get_stock_price"]),
+            ("email Sam the returns on my AAPL and MSFT stocks today", ["get_stock_price"]),
+            ("email Sam the performance of AAPL stock today", ["get_stock_price"]),
+            ("email Sam the quotes for AAPL stock today", ["get_stock_price"]),
+            ("email Sam the performance of my equities today", ["get_stock_price"]),
+            ("email Sam the latest value of my AAPL stock", ["get_stock_price"]),
+            ("email Sam the returns on my portfolio from my notes", ["search_notes"]),
+            ("email Sam the quotes for my portfolio from my notes", ["search_notes"]),
+            ("email Sam the returns on my portfolio as recorded in my notes", ["search_notes"]),
+            ("email Sam the returns on my portfolio today; don't read anything from my notes",
+             ["get_stock_price"]),
+            ("email Sam the returns on my portfolio today; don’t read anything from my notes",
+             ["get_stock_price"]),
+            ("email Sam the returns on my portfolio today and copy the address from my notes",
+             ["get_stock_price", "search_notes"]),
+            ("email Sam the returns on my portfolio and include the address from my notes",
+             ["get_stock_price", "search_notes"]),
+            ("email Sam the returns on my portfolio; from my notes, copy the address",
+             ["get_stock_price", "search_notes"]),
+            ("email Sam the returns on my portfolio today and save a copy in Notes; include the address from my notes",
+             ["get_stock_price", "search_notes"]),
+            ("email Sam the returns on my portfolio today, not from my notes, and include the address from my notes",
+             ["get_stock_price", "search_notes"]),
+        ):
+            with self.subTest(prompt=prompt):
+                sid = sessions.create_session()
+                self.assertIsNone(prepare_news_selector_guard(sessions, sid, prompt))
+                self.assertIsNone(await prepare_task_turn_async(
+                    sessions, sid, prompt, assistant_store=assistant,
+                    persist=False, allow_native=False))
+                self.assertIsNone(prepare_legacy_turn(sessions, sid, prompt, persist=False))
+                self.assertIsNone(compile_read(prompt))
+                d = await R.route(prompt)
+                self.assertEqual(d.tool_subset, sources + ["lookup_contact", "send_email"])
+                self.assertEqual(d.required_tool_groups, tuple(
+                    frozenset({source}) for source in sources + ["lookup_contact", "send_email"]))
+                self.assertEqual(d.direct_calls, [])
+                self.assertIsNone(d.force_first_tool)
+
+        # A generic "draft a summary" also matches the legacy workflow. It
+        # asks for symbols before routing, so do not pretend this variant has
+        # the same handler fallthrough as the two audit reproductions.
+        prompt = "email Sam the quotes for my portfolio today and draft a summary from my notes"
+        sid = sessions.create_session()
+        self.assertIsNone(prepare_news_selector_guard(sessions, sid, prompt))
+        self.assertIsNone(await prepare_task_turn_async(
+            sessions, sid, prompt, assistant_store=assistant, persist=False, allow_native=False))
+        legacy = prepare_legacy_turn(sessions, sid, prompt, persist=False)
+        self.assertIsNotNone(legacy)
+        self.assertEqual(legacy.plan.status, "waiting_for_symbols")
+        self.assertEqual(legacy.response, "Which stock symbols or company names should I include?")
+        self.assertIsNone(legacy.decision)
+
+    async def test_financial_topics_and_separate_clauses_do_not_require_quotes(self):
+        for prompt in (
+            "email Sam stock market news today",
+            "email Sam the performance of the stock market today",
+            "email Sam an explanation of portfolio return theory",
+            "email Sam performance notes; then research AAPL stock",
+            "email Sam the returns on my notes and then look up AAPL stock",
+            "email Sam the performance of my laptop and summarize my notes about stocks",
+            "email Sam the performance of my laptop and define stocks",
+            "email Sam the value of my laptop and describe equities",
+            "email Sam the value of portfolio theory and describe stocks",
+            "email Sam the returns on my order and describe shares",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(R._stock_payload_match(prompt))
+                self.assertNotIn("get_stock_price", R._outbound_sources(prompt))
+                d = await R.route(prompt)
+                self.assertNotIn(frozenset({"get_stock_price"}), d.required_tool_groups)
+                self.assertFalse(any(name == "get_stock_price" for name, _ in d.direct_calls))
+
+    async def test_financial_notes_source_is_preserved_across_metrics_and_history(self):
+        for payload in (
+            "the returns on my portfolio", "the quotes for AAPL stock",
+            "the performance of my AAPL and MSFT stocks",
+            "share prices of Apple and Microsoft from two weeks ago",
+            "share prices of Snowflake", "share prices of Snowflake and Datadog today",
+        ):
+            for qualifier in ("from my notes", "in my notes", "using my notes",
+                              "according to my notes", "based on my notes",
+                              "using only my notes", "using just my notes",
+                              "only from my notes", "based only on my notes",
+                              "as recorded in my notes"):
+                prompt = f"email Sam {payload} {qualifier}"
+                with self.subTest(prompt=prompt):
+                    d = await R.route(prompt, last_tools="get_stock_price",
+                                      last_user="check AAPL", last_assistant="AAPL: 100 USD")
+                    self.assertEqual(d.tool_subset, ["search_notes", "lookup_contact", "send_email"])
+                    self.assertEqual(d.required_tool_groups, (
+                        frozenset({"search_notes"}), frozenset({"lookup_contact"}),
+                        frozenset({"send_email"})))
+                    self.assertEqual(d.direct_calls, [])
+        d = await R.route(
+            "yes", last_user="email Sam the returns on my portfolio from my notes",
+            last_assistant="Would you like me to send the report?",
+            last_tools="get_stock_price")
+        self.assertEqual(d.tool_subset, ["search_notes", "lookup_contact", "send_email"])
+
+    async def test_financial_sources_belong_to_each_payload(self):
+        cases = (
+            ("email Sam the returns on my portfolio today and save a copy in Notes",
+             ["get_stock_price"]),
+            ('email Sam the returns on my portfolio today and the phrase "from my notes"',
+             ["get_stock_price"]),
+            ("email Sam the returns on my portfolio from my notes and the fresh quotes for AAPL stock today",
+             ["search_notes", "get_stock_price"]),
+            ("email Sam the fresh quotes for AAPL stock today and the returns on my portfolio from my notes",
+             ["get_stock_price", "search_notes"]),
+            ("email Sam the returns on my portfolio today, not from my notes",
+             ["get_stock_price"]),
+            ("email Sam the returns on my portfolio today without using my notes",
+             ["get_stock_price"]),
+            ("email Sam the returns on my portfolio today, not as recorded in my notes",
+             ["get_stock_price"]),
+            ('email Sam the returns on my portfolio today and the phrase "as recorded in my notes"',
+             ["get_stock_price"]),
+            ("email Sam the returns on my portfolio today and read anything from my notes",
+             ["get_stock_price", "search_notes"]),
+            ("email Sam the returns on my portfolio today and omit anything from my notes",
+             ["get_stock_price"]),
+            ("email Sam the returns on my portfolio today and exclude anything from my notes",
+             ["get_stock_price"]),
+            ("email Sam the returns on my portfolio today and save a copy in Notes; not from my notes",
+             ["get_stock_price"]),
+            ("email Sam the returns on my portfolio today, not from my notes; save a copy in Notes",
+             ["get_stock_price"]),
+            ("email Sam the returns on my portfolio today and save a copy in Notes; from my notes, copy the address",
+             ["get_stock_price", "search_notes"]),
+            ("email Sam the returns on my portfolio today, not from my notes; from my notes, copy the address",
+             ["get_stock_price", "search_notes"]),
+            ("from my notes, email Sam the returns on my portfolio", ["search_notes"]),
+            ("using my notes, email Sam the quotes for my portfolio", ["search_notes"]),
+            ("email Sam both the stock prices and returns on my portfolio from my notes",
+             ["search_notes"]),
+            ("from my notes, email Sam the returns on my portfolio; then email Sam the fresh quotes for AAPL stock today",
+             ["search_notes", "get_stock_price"]),
+        )
+        for prompt, sources in cases:
+            with self.subTest(prompt=prompt):
+                d = await R.route(prompt)
+                self.assertEqual(d.tool_subset, sources + ["lookup_contact", "send_email"])
+                self.assertEqual(d.required_tool_groups, tuple(
+                    frozenset({source}) for source in sources + ["lookup_contact", "send_email"]))
+                self.assertEqual(d.direct_calls, [])
+        draft = await R.route(
+            "email Sam the quotes for my portfolio today and draft a summary from my notes")
+        self.assertEqual(draft.tool_subset,
+                         ["get_stock_price", "search_notes", "lookup_contact", "draft_email"])
+        self.assertEqual(draft.required_tool_groups[:2],
+                         (frozenset({"get_stock_price"}), frozenset({"search_notes"})))
+        literal = await R.route('email Sam saying "returns on my portfolio today"')
+        self.assertFalse(any({"get_stock_price", "search_notes"} & group
+                             for group in literal.required_tool_groups))
+
+        # The existing public-current classifier uses web_search for a pure
+        # "current quotes" request. Preserve that source as well as the
+        # quote-tool route, without inheriting an unrelated Notes qualifier.
+        for freshness, current_source in (("fresh", "get_stock_price"),
+                                          ("current", "web_search"),
+                                          ("live", "get_stock_price")):
+            for prompt, sources in (
+                (f"email Sam the {freshness} quotes for AAPL stock today", [current_source]),
+                (f"email Sam the {freshness} quotes for AAPL stock today and copy the address from my notes",
+                 ["get_stock_price", "search_notes"]),
+                (f"from my notes, email Sam the returns on my portfolio and the {freshness} quotes for AAPL stock today",
+                 ["search_notes", "get_stock_price"]),
+            ):
+                with self.subTest(prompt=prompt):
+                    d = await R.route(prompt)
+                    self.assertEqual(d.tool_subset, sources + ["lookup_contact", "send_email"])
+                    self.assertEqual(d.required_tool_groups, tuple(
+                        frozenset({source}) for source in sources + ["lookup_contact", "send_email"]))
+
+    async def test_excluded_financial_notes_source_clarifies_without_reading_or_sending(self):
+        for denial in ("do not read my notes", "don't use my notes", "never search my notes",
+                       "do not read anything from my notes", "don't read anything from my notes",
+                       "don’t read anything from my notes"):
+            prompt = f"email Sam the returns on my portfolio from my notes; {denial}"
+            with self.subTest(prompt=prompt):
+                d = await R.route(prompt)
+                self.assertFalse(d.needs_tools)
+                self.assertTrue(d.clarify_target)
+                self.assertEqual(d.tool_subset, [])
+                self.assertEqual(d.required_tool_groups, ())
+                self.assertEqual(d.direct_calls, [])
+                self.assertTrue({"search_notes", "get_stock_price", "send_email"}.issubset(d.forbidden_tools))
+                execute = AsyncMock(side_effect=AssertionError("conflicting source must not execute"))
+                with patch.object(loop, "run_tool", execute):
+                    await self.run_loop(prompt, [
+                        ("search_notes", {"query": "portfolio"}),
+                        ("send_email", {"to": "sam@example.com", "subject": "Portfolio", "body": "Report"}),
+                        "Please clarify the permitted source."])
+                execute.assert_not_awaited()
+
+    async def test_financial_notes_denial_is_independent_of_apostrophe_typography(self):
+        for apostrophe in ("'", "’", "‘", "ʼ", "＇"):
+            denial = f"don{apostrophe}t read anything from my notes"
+            for payload, expected in (("today", ["get_stock_price", "lookup_contact", "send_email"]),
+                                      ("as recorded in my notes", [])):
+                prompt = f"email Sam the returns on my portfolio {payload}; {denial}"
+                with self.subTest(prompt=prompt):
+                    d = await R.route(prompt)
+                    self.assertEqual(d.tool_subset, expected)
+                    self.assertFalse(any("search_notes" in group for group in d.required_tool_groups))
+                    self.assertFalse(any(name == "search_notes" for name, _ in d.direct_calls))
+                    execute = AsyncMock(side_effect=AssertionError("denied Notes read must not execute"))
+                    with patch.object(loop, "run_tool", execute):
+                        await self.run_loop(prompt, [
+                            ("search_notes", {"query": "portfolio"}),
+                            "Please clarify the permitted source."], max_steps=2)
+                    execute.assert_not_awaited()
+
+    async def test_unresolved_positive_financial_notes_source_clarifies_before_effects(self):
+        for prompt in (
+            "email Sam the returns on my portfolio as detailed in my notes",
+            "email Sam the returns on my portfolio as documented in my notes",
+            "email Sam the returns on my portfolio with reference to the figures from my notes",
+            "using the figures from my notes, email Sam the returns on my portfolio",
+            "include the address from my notes; email Sam the returns on my portfolio today",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(R._outbound_sources(prompt, last_tools="get_stock_price"), [])
+                self.assertEqual(R._stock_payload_sources(prompt), [])
+                d = await R.route(prompt, last_tools="get_stock_price")
+                self.assertTrue(d.clarify_target)
+                self.assertFalse(d.needs_tools)
+                self.assertEqual(d.tool_subset, [])
+                self.assertEqual(d.required_tool_groups, ())
+                self.assertEqual(d.direct_calls, [])
+                execute = AsyncMock(side_effect=AssertionError("unresolved source must not execute"))
+                with patch.object(loop, "run_tool", execute):
+                    await self.run_loop(prompt, [
+                        ("get_stock_price", {"symbols": ["AAPL"]}),
+                        ("search_notes", {"query": "portfolio"}),
+                        ("send_email", {"to": "sam@example.com", "subject": "Portfolio", "body": "Report"}),
+                        "Which content should come from Notes?"], approve=True)
+                execute.assert_not_awaited()
+                # An unresolved source remains the current outbound request;
+                # an older successful quote task must not replace it on yes.
+                continued = await R.route(
+                    "yes", last_user=prompt,
+                    recent_users=["email Sam the returns on my portfolio today", prompt],
+                    last_assistant="Should I send it?", last_tools="get_stock_price")
+                self.assertFalse(continued.tool_subset)
+                self.assertFalse(continued.needs_tools)
+
+    async def test_financial_notes_report_cannot_send_from_quotes_alone(self):
+        for metric, qualifier in (("returns on", "from my notes"),
+                                  ("quotes for", "from my notes"),
+                                  ("returns on", "as recorded in my notes"),
+                                  ("quotes for", "as recorded in my notes")):
+            prompt = f"email Sam the {metric} my portfolio {qualifier}"
+            with self.subTest(prompt=prompt):
+                executed = []
+
+                async def fake_run(tool, args, **kwargs):
+                    executed.append(tool.name)
+                    return {
+                        "search_notes": "Portfolio note: recorded return was 5%.",
+                        "lookup_contact": "Sam: sam@example.com",
+                        "send_email": "Email sent to sam@example.com.",
+                    }.get(tool.name, "AAPL: 100 USD")
+
+                contact = ("lookup_contact", {"name": "Sam"})
+                send = ("send_email", {"to": "sam@example.com", "subject": "Portfolio",
+                                       "body": "Recorded return was 5%."})
+                claim = "I sent your portfolio report."
+                with patch.object(loop, "run_tool", side_effect=fake_run):
+                    result, _, approver = await self.run_loop(prompt, [
+                        ("get_stock_price", {"symbols": ["AAPL"]}), contact, send, claim],
+                        approve=True)
+                self.assertNotEqual(result, claim)
+                self.assertNotIn("get_stock_price", executed)
+                self.assertNotIn("send_email", executed)
+                approver.confirm.assert_not_awaited()
+
+                executed.clear()
+                with patch.object(loop, "run_tool", side_effect=fake_run):
+                    await self.run_loop(prompt, [
+                        ("search_notes", {"query": "portfolio"}), contact, send, claim],
+                        approve=True)
+                self.assertEqual(executed, ["search_notes", "lookup_contact", "send_email"])
+
+    async def test_market_read_does_not_reuse_portfolio_symbols(self):
+        history = {
+            "last_user": "AAPL and MSFT",
+            "last_tools": "get_stock_price",
+            "last_stock_response": "AAPL: 100 USD\nMSFT: 200 USD",
+        }
+        for prompt in (
+            "and how did the stock market move today",
+            "what is stock market volatility",
+            "what is the forecast for the stock market",
+            "what is stock volatility",
+            "explain portfolio theory",
+            "how did the stock markets move today",
+            "what is a stock price",
+            "what is the stock price forecast",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(compile_read(prompt, **history))
+                d = await R.route(prompt, last_user=history["last_user"],
+                                  last_tools=history["last_tools"],
+                                  last_assistant=history["last_stock_response"])
+                expected = ([("web_search", {"query": prompt})]
+                            if prompt == "how did the stock markets move today" else [])
+                self.assertEqual(d.direct_calls, expected)
+                self.assertFalse(d.expect_tool_first)
+                self.assertIn("web_search", d.tool_subset)
+        # Same stock keyword, but a genuine portfolio continuation remains
+        # deterministic and uses only the immediately preceding stock reply.
+        plan, question = compile_read("how did these stocks do today", **history)
+        self.assertEqual(question, "")
+        self.assertEqual(plan, [("get_stock_price", {
+            "symbols": ["AAPL", "MSFT"], "period": "today"})])
+        for prompt in ("show my stock prices today", "what are AAPL and MSFT stock prices today"):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(compile_read(prompt, **history), (plan, ""))
+
+    def test_market_news_fast_path_requires_the_exact_topic_continuation(self):
+        history = {"last_user": "what is the global news for today", "last_tools": "web_search"}
+        self.assertEqual(compile_read("and in the stock market?", **history), (
+            [("web_search", {"query": "stock market news today"})], ""))
+        for prompt in (
+            "what is stock market volatility",
+            "how did the stock market move last week",
+            "and in the stock market, do not browse",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(compile_read(prompt, **history))
+
+    async def test_wisp_todo_creation_never_becomes_calendar_or_memory(self):
+        writes = set(R._ALL_MUTATING_TOOLS)
+        calendar = set(R._CALENDAR_ROUTE_TOOLS)
+        prompts = (
+            "create a to list for me tommorow",
+            "create a to do list in Wisp for tomorrow",
+            "draft a todo list on wisp",
+            "make a checklist in Wisp, not on Calendar",
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertFalse(decision.needs_tools)
+                self.assertEqual(decision.tool_subset, [])
+                self.assertEqual(decision.direct_calls, [])
+                self.assertIsNone(decision.force_first_tool)
+                self.assertTrue((writes | calendar | {"recall"}).issubset(
+                    decision.forbidden_tools))
+                self.assertIn("ask only what items", decision.resolved_request)
+
+    async def test_wisp_todo_correction_preserves_denied_intent(self):
+        decision = await R.route(
+            "on wisp so I can see it not on calender",
+            last_user="create a to list for me tommorow",
+            last_assistant="I can add that to your calendar. Shall I continue?",
+            last_tools="recall,add_calendar_event",
+        )
+        self.assertFalse(decision.needs_tools)
+        self.assertEqual(decision.tool_subset, [])
+        self.assertEqual(decision.direct_calls, [])
+        self.assertTrue(R._CALENDAR_ROUTE_TOOLS.issubset(decision.forbidden_tools))
+        self.assertIn("recall", decision.forbidden_tools)
+        self.assertIn("create a to list for me tommorow", decision.resolved_request)
+        self.assertIn("on wisp so I can see it not on calender",
+                      decision.resolved_request)
+
+    async def test_calendar_negation_and_positive_controls(self):
+        for prompt in (
+                "not on calendar, show it in Wisp",
+                "do not put this on my Calendar",
+                "use Wisp instead of calender",
+                "no calendar, remind me to pack tomorrow"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                offered = set(decision.tool_subset or ())
+                offered.update(name for name, _ in decision.direct_calls)
+                self.assertTrue(R._CALENDAR_ROUTE_TOOLS.isdisjoint(offered))
+                self.assertTrue(R._CALENDAR_ROUTE_TOOLS.issubset(
+                    decision.forbidden_tools))
+
+        reminder = await R.route("remind me to pack tomorrow at 9am")
+        self.assertIn("add_reminder", reminder.tool_subset)
+        calendar_read = await R.route("what is on my calender tommorow")
+        self.assertIn("get_upcoming", {
+            *(calendar_read.tool_subset or ()),
+            *(name for name, _ in calendar_read.direct_calls),
+        })
+        calendar_write = await R.route(
+            "put a dentist appointment on my Calendar tomorrow at 3pm")
+        self.assertIn("add_calendar_event", calendar_write.tool_subset)
+        aggregate = await R.route("what's on my to-do list tomorrow?")
+        self.assertTrue(set(R._ALL_SOURCES).issubset(aggregate.tool_subset))
+
+    async def test_negation_scope_preserves_the_positive_alternative(self):
+        calendar_read = await R.route("show tomorrow's calendar")
+        calendar_tools = set(calendar_read.tool_subset or ())
+        calendar_tools.update(name for name, _ in calendar_read.direct_calls)
+        self.assertIn("get_upcoming", calendar_tools)
+        self.assertNotIn("web_search", calendar_tools)
+        self.assertNotEqual(calendar_read.reason,
+                            "current public information -> web_search on Ling (router-direct)")
+
+        checklist = await R.route("add a checklist to Calendar tomorrow")
+        self.assertEqual(checklist.tool_subset, ["add_calendar_event"])
+        self.assertEqual(checklist.force_first_tool, "add_calendar_event")
+        self.assertEqual(checklist.required_tool_groups,
+                         (frozenset({"add_calendar_event"}),))
+        self.assertTrue(set(R._ALL_SOURCES).isdisjoint(checklist.tool_subset))
+
+        calendar_only = await R.route("don't add a reminder, add it to calendar")
+        self.assertIn("add_calendar_event", calendar_only.tool_subset)
+        self.assertNotIn("add_reminder", calendar_only.tool_subset)
+        self.assertIn("add_reminder", calendar_only.forbidden_tools)
+
+        reminder_only = await R.route("not calendar, make a reminder")
+        self.assertNotIn("add_reminder", reminder_only.tool_subset)
+        self.assertTrue(R._CALENDAR_ROUTE_TOOLS.isdisjoint(
+            reminder_only.tool_subset))
+        self.assertTrue(R._CALENDAR_ROUTE_TOOLS.issubset(
+            reminder_only.forbidden_tools))
+        self.assertEqual(reminder_only.reminder_action, "clarify_time")
+        self.assertIsNone(reminder_only.force_first_tool)
+        self.assertFalse(reminder_only.expect_tool_first)
+        self.assertEqual(reminder_only.required_tool_groups, ())
+        self.assertEqual(reminder_only.tool_argument_bindings, {})
+
+        wisp_only = await R.route(
+            "do not put this to-do list on Calendar; put it in Wisp")
+        self.assertFalse(wisp_only.needs_tools)
+        self.assertEqual(wisp_only.tool_subset, [])
+        self.assertEqual(wisp_only.direct_calls, [])
+        self.assertIn("ask only what items", wisp_only.resolved_request)
+
+    async def test_negation_order_is_symmetric_and_actions_choose_writes(self):
+        reminder_cases = (
+            "make a reminder, not a calendar event",
+            "not a calendar event; make a reminder",
+        )
+        for prompt in reminder_cases:
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertNotIn("add_reminder", decision.tool_subset)
+                self.assertTrue(R._CALENDAR_ROUTE_TOOLS.isdisjoint(
+                    decision.tool_subset))
+                self.assertTrue(R._CALENDAR_ROUTE_TOOLS.issubset(
+                    decision.forbidden_tools))
+                self.assertEqual(decision.reminder_action, "clarify_time")
+                self.assertIsNone(decision.force_first_tool)
+                self.assertFalse(decision.expect_tool_first)
+                self.assertEqual(decision.required_tool_groups, ())
+                self.assertEqual(decision.tool_argument_bindings, {})
+
+        timed_reminder_cases = (
+            "make a reminder tomorrow at 9, not a calendar event",
+            "not a calendar event; make a reminder tomorrow at 9",
+        )
+        for prompt in timed_reminder_cases:
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["add_reminder"])
+                self.assertEqual(decision.reminder_action, "create")
+                self.assertEqual(decision.force_first_tool, "add_reminder")
+                self.assertTrue(decision.expect_tool_first)
+                self.assertEqual(decision.required_tool_groups,
+                                 (frozenset({"add_reminder"}),))
+                self.assertIn("add_reminder", decision.tool_argument_bindings)
+                self.assertTrue(R._CALENDAR_ROUTE_TOOLS.isdisjoint(
+                    decision.tool_subset))
+
+        for prompt in (
+                "remind me to pack tomorrow at 9",
+                "remind me tomorrow at 9 to pack"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["add_reminder"])
+                self.assertEqual(decision.reminder_action, "create")
+                self.assertTrue(decision.expect_tool_first)
+                self.assertEqual(decision.force_first_tool, "add_reminder")
+                self.assertEqual(decision.required_tool_groups,
+                                 (frozenset({"add_reminder"}),))
+                self.assertNotIn("get_upcoming", decision.tool_subset)
+
+        for prompt in (
+                "show my reminders tomorrow",
+                "are there no reminders tomorrow?"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["search_reminders"])
+                self.assertEqual(decision.force_first_tool, "search_reminders")
+                self.assertNotIn("add_reminder", decision.tool_subset)
+                self.assertEqual(decision.reminder_action, "")
+
+        for prompt in (
+                "remind me to pack tomorrow at 9 and show my reminders tomorrow",
+                "show my reminders tomorrow and remind me to pack tomorrow at 9"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(set(decision.tool_subset),
+                                 {"add_reminder", "search_reminders"})
+                self.assertEqual(decision.force_first_tool, "add_reminder")
+                self.assertTrue(decision.expect_tool_first)
+                self.assertTrue(decision.multi_round)
+                self.assertIn(frozenset({"add_reminder"}),
+                              decision.required_tool_groups)
+                self.assertIn(frozenset({"search_reminders"}),
+                              decision.required_tool_groups)
+                self.assertNotIn("get_upcoming", decision.tool_subset)
+
+        pure_calendar_write = await R.route(
+            "add a meeting to my calendar tomorrow at 3")
+        self.assertEqual(pure_calendar_write.tool_subset,
+                         ["add_calendar_event"])
+        self.assertEqual(pure_calendar_write.force_first_tool,
+                         "add_calendar_event")
+
+        for prompt in (
+                "add a meeting to my calendar tomorrow at 3 and show my calendar tomorrow",
+                "show my calendar tomorrow and add a meeting to my calendar tomorrow at 3"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(set(decision.tool_subset),
+                                 {"add_calendar_event", "get_upcoming"})
+                self.assertEqual(decision.force_first_tool,
+                                 "add_calendar_event")
+                self.assertTrue(decision.expect_tool_first)
+                self.assertTrue(decision.multi_round)
+                self.assertIn(frozenset({"get_upcoming"}),
+                              decision.required_tool_groups)
+                self.assertNotIn("search_reminders", decision.tool_subset)
+
+        for prompt in (
+                "add a meeting to my calendar tomorrow at 3 and show my reminders tomorrow",
+                "show my reminders tomorrow and add a meeting to my calendar tomorrow at 3"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(set(decision.tool_subset),
+                                 {"add_calendar_event", "search_reminders"})
+                self.assertEqual(decision.force_first_tool,
+                                 "add_calendar_event")
+                self.assertTrue(decision.expect_tool_first)
+                self.assertTrue(decision.multi_round)
+                self.assertIn(frozenset({"search_reminders"}),
+                              decision.required_tool_groups)
+                self.assertNotIn("get_upcoming", decision.tool_subset)
+
+        for prompt in (
+                "remind me to pack tomorrow at 9 and show my calendar tomorrow",
+                "show my calendar tomorrow and remind me to pack tomorrow at 9"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(set(decision.tool_subset),
+                                 {"add_reminder", "get_upcoming"})
+                self.assertEqual(decision.force_first_tool, "add_reminder")
+                self.assertTrue(decision.expect_tool_first)
+                self.assertTrue(decision.multi_round)
+                self.assertIn(frozenset({"add_reminder"}),
+                              decision.required_tool_groups)
+                self.assertIn(frozenset({"get_upcoming"}),
+                              decision.required_tool_groups)
+                self.assertNotIn("search_reminders", decision.tool_subset)
+
+        calendar_cases = (
+            "no reminder; schedule it on my calendar tomorrow at 9",
+            "schedule it on my calendar tomorrow at 9; no reminder",
+            "don't add a reminder but add it to calendar tomorrow at 9",
+            "add it to calendar tomorrow at 9 but don't add a reminder",
+        )
+        for prompt in calendar_cases:
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["add_calendar_event"])
+                self.assertEqual(decision.force_first_tool, "add_calendar_event")
+                self.assertTrue(decision.expect_tool_first)
+                self.assertEqual(decision.required_tool_groups,
+                                 (frozenset({"add_calendar_event"}),))
+                self.assertNotIn("get_upcoming", decision.tool_subset)
+                self.assertTrue(R._REMINDER_ROUTE_TOOLS.isdisjoint(
+                    decision.tool_subset))
+                self.assertTrue(R._REMINDER_ROUTE_TOOLS.issubset(
+                    decision.forbidden_tools))
+                self.assertEqual(decision.reminder_action, "")
+                self.assertEqual(decision.direct_calls, [])
+                self.assertEqual(decision.conditional_tools, ())
+                self.assertNotIn("add_reminder", decision.tool_argument_bindings)
+
+    async def test_production_read_compiler_honors_calendar_negation(self):
+        for prompt in (
+                "not on calendar, show it in Wisp",
+                "show it in Wisp instead of calendar",
+                "calendar? no; show it in Wisp",
+                "show it in Wisp rather than calendar"):
+            with self.subTest(prompt=prompt):
+                compiled = compile_read(prompt)
+                self.assertTrue(compiled is None or all(
+                    name != "get_upcoming" for name, _ in compiled[0]))
+        positive = compile_read("show tomorrow's calendar")
+        self.assertIsNotNone(positive)
+        self.assertEqual(positive[0][0][0], "get_upcoming")
+        self.assertFalse(R.calendar_is_excluded(
+            "why are there no calendar events tomorrow?"))
+        absence_route = await R.route("why are there no calendar events tomorrow?")
+        absence_tools = set(absence_route.tool_subset or ())
+        absence_tools.update(name for name, _ in absence_route.direct_calls)
+        self.assertIn("get_upcoming", absence_tools)
+
+        for prompt, expected_tool, force_tool, direct_calls in (
+                ("are there no reminders tomorrow?", "search_reminders",
+                 "search_reminders", []),
+                ("why are there no reminders tomorrow?", "search_reminders",
+                 "search_reminders", []),
+                ("are there no calendar events tomorrow?", "get_upcoming",
+                 None, [("get_upcoming", {"period": "tomorrow", "calendar_only": True})]),
+                ("why are there no calendar events tomorrow?", "get_upcoming",
+                 None, [("get_upcoming", {"period": "tomorrow", "calendar_only": True})])):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, [expected_tool])
+                self.assertEqual(decision.expect_tool_first,
+                                 force_tool is not None)
+                self.assertEqual(decision.force_first_tool, force_tool)
+                self.assertNotIn("web_search", decision.tool_subset)
+                self.assertEqual(decision.direct_calls, direct_calls)
+                self.assertFalse({"add_reminder", "add_calendar_event"}
+                                 .intersection(decision.tool_subset))
+
+        reminder_exclusion = await R.route(
+            "no reminders; add it to calendar tomorrow at 9")
+        self.assertEqual(reminder_exclusion.tool_subset,
+                         ["add_calendar_event"])
+        self.assertNotIn("get_upcoming", reminder_exclusion.tool_subset)
+        self.assertTrue(R._REMINDER_ROUTE_TOOLS.issubset(
+            reminder_exclusion.forbidden_tools))
+
+        calendar_exclusion = await R.route(
+            "not calendar; make a reminder tomorrow at 9")
+        self.assertEqual(calendar_exclusion.tool_subset, ["add_reminder"])
+        self.assertTrue(R._CALENDAR_ROUTE_TOOLS.issubset(
+            calendar_exclusion.forbidden_tools))
+
+    async def test_to_list_typo_is_only_a_personal_checklist(self):
+        personal = await R.route("create a to list for me tommorow")
+        self.assertFalse(personal.needs_tools)
+        self.assertIn("Wisp-visible to-do/checklist", personal.reason)
+        for prompt in ("create a script to list files", "show me how to list files"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertNotIn("Wisp-visible to-do/checklist", decision.reason)
+                self.assertEqual(decision.resolved_request, "")
+                self.assertFalse(set(R._ALL_SOURCES).issubset(
+                    set(decision.tool_subset or ())))
+
+    async def test_negated_state_filters_and_quoted_titles_remain_read_requests(self):
+        for prompt, expected in (
+                ("Show my calendar events that are not cancelled tomorrow", "get_upcoming"),
+                ("show my reminders that are not completed", "search_reminders"),
+                ('Show calendar events named "Do not disturb" tomorrow', "get_upcoming"),
+                ('Show calendar events named “Do not disturb; instead of lunch” tomorrow',
+                 "get_upcoming")):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                offered = set(decision.tool_subset or ())
+                offered.update(name for name, _ in decision.direct_calls)
+                self.assertIn(expected, offered)
+                self.assertFalse(CREATION.intersection(offered))
+                self.assertFalse({"cancel_event", "complete_reminder"}.intersection(offered))
+
+        self.assertIsNotNone(compile_read(
+            "Show my calendar events that are not cancelled tomorrow"))
+        self.assertIsNotNone(compile_read(
+            'Show calendar events named "Do not disturb" tomorrow'))
+        denied = await R.route("do not show my calendar tomorrow")
+        self.assertTrue(R._CALENDAR_ROUTE_TOOLS.issubset(denied.forbidden_tools))
+
+    async def test_bare_instead_keeps_the_positive_replacement_action(self):
+        decision = await R.route(
+            "No reminders; instead add a meeting to Calendar tomorrow at 3pm")
+        self.assertEqual(decision.tool_subset, ["add_calendar_event"])
+        self.assertEqual(decision.force_first_tool, "add_calendar_event")
+        self.assertTrue(R._REMINDER_ROUTE_TOOLS.issubset(decision.forbidden_tools))
+
+        excluded = await R.route(
+            "Add a meeting to Calendar instead of Reminders tomorrow at 3pm")
+        self.assertIn("add_calendar_event", excluded.tool_subset)
+        self.assertTrue(R._REMINDER_ROUTE_TOOLS.issubset(excluded.forbidden_tools))
+
+    async def test_explicit_checklist_destinations_and_calendar_source_are_scoped(self):
+        for prompt in ("Add a checklist to my Calendar tomorrow",
+                       "Add a checklist to the Calendar tomorrow"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["add_calendar_event"])
+                self.assertEqual(decision.force_first_tool, "add_calendar_event")
+
+        for prompt in ("create a checklist in my Notes", "create a checklist in the Notes"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["create_note"])
+                self.assertEqual(decision.force_first_tool, "create_note")
+                self.assertTrue(set(R._ALL_SOURCES).isdisjoint(decision.tool_subset))
+                self.assertTrue(R._CALENDAR_ROUTE_TOOLS.isdisjoint(decision.tool_subset))
+
+        for prompt in ("Create a checklist from my calendar tomorrow",
+                       "Create a checklist using my calendar tomorrow"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["get_upcoming"])
+                self.assertEqual(decision.force_first_tool, "get_upcoming")
+                self.assertTrue(set(R._ALL_MUTATING_TOOLS).issubset(decision.forbidden_tools))
+                self.assertIn("recall", decision.forbidden_tools)
+                self.assertFalse({"search_reminders", "summarize_messages", "summarize_emails"}
+                                 .intersection(decision.tool_subset))
+
+        denied = await R.route("do not create a checklist from my calendar tomorrow")
+        self.assertFalse(denied.needs_tools)
+        self.assertIn("get_upcoming", denied.forbidden_tools)
+
+    async def test_negated_notes_checklist_never_reaches_generic_source_routing(self):
+        prompts = (
+            "do not create a checklist in my Notes",
+            "do not create a checklist in the Notes",
+            "don't create a checklist in my Notes",
+            "don't create a checklist in the Notes",
+        )
+        blocked = {"search_notes", "create_note", "append_note", "scan_to_note",
+                   "get_upcoming", "summarize_messages", "summarize_emails", "daily_brief"}
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertFalse(decision.needs_tools)
+                self.assertEqual(decision.tool_subset, [])
+                self.assertEqual(decision.direct_calls, [])
+                self.assertTrue(blocked.issubset(decision.forbidden_tools))
+
+                sources = [AsyncMock(side_effect=AssertionError("source must not run"))
+                           for _ in range(5)]
+                with patch.object(REGISTRY["search_notes"], "func", sources[0]), \
+                        patch.object(REGISTRY["get_upcoming"], "func", sources[1]), \
+                        patch.object(REGISTRY["summarize_messages"], "func", sources[2]), \
+                        patch.object(REGISTRY["summarize_emails"], "func", sources[3]), \
+                        patch.object(REGISTRY["daily_brief"], "func", sources[4]):
+                    await self.run_loop(prompt, ["No checklist will be created."])
+                for source in sources:
+                    source.assert_not_awaited()
+
+    async def test_negated_notes_checklist_allows_only_an_explicit_replacement_destination(self):
+        blocked = {"search_notes", "create_note", "append_note", "scan_to_note",
+                   "get_upcoming", "summarize_messages", "summarize_emails", "daily_brief"}
+        for negation in ("do not", "don't"):
+            for notes_article in ("my", "the"):
+                for verb in ("add", "create"):
+                    for destination, tool in (("Calendar", "add_calendar_event"),
+                                              ("Reminders", "add_reminder")):
+                        for destination_article in ("my", "the"):
+                            prompt = (f"{negation} create a checklist in {notes_article} Notes; "
+                                      f"instead {verb} a checklist to {destination_article} "
+                                      f"{destination} tomorrow at 3pm")
+                            with self.subTest(prompt=prompt):
+                                decision = await R.route(prompt)
+                                self.assertEqual(decision.tool_subset, [tool])
+                                self.assertEqual(decision.force_first_tool, tool)
+                                self.assertEqual(decision.required_tool_groups,
+                                                 (frozenset({tool}),))
+                                self.assertTrue(blocked.issubset(decision.forbidden_tools))
+                                self.assertFalse(({"add_calendar_event", "add_reminder"} - {tool})
+                                                 .intersection(decision.tool_subset))
+
+        for prompt in (
+                "do not create a checklist in Notes instead of Calendar",
+                'do not create a checklist in Notes; instead add "instead" to Wisp'):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertFalse(decision.needs_tools)
+                self.assertEqual(decision.tool_subset, [])
+                self.assertEqual(decision.direct_calls, [])
+
+    async def test_negated_notes_checklist_allows_only_explicit_positive_calendar_reads(self):
+        for prompt in (
+                "do not create a checklist in Notes; instead show my Calendar tomorrow",
+                "do not create a checklist in Notes; instead create a checklist in Wisp from my Calendar tomorrow"):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["get_upcoming"])
+                self.assertEqual(decision.direct_calls, [("get_upcoming", {"days": 2})])
+                self.assertEqual(decision.force_first_tool, "get_upcoming")
+                self.assertTrue({"search_notes", "summarize_messages", "summarize_emails", "daily_brief"}
+                                .issubset(decision.forbidden_tools))
+
+                calendar = AsyncMock(return_value="Synthetic Calendar event")
+                notes = AsyncMock(side_effect=AssertionError("Notes read must not run"))
+                with patch.object(REGISTRY["get_upcoming"], "func", calendar), \
+                        patch.object(REGISTRY["search_notes"], "func", notes):
+                    await self.run_loop(prompt, ["Calendar result."])
+                calendar.assert_awaited_once()
+                notes.assert_not_awaited()
+
+        pure = await R.route("do not create a checklist in Notes")
+        self.assertFalse(pure.needs_tools)
+        self.assertIn("get_upcoming", pure.forbidden_tools)
+
+    async def run_loop(self, prompt, replies, *, approve=False, test_mode=False, max_steps=4):
+        d = await R.route(prompt)
+        client = ScriptedClient(replies)
+        emit = AsyncMock()
+        approver = type("Approver", (), {"confirm": AsyncMock(return_value=approve)})()
+        result = await loop.run_agent(
+            client, "Ling-3.0-tiny-oQ4e", [{"role": "user", "content": prompt}],
+            emit, approver, tools=d.tool_subset, expect_tool_first=d.expect_tool_first,
+            force_first_tool=d.force_first_tool, multi_round=d.multi_round,
+            direct_calls=d.direct_calls,
+            required_tool_groups=d.required_tool_groups, forbidden_tools=d.forbidden_tools,
+            tool_argument_bindings=d.tool_argument_bindings,
+            reminder_action=d.reminder_action, include_memory_context=False,
+            test_mode=test_mode, max_steps=max_steps)
+        return result, client, approver
+
+    async def test_existing_note_edit_is_not_calendar_creation(self):
+        for prompt in ("add a line to the meeting note",
+                       "add agenda items to my meeting note"):
+            with self.subTest(prompt=prompt):
+                self.assertIn("append_note", R.rule_route(prompt).tool_subset)
+                d = await R.route(prompt)
+                self.assertEqual(set(d.tool_subset), {"search_notes", "append_note"})
+                self.assertEqual(d.required_tool_groups, (
+                    frozenset({"search_notes"}), frozenset({"append_note"})))
+                self.assertFalse(CREATION.intersection(d.tool_subset))
+        for prompt in ("add a meeting to my calendar tomorrow at 3pm",
+                       "add a calendar event titled meeting notes tomorrow"):
+            with self.subTest(prompt=prompt):
+                d = await R.route(prompt)
+                self.assertEqual(d.tool_subset, ["add_calendar_event"])
+
+    async def test_reminder_reads_reach_the_overdue_inclusive_source(self):
+        for prompt in ("when is my vaccine reminder", "find my dentist reminder",
+                       "what does my reminder say", "find my overdue dentist reminder"):
+            with self.subTest(prompt=prompt):
+                self.assertIn("search_reminders", R.rule_route(prompt).tool_subset)
+                d = await R.route(prompt)
+                self.assertEqual(d.tool_subset, ["search_reminders"])
+                self.assertEqual(d.force_first_tool, "search_reminders")
+                self.assertEqual(d.direct_calls, [])
+                self.assertEqual(d.reminder_action, "")
+        d = await R.route("what is on my calendar")
+        self.assertEqual(d.direct_calls, [("get_upcoming", {"days": 60})])
+        d = await R.route("find free time between my reminders")
+        self.assertIn("find_free_time", d.tool_subset)
+
+    async def test_reschedule_is_an_update_not_creation(self):
+        for word in ("reschedule", "rescheduled", "rescheduling", "reschedules"):
+            self.assertEqual(R._normalize_typos(word), word)
+        for prompt, target in (
+                ("reschedule the meeting to tomorrow", "update_event"),
+                ("please reschedule my appointment to tomorrow", "update_event"),
+                ("I need you to reschedule my reminder to tomorrow", "update_reminder"),
+                ("reschedule my reminder", "update_reminder")):
+            with self.subTest(prompt=prompt):
+                self.assertIn(target, R.rule_route(prompt).tool_subset)
+                d = await R.route(prompt)
+                if target == "update_event":
+                    self.assertEqual(d.tool_subset, [])
+                    self.assertEqual(d.required_tool_groups, (frozenset({"update_event"}),))
+                    self.assertIsNone(d.force_first_tool)
+                else:
+                    self.assertEqual(set(d.tool_subset), {"get_upcoming", target})
+                    self.assertEqual(d.required_tool_groups, ())
+                    self.assertIsNone(d.force_first_tool)
+                self.assertEqual(d.reminder_action, "")
+                self.assertEqual(d.tool_argument_bindings, {})
+                self.assertFalse(CREATION.intersection(d.tool_subset))
+        both = await R.route("reschedule my meeting and my reminder to tomorrow")
+        self.assertEqual(set(both.tool_subset), {"get_upcoming", "update_reminder"})
+        self.assertEqual(both.required_tool_groups, (frozenset({"update_event"}),))
+
+    async def test_incomplete_reschedule_can_ask_without_forcing_an_update(self):
+        question = "Which reminder should I reschedule, and when?"
+        result, client, approver = await self.run_loop("reschedule my reminder", [question])
+        self.assertEqual(result, question)
+        self.assertEqual(len(client.requests), 1)
+        self.assertNotEqual(client.requests[0].get("tool_choice"), "required")
+        approver.confirm.assert_not_awaited()
+
+    async def test_complete_reschedule_cannot_claim_success_without_update(self):
+        prompt = "reschedule the team meeting to tomorrow at 3pm"
+        d = await R.route(prompt)
+        self.assertEqual(d.required_tool_groups, (frozenset({"update_event"}),))
+        self.assertIsNone(d.force_first_tool)
+        self.assertNotIn("update_event", d.tool_subset)
+        self.assertEqual(d.tool_argument_bindings, {})
+        claim = "Done — I've rescheduled the team meeting to tomorrow at 3 PM."
+        result, client, approver = await self.run_loop(prompt, [claim] * 4)
+        self.assertEqual(result, EVENT_UPDATE_UNAVAILABLE)
+        self.assertEqual(client.requests, [])
+        approver.confirm.assert_not_awaited()
+        read = AsyncMock(return_value="Calendar events: 1. team meeting tomorrow at noon.")
+        with patch.object(REGISTRY["get_upcoming"], "func", read):
+            result, _, approver = await self.run_loop(prompt, [("get_upcoming", {}), *([claim] * 3)])
+        read.assert_not_awaited()
+        self.assertEqual(result, EVENT_UPDATE_UNAVAILABLE)
+        approver.confirm.assert_not_awaited()
+
+    async def test_reschedule_does_not_bind_partially_understood_destinations(self):
+        for when in ("October 1 at 3pm", "next week at 3pm", "tomorrow at 3pm UTC",
+                     "tomorrow at 3pm or Friday at 4pm", "tomorrow at 3pm for 30 minutes",
+                     "tomorrow at 25pm", "tomorrow at 6:7"):
+            with self.subTest(when=when):
+                d = await R.route("reschedule the team meeting to " + when)
+                self.assertEqual(d.tool_subset, [])
+                self.assertIn("cancel_event", d.forbidden_tools)
+                self.assertEqual(d.tool_argument_bindings, {})
+                self.assertEqual(d.required_tool_groups, (frozenset({"update_event"}),))
+        for when in ("tomorrow 3pm", "15:00 tomorrow", "tomorrow noon", "noon tomorrow"):
+            with self.subTest(when=when):
+                d = await R.route("reschedule the team meeting to " + when)
+                self.assertEqual(d.tool_argument_bindings, {})
+                result, _, approver = await self.run_loop(
+                    "reschedule the team meeting to " + when, ["Done."])
+                self.assertEqual(result, EVENT_UPDATE_UNAVAILABLE)
+                approver.confirm.assert_not_awaited()
+
+    async def test_unavailable_inventory_is_non_routable_and_never_dispatches(self):
+        expected = {
+            "country_info", "find_local_events", "get_lyrics", "identify_song",
+            "live_captions", "lookup_media_title", "set_hotkey",
+            "set_keyboard_backlight", "track_flight", "track_package",
+            "transcribe_audio", "transit_info",
+        }
+        self.assertEqual(set(UNAVAILABLE_TOOL_REASONS), expected)
+        advertised = {schema["function"]["name"] for schema in tool_schemas(None)}
+        self.assertTrue(expected.isdisjoint(advertised))
+        for name in sorted(expected):
+            with self.subTest(tool=name):
+                self.assertEqual(REGISTRY[name].unavailable_reason,
+                                 UNAVAILABLE_TOOL_REASONS[name])
+                self.assertNotIn("settings under api keys",
+                                 (REGISTRY[name].description + " "
+                                  + REGISTRY[name].unavailable_reason).lower())
+                implementation = AsyncMock(side_effect=AssertionError(
+                    "an unavailable compatibility implementation must not run"))
+                with patch.object(REGISTRY[name], "func", implementation):
+                    result = await run_tool(REGISTRY[name], {})
+                implementation.assert_not_awaited()
+                self.assertEqual(result, UNAVAILABLE_TOOL_REASONS[name])
+                self.assertEqual(classify_tool_outcome(name, result).status, "unsupported")
+                self.assertRegex(result, r"(?i)(no |cannot|nothing was|does not)")
+
+    async def test_legacy_mixed_menu_keeps_genuine_tool_and_filters_unavailable_one(self):
+        receipt = "Calendar fixture: team meeting tomorrow at noon."
+        calendar = AsyncMock(return_value=receipt)
+        unavailable = AsyncMock(side_effect=AssertionError(
+            "unavailable compatibility implementation must not run"))
+        client = ScriptedClient([("get_upcoming", {"days": 7}), "Done."])
+        approver = type("Approver", (), {"confirm": AsyncMock(return_value=True)})()
+        with patch.object(REGISTRY["get_upcoming"], "func", calendar), \
+                patch.object(REGISTRY["country_info"], "func", unavailable):
+            result = await loop.run_agent(
+                client, "fixture-model", [{"role": "user", "content": "show my calendar"}],
+                AsyncMock(), approver, tools=["get_upcoming", "country_info"],
+                include_memory_context=False, max_steps=2)
+        self.assertEqual(result, "Done.")
+        calendar.assert_awaited_once_with(days=7)
+        unavailable.assert_not_awaited()
+        approver.confirm.assert_not_awaited()
+        self.assertGreaterEqual(len(client.requests), 1)
+        for request in client.requests:
+            offered = {schema["function"]["name"] for schema in request.get("tools") or []}
+            self.assertIn("get_upcoming", offered)
+            self.assertNotIn("country_info", offered)
+
+    async def test_legacy_forced_unavailable_tool_returns_without_model_or_dispatch(self):
+        client = ScriptedClient(["unrelated model prose"])
+        unavailable = AsyncMock(side_effect=AssertionError(
+            "unavailable compatibility implementation must not run"))
+        approver = type("Approver", (), {"confirm": AsyncMock(return_value=True)})()
+        emit = AsyncMock()
+        with patch.object(REGISTRY["country_info"], "func", unavailable):
+            result = await loop.run_agent(
+                client, "fixture-model", [{"role": "user", "content": "show my calendar"}],
+                emit, approver, tools=None, force_first_tool="country_info",
+                include_memory_context=False, max_steps=1)
+        self.assertEqual(result, UNAVAILABLE_TOOL_REASONS["country_info"])
+        self.assertEqual(client.requests, [])
+        unavailable.assert_not_awaited()
+        approver.confirm.assert_not_awaited()
+        self.assertFalse(any(call.args[0].get("type") == "tool_call"
+                             for call in emit.await_args_list))
+
+    async def test_explicit_unavailable_device_route_reports_before_execution(self):
+        prompt = "turn up my keyboard backlight"
+        decision = await R.route(prompt)
+        self.assertNotIn("set_keyboard_backlight", decision.tool_subset or ())
+        self.assertEqual(decision.direct_calls, [])
+        self.assertIn(frozenset({"set_keyboard_backlight"}),
+                      decision.required_tool_groups)
+        result, client, approver = await self.run_loop(prompt, ["Done."], approve=True)
+        self.assertEqual(result, UNAVAILABLE_TOOL_REASONS["set_keyboard_backlight"])
+        self.assertEqual(client.requests, [])
+        approver.confirm.assert_not_awaited()
+
+    def test_capability_report_distinguishes_scheduled_email_from_scheduled_reply(self):
+        report = wisp_capabilities("email scheduling")
+        self.assertIn("Yes — Schedule a new email or text for later", report)
+        self.assertIn("No — schedule a reply inside an existing email thread", report)
+        self.assertIn("unavailable and non-routable", report)
+        self.assertNotIn("settings under API keys", report)
+
+    async def test_compound_reminder_lookup_requires_both_actual_sources(self):
+        prompt = "find my overdue dentist reminder and search my notes for dentist"
+        d = await R.route(prompt)
+        self.assertEqual(set(d.tool_subset), {"search_reminders", "search_notes"})
+        self.assertEqual(d.required_tool_groups, (
+            frozenset({"search_reminders"}), frozenset({"search_notes"})))
+        reminder = AsyncMock(return_value="dentist overdue reminder fixture")
+        notes = AsyncMock(return_value="dentist note fixture")
+        claim = "I checked both sources."
+        with patch.object(REGISTRY["search_reminders"], "func", reminder), \
+                patch.object(REGISTRY["search_notes"], "func", notes):
+            result, _, approver = await self.run_loop(prompt, [
+                ("search_reminders", {"query": "dentist"}), *([claim] * 3)])
+        self.assertNotEqual(result, claim)
+        reminder.assert_awaited_once()
+        notes.assert_not_awaited()
+        approver.confirm.assert_not_awaited()
+        reminder.reset_mock()
+        with patch.object(REGISTRY["search_reminders"], "func", reminder), \
+                patch.object(REGISTRY["search_notes"], "func", notes):
+            result, _, approver = await self.run_loop(prompt, [
+                ("search_reminders", {"query": "dentist"}),
+                ("search_notes", {"query": "dentist"}), claim])
+        self.assertEqual(result, claim)
+        reminder.assert_awaited_once()
+        notes.assert_awaited_once()
+        approver.confirm.assert_not_awaited()
+
+    async def test_source_names_in_notes_query_are_content_not_obligations(self):
+        for prompt, expected in (
+                ("search my notes for reminder ideas", {"search_notes"}),
+                ("search my notes about overdue reminders", {"search_notes"}),
+                ("find reminder ideas in my notes", {"search_notes"}),
+                ("search my notes for dentist and reminder ideas", {"search_notes"}),
+                ('search my notes for "find my overdue dentist reminder"', {"search_notes"}),
+                ("search my notes for 'dentist and check my reminders'", {"search_notes"}),
+                ("search my notes for ‘dentist and check my reminders’", {"search_notes"}),
+                ("search my notes for ideas from my reminders", {"search_notes"}),
+                ("search my reminders for quotes from my notes", {"search_reminders"}),
+                ("search my reminders for notes ideas", {"search_reminders"}),
+                ("search my notes and reminders for dentist", {"search_notes", "search_reminders"}),
+                ("search my reminders and notes for dentist", {"search_notes", "search_reminders"}),
+                ("search my notes for dentist and find my overdue dentist reminder",
+                 {"search_notes", "search_reminders"})):
+            with self.subTest(prompt=prompt):
+                d = await R.route(prompt)
+                self.assertEqual(set(d.tool_subset), expected)
+                self.assertTrue(all(group <= expected for group in d.required_tool_groups))
+        prompt = "search my notes for reminder ideas"
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="wisp-note-entry-")))
+        sessions, assistant = SessionStore(root / "sessions.db"), AssistantStore(root / "assistant.db")
+        self.addCleanup(sessions._db.close)
+        self.addCleanup(assistant._db.close)
+        sid = sessions.create_session()
+        self.assertIsNone(await prepare_task_turn_async(
+            sessions, sid, prompt, assistant_store=assistant, now=NOW, allow_native=False))
+        self.assertIsNone(prepare_legacy_turn(sessions, sid, prompt))
+        notes = AsyncMock(return_value="Fixture note: reminder ideas include drinking water.")
+        reminders = AsyncMock(side_effect=AssertionError("Reminders was not requested"))
+        answer = "Your note suggests drinking water."
+        with patch.object(REGISTRY["search_notes"], "func", notes), \
+                patch.object(REGISTRY["search_reminders"], "func", reminders):
+            result, _, approver = await self.run_loop(prompt, [
+                ("search_notes", {"query": "reminder ideas"}), answer])
+        self.assertEqual(result, answer)
+        notes.assert_awaited_once()
+        reminders.assert_not_awaited()
+        approver.confirm.assert_not_awaited()
+
+    async def test_real_calendar_backend_is_unavailable_without_preservation_safe_update(self):
+        from service.assistant.hub import hub
+        from service.assistant import sync_status
+
+        # Real disposable SQLite rows, including collapsed cross-source
+        # duplicates and repeated EventKit occurrence identifiers. The only
+        # intercepted effects are approval and the Hub/native bridge.
+        fixtures = (
+            ("empty", [], "available"),
+            ("reminder-only", [("reminders", "team meeting", 0)], "available"),
+            ("calendar-metadata", [("calendar", "Quarterly team meeting", 0)], "available"),
+            ("cross-source-duplicate", [("calendar", "team meeting", 0),
+                                        ("reminders", "team meeting", 0)], "available"),
+            ("ambiguous", [("calendar", "team meeting", 0),
+                            ("calendar", "team meeting", 3600)], "available"),
+            ("syncing", [("calendar", "team meeting", 0)], "syncing"),
+            ("unavailable", [("calendar", "team meeting", 0)], "unavailable"),
+            ("stale", [("calendar", "team meeting", -172800)], "available"),
+        )
+        for label, rows, state in fixtures:
+            for entry in ("routed-loop", "direct-backend", "registry"):
+                with self.subTest(fixture=label, entry=entry):
+                    root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="wisp-event-guard-")))
+                    store = AssistantStore(root / "assistant.db")
+                    sessions = SessionStore(root / "sessions.db")
+                    self.addCleanup(store._db.close)
+                    self.addCleanup(sessions._db.close)
+                    for source in {row[0] for row in rows}:
+                        store.sync_source(source, [{
+                            "source_id": "fixture-occurrence", "kind": "event" if source == "calendar" else "reminder",
+                            "title": title, "when_ts": (NOW + timedelta(days=1)).timestamp() + offset,
+                            "location": "Room 42", "context": "Work calendar", "account": "fixture",
+                            "organizer": "Fixture organizer", "url": "https://example.invalid/event",
+                            # Intentionally ignored by the current store: this
+                            # missing preservation metadata must not become 60.
+                            "duration_min": 90,
+                        } for row_source, title, offset in rows if row_source == source])
+                    before = [tuple(row) for row in store._db.execute("SELECT * FROM commitments ORDER BY id")]
+                    ready = {"sources": [
+                        {"id": "calendar", "label": "Calendar", "state": state},
+                        {"id": "reminders", "label": "Reminders", "state": "available"}]}
+                    publish = AsyncMock()
+                    args = {"title": "team meeting", "when_iso": "2026-09-10T15:00",
+                            "duration_min": 90, "location": "Room 42", "new_title": "Quarterly team meeting"}
+                    with patch.object(assistant_tools, "assistant_store", store), \
+                            patch.object(assistant_tools.time, "time", return_value=NOW.timestamp()), \
+                            patch.object(hub, "publish", publish), \
+                            patch.object(sync_status, "ensure_sources", AsyncMock(return_value=ready)):
+                        if entry == "routed-loop":
+                            prompt = "reschedule the team meeting to tomorrow at 3pm"
+                            sid = sessions.create_session()
+                            self.assertIsNone(await prepare_task_turn_async(
+                                sessions, sid, prompt, assistant_store=store, now=NOW, allow_native=False))
+                            self.assertIsNone(prepare_legacy_turn(sessions, sid, prompt))
+                            result, _, approver = await self.run_loop(prompt, [
+                                ("get_upcoming", {}), ("update_event", args), "Confirmed rescheduled in Calendar."],
+                                approve=True)
+                        elif entry == "direct-backend":
+                            result = await assistant_tools.update_event(**args)
+                        else:
+                            result = await run_tool(REGISTRY["update_event"], args)
+                    after = [tuple(row) for row in store._db.execute("SELECT * FROM commitments ORDER BY id")]
+                    self.assertEqual(after, before, "All stored event and Reminder metadata must remain unchanged")
+                    publish.assert_not_awaited()
+                    if entry == "routed-loop":
+                        approver.confirm.assert_not_awaited()
+                    self.assertIn("unavailable", result.lower())
+                    self.assertIn("preserv", result.lower())
+                    self.assertNotIn("Confirmed rescheduled", result)
+                    self.assertEqual(classify_tool_outcome("update_event", result).status, "needs_input")
+
+    async def test_calendar_discovery_empty_or_degraded_is_not_success(self):
+        from service.assistant.hub import hub
+        from service.assistant import sync_status
+
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="wisp-calendar-read-")))
+        store = AssistantStore(root / "assistant.db")
+        self.addCleanup(store._db.close)
+        publish = AsyncMock()
+        for state, expected in (("available", "no_match"), ("syncing", "needs_input"),
+                                ("unavailable", "failed")):
+            with self.subTest(state=state):
+                ready = {"sources": [{"id": "calendar", "label": "Calendar", "state": state},
+                                     {"id": "reminders", "label": "Reminders", "state": "available"}]}
+                with patch.object(assistant_tools, "assistant_store", store), \
+                        patch.object(assistant_tools.time, "time", return_value=NOW.timestamp()), \
+                        patch.object(hub, "publish", publish), \
+                        patch.object(sync_status, "ensure_sources", AsyncMock(return_value=ready)):
+                    result = await assistant_tools.get_upcoming(days=60, query="team meeting", calendar_only=True)
+                self.assertEqual(classify_tool_outcome("get_upcoming", result).status, expected)
+        publish.assert_not_awaited()
+
+    def test_update_event_old_cancel_recreate_receipts_are_not_success(self):
+        for receipt, expected in (
+                (EVENT_UPDATE_UNAVAILABLE, "needs_input"),
+                (UPDATE_RECEIPT, "failed"),
+                ('Nothing upcoming or past matches “team meeting”.', "needs_input"),
+                ('Several items match “team meeting”. Which one?', "needs_input"),
+                ('Cancelled “team meeting”.', "failed"),
+                (UPDATE_RECEIPT.split("\n")[1], "failed"),
+                ('Cancelled “team meeting”.\n(bad when_iso)', "failed"),
+                ("The event was updated.", "failed"), ("", "failed")):
+            with self.subTest(receipt=receipt):
+                outcome = classify_tool_outcome("update_event", receipt)
+                self.assertEqual(outcome.status, expected)
+                self.assertEqual(outcome.effect, "updated")
+        self.assertEqual(classify_tool_outcome("update_event", UPDATE_RECEIPT,
+                                              planned=True).status, "planned")
+        self.assertEqual(classify_tool_outcome("update_event", UPDATE_RECEIPT,
+                                              denied=True).status, "denied")
+
+    async def test_reschedule_unavailability_precedes_model_and_effect_dispatch(self):
+        prompt = "reschedule the team meeting to tomorrow at 3pm"
+        read = AsyncMock(return_value="Calendar events: 1. team meeting tomorrow at noon.")
+        update = AsyncMock(return_value=UPDATE_RECEIPT)
+        redirected = {"title": "unrelated event", "when_iso": "2030-01-01T00:00",
+                      "new_title": "injected rename", "location": "injected location", "duration_min": 999}
+        with patch.object(REGISTRY["get_upcoming"], "func", read), \
+                patch.object(REGISTRY["update_event"], "func", update):
+            result, _, approver = await self.run_loop(prompt, [
+                ("update_event", redirected),
+                ("get_upcoming", {"days": 1, "period": "tomorrow", "query": "unrelated event",
+                                  "calendar_only": False}),
+                ("update_event", redirected), ("update_event", redirected),
+                "Done — confirmed in the native Calendar app."], approve=True, max_steps=6)
+        read.assert_not_awaited()
+        update.assert_not_awaited()
+        approver.confirm.assert_not_awaited()
+        self.assertEqual(result, EVENT_UPDATE_UNAVAILABLE)
+
+    async def test_reschedule_model_and_direct_calls_cannot_bypass_unavailability(self):
+        prompt = "reschedule the team meeting to tomorrow at 3pm"
+        args = {"title": "team meeting", "when_iso": "2026-09-10T15:00"}
+        for direct in (False, True):
+            for dry_run in (False, True):
+                with self.subTest(direct=direct, dry_run=dry_run):
+                    approver = type("Approver", (), {"confirm": AsyncMock(return_value=True)})()
+                    update = AsyncMock(side_effect=AssertionError("unavailable effect must not dispatch"))
+                    emit = AsyncMock()
+                    with patch.object(REGISTRY["update_event"], "func", update):
+                        result = await loop.run_agent(
+                            ScriptedClient([("update_event", args), "I've rescheduled it."]),
+                            "fixture-model", [{"role": "user", "content": prompt}], emit, approver,
+                            tools=["update_event"], direct_calls=[("update_event", args)] if direct else [],
+                            include_memory_context=False, test_mode=dry_run, max_steps=3)
+                    update.assert_not_awaited()
+                    approver.confirm.assert_not_awaited()
+                    self.assertEqual(result, EVENT_UPDATE_UNAVAILABLE)
+                    self.assertFalse(any(call.args[0].get("type") == "tool_call" for call in emit.await_args_list))
+
+    async def test_unavailable_update_preflights_legacy_direct_mixed_tool_batch(self):
+        args = {"title": "team meeting", "when_iso": "2026-09-10T15:00"}
+        create = ("add_calendar_event", args)
+        unavailable = ("update_event", args)
+        receipt = "Added “separate event” to your calendar for tomorrow. (Native fixture only.)"
+        approver = type("Approver", (), {"confirm": AsyncMock(return_value=True)})()
+        created, updated = AsyncMock(return_value=receipt), AsyncMock(return_value=UPDATE_RECEIPT)
+        with patch.object(REGISTRY["add_calendar_event"], "func", created), \
+                patch.object(REGISTRY["update_event"], "func", updated):
+            result = await loop.run_agent(
+                ScriptedClient([[create, create, unavailable]]), "fixture-model",
+                [{"role": "user", "content": "Create two events and reschedule the meeting."}],
+                AsyncMock(), approver, tools=["add_calendar_event", "update_event"],
+                direct_calls=[create, create, unavailable],
+                include_memory_context=False, max_steps=3)
+        self.assertEqual(result, EVENT_UPDATE_UNAVAILABLE)
+        approver.confirm.assert_not_awaited()
+        created.assert_not_awaited()
+        updated.assert_not_awaited()
+
+    async def test_embedded_future_task_verbs_do_not_hijack_creation(self):
+        for prompt in ("create a reminder tomorrow to reschedule my meeting",
+                       "remind me tomorrow to reschedule my dentist reminder",
+                       "remind me to find my dentist reminder tomorrow",
+                       "remind me tomorrow to append a line to my meeting note"):
+            with self.subTest(prompt=prompt):
+                d = await R.route(prompt)
+                self.assertEqual(d.reminder_action, "create")
+                self.assertIn("add_reminder", d.tool_subset)
+                self.assertFalse({"update_event", "update_reminder", "append_note"}
+                                 .intersection(d.tool_subset))
+
+    async def test_capability_lists_cannot_act_or_start_reminder_clarification(self):
+        for prompt in ("Can you send texts and create reminders?",
+                       "Can you send text messages, create reminders, and read browser history?"):
+            with self.subTest(prompt=prompt):
+                d = await R.route(prompt)
+                self.assertEqual(d.tool_subset, ["wisp_capabilities"])
+                self.assertEqual(d.direct_calls[0][0], "wisp_capabilities")
+                self.assertEqual(d.required_tool_groups, (frozenset({"wisp_capabilities"}),))
+                self.assertEqual(d.reminder_action, "")
+                self.assertIsNone(d.force_first_tool)
+                self.assertEqual(d.tool_argument_bindings, {})
+        d = await R.route("can you send texts to Mom and create reminders for tomorrow")
+        self.assertNotIn("wisp_capabilities", d.tool_subset)
+        self.assertEqual(d.tool_subset, [])
+        self.assertEqual(d.required_tool_groups, ())
+        self.assertEqual(d.direct_calls, [])
+        self.assertIsNone(d.force_first_tool)
+        self.assertFalse(d.needs_tools)
+
+    def assertClockClarification(self, d):
+        self.assertEqual(d.reminder_action, "clarify_time")
+        self.assertEqual(d.tool_subset, ["get_upcoming"])
+        self.assertFalse(CREATION.intersection(d.tool_subset))
+        self.assertEqual(d.direct_calls, [])
+        self.assertIsNone(d.force_first_tool)
+        self.assertFalse(d.expect_tool_first)
+        self.assertEqual(d.required_tool_groups, ())
+        self.assertEqual(d.tool_argument_bindings, {})
+
+    async def test_unsupported_clock_initial_and_followup_cannot_create(self):
+        for clock in ("half six tomorrow", "half past six tomorrow", "quarter to six tomorrow",
+                      "tomorrow at six", "tomorrow at 6:7", "tomorrow at 25:00",
+                      "6 or 7 tomorrow", "six pm tomorrow", "25pm tomorrow"):
+            with self.subTest(clock=clock):
+                self.assertTrue(has_unsupported_alert_clock(clock))
+                self.assertFalse(has_alert_time(clock))
+                self.assertIsNone(resolve_alert_datetime(clock, now=NOW))
+                self.assertClockClarification(await R.route("set an alarm for " + clock))
+                self.assertClockClarification(await R.route(
+                    clock, last_user="set an alarm for my medicine",
+                    last_assistant="What time should I set the reminder?"))
+        for prompt in ("set an alarm tomorrow 25:00 to take medicine",
+                       "set an alarm tomorrow 6:7 to take medicine",
+                       "set an alarm at six thirty tomorrow to take medicine",
+                       "set an alarm six thirty tomorrow to take medicine"):
+            with self.subTest(prompt=prompt):
+                self.assertClockClarification(await R.route(prompt))
+        self.assertClockClarification(await R.route("set an alarm at half six"))
+        unrelated = await R.route("show my notes about half six",
+                                  last_assistant="What time should I set the reminder?")
+        self.assertEqual(unrelated.tool_subset, ["search_notes"])
+        self.assertEqual(unrelated.reminder_action, "")
+        question = await R.route("what does half six mean?",
+                                 last_assistant="What time should I set the reminder?")
+        self.assertEqual(question.reminder_action, "")
+
+    async def test_supported_clock_date_defaults_and_relative_times_are_preserved(self):
+        for prompt, expected in (
+                ("set an alarm at 6:30 am tomorrow", "2026-09-10T06:30"),
+                ("set an alarm tomorrow", "2026-09-10T09:00"),
+                ("set an alarm tomorrow at 6", "2026-09-10T18:00"),
+                ("remind me tomorrow at 9am to prepare for my 1:1", "2026-09-10T09:00"),
+                ("set an alarm at noon tomorrow", "2026-09-10T12:00"),
+                ("set an alarm at 6pm tomorrow for half an hour of exercise", "2026-09-10T18:00")):
+            with self.subTest(prompt=prompt):
+                self.assertFalse(has_unsupported_alert_clock(prompt))
+                self.assertEqual(resolve_alert_datetime(prompt, now=NOW).isoformat(timespec="minutes"), expected)
+                d = await R.route(prompt)
+                self.assertEqual(d.reminder_action, "create")
+                self.assertEqual(d.tool_argument_bindings["add_reminder"]["when_iso"], expected)
+        for text in ("in half an hour", "30 minutes before", "the day before"):
+            with self.subTest(text=text):
+                self.assertFalse(has_unsupported_alert_clock(text))
+                self.assertTrue(has_alert_time(text))
+        d = await R.route("set an alarm for my repair appointment tomorrow at 1pm")
+        self.assertEqual(d.reminder_action, "clarify_time")
+
+    async def test_attempted_creation_during_clock_clarification_is_never_executed(self):
+        effect = AsyncMock(side_effect=AssertionError("creation must not execute"))
+        # Real dispatch rejection, not test_mode's dry-run interception.
+        with patch.object(REGISTRY["add_reminder"], "func", effect):
+            result, _, approver = await self.run_loop(
+                "set an alarm for half six tomorrow", [
+                    ("add_reminder", {"title": "medicine", "when_iso": "2026-09-10T09:00"}),
+                    "What exact time should I use for the reminder?"])
+        effect.assert_not_awaited()
+        approver.confirm.assert_not_awaited()
+        self.assertNotIn("Reminder set:", result)
+        self.assertIn("?", result)
+
+
+class TypedClockContractTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="wisp-routing-contract-")))
+        self.sessions = SessionStore(root / "sessions.db")
+        self.assistant = AssistantStore(root / "assistant.db")
+        self.addCleanup(self.sessions._db.close)
+        self.addCleanup(self.assistant._db.close)
+        self.sid = self.sessions.create_session()
+
+    def prepare(self, prompt):
+        return prepare_task_turn(self.sessions, self.sid, prompt,
+                                 assistant_store=self.assistant, now=NOW)
+
+    def test_reminder_search_reads_overdue_records_and_excludes_calendar_events(self):
+        self.assistant.add_manual("dentist overdue", (NOW - timedelta(days=1)).timestamp())
+        self.assistant.add_manual("dentist upcoming", (NOW + timedelta(days=1)).timestamp())
+        self.assistant.sync_source("calendar", [{
+            "source_id": "fixture-meeting", "kind": "event", "title": "dentist calendar event",
+            "when_ts": (NOW + timedelta(days=1)).timestamp()}])
+        fresh = {"sources": [{"id": "reminders", "state": "ready"}],
+                 "reminders_fresh": True}
+        # The fixture's NOW is fixed in the past; pin the clock to it so the
+        # 14-day Wisp-only expiry judges "overdue" against the same instant.
+        with patch.object(assistant_tools, "assistant_store", self.assistant), \
+             patch("service.tools.assistant_tools.time.time", return_value=NOW.timestamp()), \
+             patch("service.assistant.sync_status.ensure_sources",
+                   new_callable=AsyncMock, return_value=fresh):
+            result = asyncio.run(assistant_tools.search_reminders("dentist"))
+        self.assertIn("dentist overdue", result)
+        self.assertIn("dentist upcoming", result)
+        self.assertNotIn("dentist calendar event", result)
+
+    def test_initial_typed_creation_and_update_have_no_guessed_time(self):
+        for prompt in ("set an alarm for half six tomorrow",
+                       "set an alarm at half six tomorrow to take medicine",
+                       "set an alarm for 6 or 7 tomorrow",
+                       "set an alarm for six pm tomorrow", "set an alarm for 25pm tomorrow"):
+            with self.subTest(prompt=prompt):
+                plan = compile_reminder_create(prompt, now=NOW)
+                self.assertIsNotNone(plan)
+                self.assertEqual(plan.status, "waiting_for_input")
+                self.assertEqual(plan.temporal.absolute_iso, "")
+                self.assertEqual(plan.temporal.defaulted_part_of_day, "")
+                self.assertIn("temporal.time", plan.missing_slots)
+                with self.assertRaises(InvalidTaskPlan):
+                    plan_task(plan)
+        plan = compile_reminder_update("reschedule my medicine reminder to tomorrow at half six", now=NOW)
+        self.assertEqual(plan.target.value, "medicine")
+        self.assertEqual(plan.temporal.absolute_iso, "")
+        self.assertIn("update.change", plan.missing_slots)
+        valid = compile_reminder_create("remind me tomorrow at 9am to prepare for my 1:1", now=NOW)
+        self.assertEqual(valid.status, "ready")
+        self.assertEqual(valid.temporal.absolute_iso, "2026-09-10T09:00")
+        self.assertEqual(valid.subject.value, "prepare for my 1:1")
+
+    def test_pending_create_preserves_plan_then_accepts_precise_reply(self):
+        first = self.prepare("set an alarm at half six tomorrow to take medicine")
+        self.assertFalse(first.executable)
+        self.assertIn("temporal.time", first.plan.missing_slots)
+        snapshot = self.sessions.active_task(self.sid)
+        for reply in ("half six tomorrow", "tomorrow at 6:7", "6 or 7 tomorrow"):
+            second = self.prepare(reply)
+            self.assertIsNotNone(second)
+            self.assertFalse(second.executable)
+            self.assertEqual(second.plan.steps, [])
+            self.assertEqual(second.event, "clock_clarification")
+            self.assertEqual(self.sessions.active_task(self.sid), snapshot)
+        final = self.prepare("6:30 am tomorrow")
+        self.assertTrue(final.executable)
+        self.assertEqual(final.plan.id, first.plan.id)
+        self.assertEqual(final.plan.subject.value, first.plan.subject.value)
+        self.assertEqual(final.plan.temporal.absolute_iso, "2026-09-10T06:30")
+        self.assertEqual([step.tool for step in final.plan.steps], ["add_reminder"])
+
+    def test_pending_update_preserves_target_then_accepts_precise_reply(self):
+        row = self.assistant.add_manual("medicine", (NOW + timedelta(days=2)).timestamp())
+        first = self.prepare("reschedule my medicine reminder")
+        self.assertFalse(first.executable)
+        snapshot = self.sessions.active_task(self.sid)
+        second = self.prepare("half six tomorrow")
+        self.assertFalse(second.executable)
+        self.assertEqual(second.event, "clock_clarification")
+        self.assertEqual(self.sessions.active_task(self.sid), snapshot)
+        final = self.prepare("6:30 am tomorrow")
+        self.assertTrue(final.executable)
+        self.assertEqual(final.plan.id, first.plan.id)
+        self.assertEqual(final.plan.temporal.absolute_iso, "2026-09-10T06:30")
+        self.assertEqual(final.plan.steps[0].tool, "update_reminder")
+        self.assertEqual(final.plan.steps[0].args["expected_id"], row["id"])
+
+    def test_pending_clock_does_not_swallow_cancellation_or_new_task(self):
+        self.prepare("set an alarm at half six tomorrow to take medicine")
+        self.assertIsNone(self.prepare("check my email"))
+        self.assertIsNone(self.prepare("show my notes about half six"))
+        cancelled = self.prepare("cancel")
+        self.assertEqual(cancelled.plan.status, "cancelled")
+        self.assertFalse(cancelled.executable)
+        fresh = self.prepare("remind me tomorrow at noon to drink water")
+        self.assertTrue(fresh.executable)
+        self.assertEqual(fresh.plan.temporal.absolute_iso, "2026-09-10T12:00")
+
+
+class AsyncEntryContractTests(unittest.IsolatedAsyncioTestCase):
+    """Use production entry order, not just the downstream route oracle."""
+
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="wisp-routing-entry-")))
+        self.sessions = SessionStore(root / "sessions.db")
+        self.assistant = AssistantStore(root / "assistant.db")
+        self.addCleanup(self.sessions._db.close)
+        self.addCleanup(self.assistant._db.close)
+        self.enterContext(patch.object(R, "models_config", return_value={
+            "tool_retrieval": {"provider": "lexical"}}))
+
+    async def prepare(self, sid, prompt):
+        return await prepare_task_turn_async(
+            self.sessions, sid, prompt, assistant_store=self.assistant,
+            now=NOW, allow_native=False,
+            contacts_resolver=lambda name: [])
+
+    async def test_scheduled_email_reply_stops_before_native_source_or_send_execution(self):
+        for prompt in (
+                "reply to Dan's email tomorrow saying Thanks",
+                "reply all to the email from Dan at 6pm saying Thanks everyone",
+                "respond to the email from Dan in 20 minutes saying Got it",
+                "schedule a reply to Dan's email for tomorrow saying Thanks",
+                "schedule an email response to Dan's email saying Thanks",
+                "reply to Dan's email next Monday saying Thanks",
+                "reply to Dan's email this evening saying Thanks",
+                "reply to Dan's email Friday saying Thanks",
+                "reply to Dan's email at 6 saying Thanks",
+                "reply to Dan's email at 6:30pm saying Thanks",
+                "reply to Dan's email at 06:30 saying Thanks",
+                "reply to Dan's email at 18 saying Thanks",
+                "reply to Dan's email at 18:00 saying Thanks",
+                "reply to Dan's email next Friday at 6 saying Thanks",
+                "reply to Dan's email on 9/12 at 18:00 saying Thanks",
+                "reply to Dan's email September 12 saying Thanks",
+                "reply to Dan's email September 12 at 6:30pm saying Thanks",
+                "reply to Dan's email Friday about the launch saying Thanks",
+                "reply to Dan's email at 6 about the meeting saying Thanks",
+                "reply to Dan's email tomorrow about September 12 saying Thanks",
+                'reply to Dan\'s email about "Friday launch" at 18:00 saying Thanks'):
+            with self.subTest(prompt=prompt):
+                reply = AsyncMock(side_effect=AssertionError("reply must not send"))
+                scheduled = AsyncMock(side_effect=AssertionError("standalone send must not schedule"))
+                prepare = AsyncMock(side_effect=AssertionError("native reply must not prepare"))
+                warm = AsyncMock(side_effect=AssertionError("Mail must not warm"))
+                with patch.object(REGISTRY["reply_to_email"], "func", reply), \
+                        patch.object(REGISTRY["schedule_send"], "func", scheduled), \
+                        patch("service.tools.email_tools.ensure_reply_source", warm), \
+                        patch("service.tasks.source_readers.current_mail_reader",
+                              side_effect=AssertionError("Mail reader must not be constructed")) as read:
+                    turn = await prepare_task_turn_async(
+                        self.sessions, self.sessions.create_session(), prompt,
+                        assistant_store=self.assistant, now=NOW, allow_native=True,
+                        reply_preparer=prepare, contacts_resolver=lambda name: [])
+                self.assertIsNotNone(turn)
+                self.assertFalse(turn.executable)
+                self.assertEqual(turn.event, "reply_schedule_unsupported")
+                self.assertEqual(
+                    turn.response,
+                    "Scheduling an email reply isn’t supported yet. Nothing was sent.",
+                )
+                self.assertIn("reply.schedule", turn.plan.missing_slots)
+                self.assertEqual(turn.plan.steps, [])
+                warm.assert_not_awaited()
+                read.assert_not_called()
+                prepare.assert_not_awaited()
+                reply.assert_not_awaited()
+                scheduled.assert_not_awaited()
+
+    async def test_opening_reply_time_ambiguity_stops_before_native_mail_access(self):
+        for when in ("at 6", "at 6pm", "at 6:30pm", "at 06:30", "at 18",
+                     "at 18:00", "tomorrow", "tomorrow at 06:30", "next Friday",
+                     "next Friday at 18:00", "on September 12", "on 9/12 at 6pm"):
+            with self.subTest(when=when):
+                warm = AsyncMock(side_effect=AssertionError("Mail must not warm"))
+                prepare = AsyncMock(side_effect=AssertionError("native reply must not prepare"))
+                with patch("service.tools.email_tools.ensure_reply_source", warm), \
+                        patch("service.tasks.source_readers.current_mail_reader",
+                              side_effect=AssertionError("Mail reader must not be constructed")) as read:
+                    turn = await prepare_task_turn_async(
+                        self.sessions, self.sessions.create_session(),
+                        f"reply to Dan's email saying Thanks {when}",
+                        assistant_store=self.assistant, now=NOW, allow_native=True,
+                        reply_preparer=prepare)
+                self.assertEqual(turn.event, "language_clarification")
+                self.assertFalse(turn.executable)
+                self.assertEqual(turn.plan.steps, [])
+                warm.assert_not_awaited()
+                read.assert_not_called()
+                prepare.assert_not_awaited()
+
+    async def test_scheduled_reply_clarification_stops_before_native_mail_access(self):
+        sid = self.sessions.create_session()
+        asked = await prepare_task_turn_async(
+            self.sessions, sid, "reply to Dan's email saying Thanks at 6pm",
+            assistant_store=self.assistant, now=NOW, allow_native=True,
+            mail_reader=object(), reply_preparer=AsyncMock())
+        self.assertEqual(asked.event, "language_clarification")
+
+        for answer in ("send then", "when to send", "delivery time"):
+            with self.subTest(answer=answer):
+                # Restore the same pending clarification for each independent
+                # production-mode ordering check.
+                if answer != "send then":
+                    sid = self.sessions.create_session()
+                    await prepare_task_turn_async(
+                        self.sessions, sid, "reply to Dan's email saying Thanks at 6pm",
+                        assistant_store=self.assistant, now=NOW, allow_native=True,
+                        mail_reader=object(), reply_preparer=AsyncMock())
+                warm = AsyncMock(side_effect=AssertionError("Mail must not warm"))
+                prepare = AsyncMock(side_effect=AssertionError("native reply must not prepare"))
+                with patch("service.tools.email_tools.ensure_reply_source", warm), \
+                        patch("service.tasks.source_readers.current_mail_reader",
+                              side_effect=AssertionError("Mail reader must not be constructed")) as read:
+                    turn = await prepare_task_turn_async(
+                        self.sessions, sid, answer, assistant_store=self.assistant,
+                        now=NOW, allow_native=True, reply_preparer=prepare)
+                self.assertEqual(turn.event, "reply_schedule_unsupported")
+                self.assertFalse(turn.executable)
+                self.assertEqual(
+                    turn.response,
+                    "Scheduling an email reply isn’t supported yet. Nothing was sent.",
+                )
+                self.assertEqual(turn.plan.steps, [])
+                warm.assert_not_awaited()
+                read.assert_not_called()
+                prepare.assert_not_awaited()
+
+    def test_future_reply_phrases_are_typed_as_unsupported_scheduling(self):
+        for when in ("next Monday", "this evening", "Friday", "next Friday morning",
+                     "in six hours", "at noon", "on Tuesday", "at 6", "at 06:30",
+                     "at 6:30pm", "at 18", "at 18:00", "next Friday at 6",
+                     "September 12", "September 12 at 6:30pm",
+                     "Sep 12, 2026", "12 September", "9/12", "2026-09-12"):
+            with self.subTest(when=when):
+                plan = compile_task(f"reply to Dan's email {when} saying Thanks", now=NOW)
+                self.assertIsNotNone(plan)
+                self.assertEqual(plan.intent, "email.reply")
+                self.assertIn("reply.schedule", plan.missing_slots)
+
+    async def test_ordinary_and_quoted_time_reply_controls_still_prepare_immediately(self):
+        from service.tasks.source_readers import MailReader
+
+        row = {
+            "account": "Work", "message_id": "<fixture-one>",
+            "sender": "Dan <dan@example.test>", "to": "me@example.test",
+            "subject": "Dinner", "body": "Original", "ts": NOW.timestamp(),
+        }
+        envelope = {
+            "message_id": "<fixture-one>", "account": "Work",
+            "account_id": "fixture-account", "from": "me@example.test",
+            "to": ["dan@example.test"], "cc": [], "bcc": [],
+            "subject": "Re: Dinner", "content": "Thanks\rOriginal",
+        }
+
+        async def prepared(args):
+            expected = {**envelope, "content": str(args["body"]) + "\rOriginal"}
+            return {**args, "expected_reply": expected}, ""
+
+        for prompt in ("reply to Dan's email saying Thanks",
+                       'reply to Dan\'s email saying "Thanks at 6pm"'):
+            with self.subTest(prompt=prompt):
+                warm = AsyncMock()
+                reader = MailReader([row], accounts=["Work"], synced_at=NOW.timestamp())
+                with patch("service.tools.email_tools.ensure_reply_source", warm), \
+                        patch("service.tasks.source_readers.current_mail_reader",
+                              return_value=reader) as read:
+                    turn = await prepare_task_turn_async(
+                        self.sessions, self.sessions.create_session(), prompt,
+                        assistant_store=self.assistant, now=NOW, allow_native=True,
+                        reply_preparer=prepared)
+                self.assertTrue(turn.executable)
+                self.assertEqual(turn.event, "execution_started")
+                self.assertEqual([step.tool for step in turn.plan.steps], ["reply_to_email"])
+                warm.assert_awaited_once()
+                read.assert_called_once_with()
+
+    async def test_temporal_email_topics_remain_immediate_source_selectors(self):
+        from service.tasks.source_readers import MailReader
+
+        cases = (
+            ("Dan's email about September 12", "September 12"),
+            ("Dan's email about the meeting at 6", "Meeting at 6"),
+            ('Dan\'s email about "2026-09-12"', "2026-09-12"),
+            ("the email from Dan about September 15 launch", "September 15 launch"),
+            ("the email from Dan about 2026-09-15 launch", "2026-09-15 launch"),
+            ("the email from Dan about Friday lunch", "Friday lunch"),
+            ('the email from Dan about "tomorrow" project', '"tomorrow" project'),
+            ('Dan\'s email about "tomorrow at 18:00"', "tomorrow at 18:00"),
+            ("Dan's email about 9/12 at 6pm", "9/12 at 6pm"),
+        )
+        for reference, subject in cases:
+            with self.subTest(reference=reference):
+                row = {
+                    "account": "Work", "message_id": "<topic-fixture>",
+                    "sender": "Dan <dan@example.test>", "to": "me@example.test",
+                    "subject": subject, "body": "Original", "ts": NOW.timestamp(),
+                }
+                reader = MailReader([row], accounts=["Work"], synced_at=NOW.timestamp())
+                warm = AsyncMock()
+
+                async def prepared(args):
+                    envelope = {
+                        "message_id": "<topic-fixture>", "account": "Work",
+                        "account_id": "fixture-account", "from": "me@example.test",
+                        "to": ["dan@example.test"], "cc": [], "bcc": [],
+                        "subject": "Re: " + subject, "content": "Thanks\rOriginal",
+                    }
+                    return {**args, "expected_reply": envelope}, ""
+
+                with patch("service.tools.email_tools.ensure_reply_source", warm), \
+                        patch("service.tasks.source_readers.current_mail_reader",
+                              return_value=reader) as read:
+                    turn = await prepare_task_turn_async(
+                        self.sessions, self.sessions.create_session(),
+                        f"reply to {reference} saying Thanks",
+                        assistant_store=self.assistant, now=NOW, allow_native=True,
+                        reply_preparer=prepared)
+                self.assertTrue(turn.executable, (turn.event, turn.plan.missing_slots))
+                self.assertEqual(turn.event, "execution_started")
+                self.assertNotIn("reply.schedule", turn.plan.missing_slots)
+                self.assertEqual([step.tool for step in turn.plan.steps], ["reply_to_email"])
+                warm.assert_awaited_once()
+                read.assert_called_once_with()
+
+    def test_scheduled_reply_limitation_is_in_both_tool_contracts(self):
+        schedule = REGISTRY["schedule_send"].description
+        reply = REGISTRY["reply_to_email"].description
+        self.assertIn("NEW standalone email or text", schedule)
+        self.assertIn("cannot schedule a reply", schedule)
+        self.assertIn("scheduling a reply in-thread is not supported", reply)
+        self.assertIn("do not substitute schedule_send", reply)
+
+    async def _assert_reply_boundary(self, prompt, subject, expected="execution_started", body="Thanks"):
+        """Use a matching source even for negative cases: absence cannot mask a leak."""
+        from service.tasks.source_readers import MailReader
+        row = {
+            "account": "Work", "message_id": "<structured-fixture>",
+            "sender": "Dan <dan@example.test>", "to": "me@example.test",
+            "subject": subject, "body": "Original", "ts": NOW.timestamp(),
+        }
+        reader = MailReader([row], accounts=["Work"], synced_at=NOW.timestamp())
+
+        async def prepared(args):
+            self.assertEqual(args["body"], body)
+            envelope = {
+                "message_id": "<structured-fixture>", "account": "Work",
+                "account_id": "fixture-account", "from": "me@example.test",
+                "to": ["dan@example.test"], "cc": [], "bcc": [],
+                "subject": "Re: " + subject, "content": body + "\rOriginal",
+            }
+            return {**args, "expected_reply": envelope}, ""
+
+        warm, prep = AsyncMock(), AsyncMock(side_effect=prepared)
+        with patch("service.tools.email_tools.ensure_reply_source", warm), \
+                patch("service.tasks.source_readers.current_mail_reader", return_value=reader) as read, \
+                patch.object(REGISTRY["reply_to_email"], "func", AsyncMock()) as send, \
+                patch.object(REGISTRY["schedule_send"], "func", AsyncMock()) as schedule:
+            turn = await prepare_task_turn_async(
+                self.sessions, self.sessions.create_session(), prompt,
+                assistant_store=self.assistant, now=NOW, allow_native=True, reply_preparer=prep)
+        self.assertEqual(turn.event, expected, (prompt, turn.plan.missing_slots))
+        if expected == "execution_started":
+            self.assertTrue(turn.executable)
+            self.assertEqual([step.tool for step in turn.plan.steps], ["reply_to_email"])
+            self.assertEqual((warm.await_count, read.call_count, prep.await_count), (1, 1, 1))
+        else:
+            self.assertFalse(turn.executable)
+            self.assertEqual(turn.plan.steps, [])
+            self.assertEqual((warm.await_count, read.call_count, prep.await_count), (0, 0, 0))
+        send.assert_not_awaited()
+        schedule.assert_not_awaited()
+
+    async def test_structured_reply_topic_composition_matrix(self):
+        from service.tasks.reply_engine import mail_reference
+        articles = ("", "the ", "a ", "an ")
+        quotes = (("", ""), ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"))
+        topics = ("Friday lunch", "September 15 launch", "meeting at 18:00", "meeting at 6pm")
+        bodies = (("Thanks", "Thanks"), ('"See you at 18:00"', "See you at 18:00"),
+                  ("At 6pm I can join", "At 6pm I can join"))
+        for a, article in enumerate(articles):
+            for q, (left, right) in enumerate(quotes):
+                for t, topic in enumerate(topics):
+                    for b, (raw_body, body) in enumerate(bodies):
+                        source = ("Dan's email", "the email from Dan")[(a + q + t + b) % 2]
+                        reference = f"{source} about {article}{left}{topic}{right}"
+                        prompt = f"reply to {reference} saying {raw_body}"
+                        with self.subTest(prompt=prompt):
+                            self.assertEqual(mail_reference(reference).hints, {"sender": "Dan", "topic": topic})
+                            await self._assert_reply_boundary(prompt, topic, body=body)
+
+    async def test_structured_reply_delivery_composition_matrix(self):
+        articles = ("", "the ", "a ", "an ")
+        quotes = (("", ""), ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"))
+        times = ("at 6", "at 6:30pm", "at 18:00", "next Monday", "on 2026-09-15", "September 15")
+        for a, article in enumerate(articles):
+            for q, (left, right) in enumerate(quotes):
+                for w, when in enumerate(times):
+                    for leading in (False, True):
+                        source = ("Dan's email", "the email from Dan")[(a + q + w) % 2]
+                        topic = f"{article}{left}Friday launch{right}"
+                        reference = (f"{source} {when} about {topic}" if leading
+                                     else f"{source} about {topic} {when}")
+                        prompt = f"reply to {reference} saying Thanks"
+                        with self.subTest(prompt=prompt):
+                            await self._assert_reply_boundary(
+                                prompt, "Friday launch " + when, "reply_schedule_unsupported")
+
+    async def test_structured_reply_quote_and_body_boundaries(self):
+        # Delimiter words and temporal tokens inside quotes remain literal.
+        immediate = (
+            ('the "saying tomorrow at 18:00"', "saying tomorrow at 18:00"),
+            ('a “that says Friday”', "that says Friday"),
+            ('an ‘and say September 12’', "and say September 12"),
+            ('"The Friday launch"', "The Friday launch"),
+            ('the "tomorrow" project', '"tomorrow" project'),
+            ('"today in the Work account"', "today in the Work account"),
+            ("'Dan's Friday lunch'", "Dan's Friday lunch"),
+        )
+        for selector, topic in immediate:
+            with self.subTest(selector=selector):
+                await self._assert_reply_boundary(f"reply to Dan's email about {selector} saying Thanks", topic)
+        for selector in ('the "Friday launch at 18:00', 'a “Friday launch” at half six',
+                         'an ‘Friday launch’ at 6:7', 'the launch tomorrow',
+                         'the launch at 18:00', 'the launch next Friday',
+                         'the "Friday launch" at', 'the "Friday launch" next',
+                         'a "Friday launch" in 30 seconds'):
+            with self.subTest(selector=selector):
+                await self._assert_reply_boundary(
+                    f"reply to Dan's email about {selector} saying Thanks", selector,
+                    "reply_schedule_unsupported")
+        for when in ("at 18:00", "at 6", "September 15", "next Friday", "at half six", "at 6:7", "by 6pm"):
+            with self.subTest(when=when):
+                await self._assert_reply_boundary(
+                    f'reply to Dan\'s email about the "Friday launch" saying Thanks {when}',
+                    "Friday launch", "language_clarification")
+                await self._assert_reply_boundary(
+                    f'reply to Dan\'s email about the "Friday launch" saying "Thanks" {when}',
+                    "Friday launch", "reply_schedule_unsupported")
+
+    def test_structured_reply_parts_preserve_literal_boundaries(self):
+        from service.tasks.reply_parser import parse_reply_parts
+        parts = parse_reply_parts('the email from Dan at 18:00 about the "saying Friday" saying "Meet at 6"')
+        self.assertEqual(parts.source, "the email from Dan at 18:00")
+        self.assertEqual(parts.topic, "saying Friday")
+        self.assertEqual(parts.raw_topic, '"saying Friday"')
+        self.assertEqual(parts.raw_body, '"Meet at 6"')
+        self.assertEqual(parts.schedule_requested, "at 18:00")
+        from service.tasks.reply_engine import mail_reference
+        self.assertEqual(mail_reference('the email from Dan about the "Friday lunch" in the Work account').hints,
+                         {"sender": "Dan", "topic": "Friday lunch", "account": "Work"})
+        self.assertEqual(mail_reference('the email from Dan today about "today in the Work account"').hints,
+                         {"sender": "Dan", "topic": "today in the Work account", "day": "today"})
+
+    async def _assert_exact_reply_source(self, prompt, *, day="today", expected="execution_started",
+                                         intended_present=True, sid=None, constraint_decoys=False,
+                                         body="Thanks"):
+        from service.tasks.source_readers import MailReader
+        stamp = NOW - timedelta(days=day == "yesterday")
+        rows = [dict(account="Work", message_id="<wrong-account>",
+                     sender="Dan Account Manager <wrong@example.test>", to="me@example.test",
+                     subject="launch", body="Decoy", ts=stamp.timestamp()),
+                dict(account="Work Account", message_id="<wrong-day>",
+                     sender="Dan <dan@example.test>", to="me@example.test",
+                     subject="launch", body="Decoy", ts=(stamp - timedelta(days=2)).timestamp())]
+        if intended_present:
+            rows.append(dict(account="Work Account", message_id="<intended>",
+                             sender="Dan <dan@example.test>", to="me@example.test",
+                             subject="launch", body="Original", ts=stamp.timestamp()))
+        # Account-only tests do not request a source day, so keep only the
+        # wrong-account decoy; day tests also include a wrong-day decoy.
+        if constraint_decoys:
+            rows.extend([
+                dict(account="Work Account", message_id="<wrong-sender>",
+                     sender="Eve <eve@example.test>", to="me@example.test", subject="launch",
+                     body="Decoy", ts=stamp.timestamp()),
+                dict(account="Work Account", message_id="<wrong-topic>",
+                     sender="Dan <dan@example.test>", to="me@example.test", subject="Different subject",
+                     body="Decoy", ts=stamp.timestamp()),
+            ])
+        elif "today" not in prompt and "yesterday" not in prompt:
+            rows = [row for row in rows if row["message_id"] != "<wrong-day>"]
+        reader = MailReader(rows, accounts=["Work Account", "Work"], synced_at=NOW.timestamp())
+
+        async def prepared(args):
+            self.assertEqual((args["account"], args["message_id"]), ("Work Account", "<intended>"))
+            self.assertEqual(args["body"], body)
+            return {**args, "expected_reply": {
+                "account": "Work Account", "account_id": "synthetic-account",
+                "message_id": "<intended>", "from": "me@example.test", "to": ["dan@example.test"],
+                "cc": [], "bcc": [], "subject": "Re: launch", "content": body + "\rOriginal",
+            }}, ""
+
+        warm, prep = AsyncMock(), AsyncMock(side_effect=prepared)
+        with patch("service.tools.email_tools.ensure_reply_source", warm), \
+                patch("service.tasks.source_readers.current_mail_reader", return_value=reader) as read, \
+                patch.object(REGISTRY["reply_to_email"], "func", AsyncMock()) as send:
+            turn = await prepare_task_turn_async(
+                self.sessions, sid or self.sessions.create_session(), prompt,
+                assistant_store=self.assistant, now=NOW, allow_native=True, reply_preparer=prep)
+        self.assertEqual(turn.event, expected, (prompt, turn.plan.missing_slots))
+        if expected == "execution_started":
+            self.assertTrue(turn.executable)
+            self.assertEqual([s.tool for s in turn.plan.steps], ["reply_to_email"])
+            self.assertEqual((warm.await_count, read.call_count, prep.await_count), (1, 1, 1))
+        else:
+            self.assertFalse(turn.executable)
+            self.assertEqual(turn.plan.steps, [])
+            prep.assert_not_awaited()
+            if expected not in {"source_no_match", "reply_body_needed"}:
+                self.assertEqual((warm.await_count, read.call_count), (0, 0))
+        send.assert_not_awaited()
+        return turn
+
+    async def test_exact_account_boundaries_with_decoys(self):
+        from service.tasks.reply_engine import mail_reference
+        for left, right in (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’")):
+            account = f"in the {left}Work Account{right} account"
+            for reference in (f"the email from Dan about launch {account}",
+                              f"the email from Dan {account} about launch",
+                              f"the email {account} from Dan about launch",
+                              f"Dan's email {account} about launch"):
+                with self.subTest(reference=reference):
+                    self.assertEqual(mail_reference(reference).hints,
+                                     {"account": "Work Account", "sender": "Dan", "topic": "launch"})
+                    await self._assert_exact_reply_source(f"reply to {reference} saying Thanks")
+                    await self._assert_exact_reply_source(f"reply to {reference} saying Thanks",
+                                                         expected="source_no_match", intended_present=False)
+        for reference, hints in (
+                ('the email from "Dan in Work account" about Friday lunch',
+                 {"sender": '"Dan in Work account"', "topic": "Friday lunch"}),
+                ('the email from "Dan Today" about Friday lunch',
+                 {"sender": '"Dan Today"', "topic": "Friday lunch"}),
+                ('the email from Dan about Friday lunch in the ‘Work’ account',
+                 {"sender": "Dan", "topic": "Friday lunch", "account": "Work"})):
+            with self.subTest(reference=reference):
+                self.assertEqual(mail_reference(reference).hints, hints)
+
+    async def test_ambiguous_accounts_stop_before_mail_and_can_be_corrected(self):
+        from service.tasks.reply_engine import mail_reference
+        for account in ('in the "Work Account', 'in the "" account', 'in the "Work Account"',
+                        'in Work Account account', 'in "Work Account" account on Work account',
+                        'in Work "Account" account', 'in the account'):
+            prompt = f"reply to the email from Dan about launch {account} saying Thanks"
+            with self.subTest(account=account):
+                self.assertEqual(mail_reference(f"the email from Dan about launch {account}").hints, {})
+                await self._assert_exact_reply_source(prompt, expected="source_selector_ambiguous")
+        sid = self.sessions.create_session()
+        await self._assert_exact_reply_source(
+            'reply to the email from Dan about launch in "" account saying Thanks',
+            expected="source_selector_ambiguous", sid=sid)
+        await self._assert_exact_reply_source('in "Work Account"', expected="source_selector_ambiguous", sid=sid)
+        await self._assert_exact_reply_source('the email from Dan about launch in "Work Account" account', sid=sid)
+        sid = self.sessions.create_session()
+        await self._assert_exact_reply_source(
+            'reply to the email from Dan about launch in "" account saying Thanks',
+            expected="source_selector_ambiguous", sid=sid)
+        await self._assert_exact_reply_source(
+            'the email from Dan today at 18:00 about launch in "Work Account" account',
+            expected="reply_schedule_unsupported", sid=sid)
+
+    async def test_source_day_punctuation_is_not_delivery(self):
+        from service.tasks.reply_engine import mail_reference
+        for day in ("today", "yesterday"):
+            for punctuation in ("", ",", ".", ";", ":"):
+                for source in ("Dan's email", "the email from Dan"):
+                    reference = f'{source} {day}{punctuation} in "Work Account" account about launch'
+                    with self.subTest(reference=reference):
+                        self.assertEqual(mail_reference(reference).hints,
+                                         {"account": "Work Account", "sender": "Dan", "day": day, "topic": "launch"})
+                        await self._assert_exact_reply_source(f"reply to {reference} saying Thanks", day=day)
+        for punctuation in ("", ",", ".", ";", ":"):
+            for when in ("at 6", "at 18:00", "at 6pm"):
+                prompt = (f'reply to Dan\'s email today{punctuation} {when} '
+                          'in "Work Account" account about launch saying Thanks')
+                with self.subTest(prompt=prompt):
+                    await self._assert_exact_reply_source(prompt, expected="reply_schedule_unsupported")
+
+    async def test_account_recovery_preserves_all_constraints_matrix(self):
+        quotes = (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"))
+        for left, right in quotes:
+            bad_accounts = (
+                (f'in {left}{right} account', True, True),
+                (f'in {left}Work Account{right} account on Work account', True, True),
+                (f'in Work {left}Account{right} account', True, True),
+                (f'in {left}Work Account{right}', False, True),
+                (f'in {left}Work Account', False, False),
+            )
+            for bad, recoverable, body_known in bad_accounts:
+                for position in range(3):
+                    for day in ("today", "yesterday"):
+                        reference = (
+                            f'the email {bad} from Dan {day}, about launch',
+                            f'the email from Dan {day}, {bad} about launch',
+                            f'the email from Dan {day}, about launch {bad}',
+                        )[position]
+                        for complete in (False, True):
+                            for intended_present in (False, True):
+                                with self.subTest(reference=reference, complete=complete, intended=intended_present):
+                                    sid = self.sessions.create_session()
+                                    first = await self._assert_exact_reply_source(
+                                        f'reply to {reference} saying Thanks', day=day,
+                                        expected="source_selector_ambiguous", sid=sid,
+                                        constraint_decoys=True, intended_present=intended_present)
+                                    original_body = first.plan.subject.value
+                                    correction = (f'the email from Dan {day}, about launch ' if complete else '')
+                                    correction += f'in {left}Work Account{right} account'
+                                    expected = ("source_selector_ambiguous" if not complete and not recoverable
+                                                else "reply_schedule_unsupported" if "reply.schedule" in first.plan.missing_slots
+                                                else "source_no_match" if not intended_present
+                                                else "reply_body_needed" if not body_known
+                                                else "execution_started")
+                                    second = await self._assert_exact_reply_source(
+                                        correction, day=day, expected=expected, sid=sid,
+                                        constraint_decoys=True, intended_present=intended_present)
+                                    self.assertEqual(second.plan.subject.value, original_body)
+                                    if expected != "source_selector_ambiguous":
+                                        self.assertEqual(second.plan.parameters["reference_hints"].value,
+                                                         {"account": "Work Account", "sender": "Dan",
+                                                          "topic": "launch", "day": day})
+                                    else:
+                                        self.assertEqual(second.plan.target.value, first.plan.target.value)
+
+    async def test_complete_account_correction_retains_unrepeated_day_and_body(self):
+        for correction in ('in "Work Account" account',
+                           'the email from Dan about launch in "Work Account" account'):
+            with self.subTest(correction=correction):
+                sid = self.sessions.create_session()
+                await self._assert_exact_reply_source(
+                    'reply to the email from Dan yesterday, about launch in "" account saying "Meet at 6"',
+                    expected="source_selector_ambiguous", sid=sid, day="yesterday", body="Meet at 6",
+                    constraint_decoys=True)
+                turn = await self._assert_exact_reply_source(correction, sid=sid, day="yesterday",
+                                                            body="Meet at 6", constraint_decoys=True)
+                self.assertEqual(turn.plan.parameters["reference_hints"].value,
+                                 {"account": "Work Account", "sender": "Dan", "topic": "launch", "day": "yesterday"})
+        sid = self.sessions.create_session()
+        await self._assert_exact_reply_source(
+            'reply to the email in "Work Account" from Dan yesterday, about launch saying Thanks',
+            expected="source_selector_ambiguous", sid=sid, day="yesterday", constraint_decoys=True)
+        turn = await self._assert_exact_reply_source(
+            'the email from Dan about launch in "Work Account" account',
+            sid=sid, day="yesterday", constraint_decoys=True)
+        self.assertEqual(turn.plan.parameters["reference_hints"].value["day"], "yesterday")
+
+    async def _pending_reply_turn(self, sid, prompt, rows, event, *, selected="", restart=False):
+        from service.tasks.source_readers import MailReader
+        reader = MailReader(rows, accounts=["Work Account", "Work", "Old Account"], synced_at=NOW.timestamp())
+        warm = AsyncMock()
+
+        async def prepared(args):
+            self.assertEqual(args["message_id"], selected)
+            self.assertEqual(args["body"], "Thanks")
+            return {**args, "expected_reply": {
+                "message_id": selected, "account": args["account"], "account_id": "fixture-account",
+                "from": "me@example.test", "to": ["fixture@example.test"], "cc": [], "bcc": [],
+                "subject": "Re: fixture", "content": "Thanks\rOriginal",
+            }}, ""
+
+        prep = AsyncMock(side_effect=prepared)
+        # Reopen the same synthetic database: no in-memory plan crosses turns.
+        database = self.sessions._db.execute("PRAGMA database_list").fetchone()[2]
+        sessions = SessionStore(Path(database)) if restart else self.sessions
+        try:
+            with patch("service.tools.email_tools.ensure_reply_source", warm), \
+                    patch("service.tasks.source_readers.current_mail_reader", return_value=reader) as read, \
+                    patch.object(REGISTRY["reply_to_email"], "func", AsyncMock()) as send:
+                turn = await prepare_task_turn_async(
+                    sessions, sid, prompt, assistant_store=self.assistant, now=NOW,
+                    allow_native=True, reply_preparer=prep)
+            self.assertEqual(turn.event, event, (prompt, turn.plan.parameters))
+            self.assertEqual(turn.executable, event == "execution_started")
+            if selected:
+                self.assertEqual((warm.await_count, read.call_count, prep.await_count), (1, 1, 1))
+            else:
+                self.assertEqual(turn.plan.steps, [])
+                prep.assert_not_awaited()
+                if event != "source_no_match":
+                    self.assertEqual((warm.await_count, read.call_count), (0, 0))
+            send.assert_not_awaited()
+            saved = sessions.active_task(sid)
+            self.assertEqual(saved["parameters"], turn.plan.to_dict()["parameters"])
+            return turn
+        finally:
+            if restart:
+                sessions._db.close()
+
+    @staticmethod
+    def _pending_row(mid, sender="Dan", topic="launch", day="yesterday"):
+        return dict(account="Work Account", message_id=mid, sender=sender, to="me@example.test",
+                    subject=topic, body="Original", ts=(NOW - timedelta(days=day == "yesterday")).timestamp())
+
+    async def test_multiturn_invalid_source_updates_replace_stale_intent(self):
+        for left, right in (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’")):
+            for bad in (f'in {left}{right} account',
+                        f'in {left}Work Account{right} account on Work account',
+                        f'in Work {left}Account{right} account'):
+                for field, sender, topic, day in (
+                        ("sender", "Eve", "launch", "yesterday"),
+                        ("topic", "Dan", "budget", "yesterday"),
+                        ("both", "Eve", "budget", "yesterday"),
+                        ("day", "Dan", "launch", "today")):
+                    for partial in (False, True):
+                        for present in (False, True):
+                            with self.subTest(bad=bad, field=field, partial=partial, present=present):
+                                sid = self.sessions.create_session()
+                                rows = [self._pending_row("<stale>")]
+                                if present:
+                                    rows.append(self._pending_row("<latest>", sender, topic, day))
+                                await self._pending_reply_turn(
+                                    sid, f'reply to the email from Dan yesterday, about launch {bad} saying Thanks',
+                                    rows, "source_selector_ambiguous")
+                                fragment = {"sender": f"from {sender}", "topic": f"about {topic}",
+                                            "day": day, "both": f"the email from {sender} about {topic}"}[field]
+                                if not partial:
+                                    fragment = f"the email from {sender} {day}, about {topic}"
+                                second = await self._pending_reply_turn(sid, f"{fragment} {bad}", rows,
+                                                                        "source_selector_ambiguous", restart=True)
+                                self.assertEqual(second.plan.parameters["reference_hints"].value,
+                                                 {"sender": sender, "topic": topic, "day": day})
+                                third = await self._pending_reply_turn(
+                                    sid, f'in {left}Work Account{right} account', rows,
+                                    "execution_started" if present else "source_no_match",
+                                    selected="<latest>" if present else "", restart=True)
+                                self.assertEqual(third.plan.parameters["reference_hints"].value,
+                                                 {"sender": sender, "topic": topic, "day": day, "account": "Work Account"})
+
+    async def test_multiturn_invalid_corrections_keep_scheduling_monotonic(self):
+        for initial_bad in (False, True):
+            for when in ("tomorrow", "at 18:00", "next Friday", "in 20 minutes"):
+                for bad in ('in "" account', 'in "Tomorrow at 18:00" account on Work account',
+                            'in Work "Account" account', 'in "Work Account'):
+                    with self.subTest(initial_bad=initial_bad, when=when, bad=bad):
+                        sid = self.sessions.create_session()
+                        initial = ' in "" account' if initial_bad else ''
+                        await self._pending_reply_turn(
+                            sid, f'reply to the email from Dan about launch{initial} saying Thanks', [],
+                            "source_selector_ambiguous" if initial_bad else "source_no_match")
+                        rows = [self._pending_row("<would-send>", day="today")]
+                        second = await self._pending_reply_turn(
+                            sid, f'the email from Dan {when} about launch {bad}', rows,
+                            "source_selector_ambiguous", restart=True)
+                        self.assertTrue(second.plan.parameters["schedule_requested"].value)
+                        third = await self._pending_reply_turn(sid, 'in "" account', rows,
+                                                               "source_selector_ambiguous", restart=True)
+                        self.assertEqual(third.plan.parameters["schedule_requested"].value,
+                                         second.plan.parameters["schedule_requested"].value)
+                        for correction in ('in "Work Account" account',
+                                           'the email from Dan about launch in "Work Account" account'):
+                            event = ("source_selector_ambiguous" if bad == 'in "Work Account' and correction.startswith("in ")
+                                     else "reply_schedule_unsupported")
+                            await self._pending_reply_turn(sid, correction, rows, event, restart=True)
+
+    async def test_reordered_pending_fields_and_temporal_account_labels(self):
+        fragments = ('from Eve in "" account', 'about budget in "" account', 'today, in "" account')
+        for ordered in (fragments, tuple(reversed(fragments))):
+            with self.subTest(ordered=ordered):
+                sid = self.sessions.create_session()
+                rows = [self._pending_row("<stale>"), self._pending_row("<latest>", "Eve", "budget", "today")]
+                await self._pending_reply_turn(
+                    sid, 'reply to the email from Dan yesterday, about launch in "" account saying Thanks',
+                    rows, "source_selector_ambiguous")
+                for fragment in ordered + (ordered[-1],):
+                    await self._pending_reply_turn(sid, fragment, rows, "source_selector_ambiguous", restart=True)
+                # Timing words in a bounded account label are not delivery intent.
+                pending = await self._pending_reply_turn(
+                    sid, 'in "Tomorrow at 18:00" account on Work account', rows,
+                    "source_selector_ambiguous", restart=True)
+                self.assertNotIn("schedule_requested", pending.plan.parameters)
+                await self._pending_reply_turn(sid, 'in "Work Account" account', rows,
+                                               "execution_started", selected="<latest>", restart=True)
+
+    async def test_unassignable_pending_fragment_cannot_revive_stale_source(self):
+        sid = self.sessions.create_session()
+        rows = [self._pending_row("<stale>"), self._pending_row("<latest>", "Eve", "budget")]
+        await self._pending_reply_turn(
+            sid, 'reply to the email from Dan yesterday, about launch in "" account saying Thanks',
+            rows, "source_selector_ambiguous")
+        for fragment in ('the email from Eve about budget in "Work Account',
+                         'in "Work Account" account', 'from Eve', 'about budget'):
+            pending = await self._pending_reply_turn(sid, fragment, rows,
+                                                     "source_selector_ambiguous", restart=True)
+            self.assertTrue(pending.plan.parameters["reply_reference_uncertain"].value)
+        await self._pending_reply_turn(
+            sid, 'the email from Eve about budget in "Work Account" account', rows,
+            "execution_started", selected="<latest>", restart=True)
+
+    async def test_field_ledger_keeps_latest_day_through_seven_restarted_turns(self):
+        for day in ("today", "yesterday"):
+            old_day = "yesterday" if day == "today" else "today"
+            for bad in ('in "Work Account', 'in “Work Account',
+                        'in "Work Account"', 'in “Work Account”'):
+                for explicit_day in (False, True):
+                    for present in (False, True):
+                        with self.subTest(day=day, bad=bad, explicit=explicit_day, present=present):
+                            sid = self.sessions.create_session()
+                            rows = [self._pending_row("<wrong-day>", "Eve", "budget", old_day),
+                                    self._pending_row("<wrong-sender>", "Dan", "budget", day),
+                                    self._pending_row("<wrong-topic>", "Eve", "launch", day)]
+                            if present:
+                                rows.append(self._pending_row("<latest>", "Eve", "budget", day))
+                            first = await self._pending_reply_turn(
+                                sid, f'reply to the email from Dan {old_day}, about launch in "" account saying Thanks',
+                                rows, "source_selector_ambiguous")
+                            source = f'the email from Eve {day}, about budget {bad}'
+                            latest = await self._pending_reply_turn(
+                                sid, source, rows, "source_selector_ambiguous", restart=True)
+                            ledger = latest.plan.parameters["reply_intent_fields"].value
+                            day_record = dict(ledger["day"])
+                            self.assertEqual(day_record, {"status": "known", "value": day,
+                                                          "revision": latest.plan.revision, "source": source})
+                            self.assertGreater(latest.plan.revision, first.plan.revision)
+                            self.assertEqual(ledger["account"]["status"], "unresolved")
+                            self.assertIsNone(ledger["account"]["value"])
+                            self.assertEqual(ledger["body"]["value"], "Thanks")
+                            self.assertEqual(ledger["timing"]["status"], "absent")
+                            revision = latest.plan.revision
+                            for fragment in ('in "Work Account" account', 'from Eve', 'about budget', 'from Eve'):
+                                latest = await self._pending_reply_turn(
+                                    sid, fragment, rows, "source_selector_ambiguous", restart=True)
+                                self.assertGreater(latest.plan.revision, revision)
+                                revision = latest.plan.revision
+                                self.assertEqual(latest.plan.parameters["reply_intent_fields"].value["day"], day_record)
+                            final = await self._pending_reply_turn(
+                                sid, f'the email from Eve {day if explicit_day else ""} about budget in "Work Account" account',
+                                rows, "execution_started" if present else "source_no_match",
+                                selected="<latest>" if present else "", restart=True)
+                            self.assertEqual(final.plan.parameters["reference_hints"].value["day"], day)
+                            if not explicit_day:
+                                self.assertEqual(final.plan.parameters["reply_intent_fields"].value["day"], day_record)
+
+    async def test_unresolved_day_requires_explicit_resolution_not_full_restatement(self):
+        for day in ("today", "yesterday"):
+            with self.subTest(day=day):
+                sid = self.sessions.create_session()
+                rows = [self._pending_row("<latest>", "Eve", "budget", day)]
+                await self._pending_reply_turn(
+                    sid, f'reply to the email from Dan {day}, about launch in "" account saying Thanks',
+                    rows, "source_selector_ambiguous")
+                pending = await self._pending_reply_turn(
+                    sid, 'the email from Eve today yesterday about budget in "Work Account" account',
+                    rows, "source_selector_ambiguous", restart=True)
+                record = pending.plan.parameters["reply_intent_fields"].value["day"]
+                self.assertEqual(record["status"], "unresolved")
+                self.assertIsNone(record["value"])
+                for fragment in ('in "Work Account" account', 'from Eve', 'about budget',
+                                 'the email from Eve about budget in "Work Account" account'):
+                    pending = await self._pending_reply_turn(
+                        sid, fragment, rows, "source_selector_ambiguous", restart=True)
+                    self.assertNotIn("day", pending.plan.parameters["reference_hints"].value)
+                    self.assertEqual(pending.plan.parameters["reply_intent_fields"].value["day"], record)
+                final = await self._pending_reply_turn(sid, day, rows, "execution_started",
+                                                       selected="<latest>", restart=True)
+                self.assertEqual(final.plan.parameters["reply_intent_fields"].value["day"]["status"], "known")
+
+    async def test_field_ledger_stale_correction_cannot_overwrite_newer_day(self):
+        from service.tasks.models import TaskPlan
+        from service.tasks.reply_engine import prepare_reply_turn
+        from service.tasks.source_readers import MailReader
+        sid = self.sessions.create_session()
+        await self._pending_reply_turn(
+            sid, 'reply to the email from Dan yesterday about launch in "" account saying Thanks',
+            [], "source_selector_ambiguous")
+        stale = TaskPlan.from_dict(self.sessions.active_task(sid))
+        newer = await self._pending_reply_turn(
+            sid, 'the email from Eve today about budget tomorrow in "Work Account',
+            [], "source_selector_ambiguous", restart=True)
+        result = prepare_reply_turn(self.sessions, sid, 'in "Work Account" account', None, stale,
+                                    reader=MailReader([], accounts=["Work Account"]), now=NOW, persist=True)
+        self.assertEqual(result.event, "stale_reply_turn")
+        self.assertFalse(result.executable)
+        self.assertEqual(self.sessions.active_task(sid)["parameters"], newer.plan.to_dict()["parameters"])
+
+    async def test_field_ledger_late_preparation_cannot_overwrite_pending_correction(self):
+        from service.tasks.source_readers import MailReader
+        sid = self.sessions.create_session()
+        await self._pending_reply_turn(
+            sid, 'reply to the email from Dan yesterday about launch in "" account saying Thanks',
+            [], "source_selector_ambiguous")
+        reader = MailReader([self._pending_row("<stale>")], accounts=["Work Account"],
+                            synced_at=NOW.timestamp())
+        corrected = None
+
+        async def prepared(args):
+            nonlocal corrected
+            corrected = await self._pending_reply_turn(
+                sid, 'the email from Eve today about budget tomorrow in "Work Account',
+                [], "source_selector_ambiguous", restart=True)
+            return {**args, "expected_reply": {
+                "message_id": args["message_id"], "account": args["account"], "account_id": "fixture",
+                "from": "me@example.test", "to": ["fixture@example.test"], "cc": [], "bcc": [],
+                "subject": "Re: fixture", "content": "Thanks\rOriginal"}}, ""
+
+        with patch("service.tools.email_tools.ensure_reply_source", AsyncMock()), \
+                patch("service.tasks.source_readers.current_mail_reader", return_value=reader):
+            result = await prepare_task_turn_async(self.sessions, sid, 'in "Work Account" account',
+                assistant_store=self.assistant, now=NOW, allow_native=True, reply_preparer=prepared)
+        self.assertEqual(result.event, "stale_preparation")
+        self.assertFalse(result.executable)
+        saved = self.sessions.active_task(sid)
+        self.assertEqual(saved["parameters"], corrected.plan.to_dict()["parameters"])
+        self.assertEqual(saved["parameters"]["reply_intent_fields"]["value"]["day"]["value"], "today")
+        self.assertNotIn("reply_args", saved["parameters"])
+        self.assertEqual(saved["steps"], [])
+
+    async def test_source_corrections_persist_while_body_is_also_unresolved(self):
+        for when in ("", "tomorrow"):
+            with self.subTest(when=when):
+                sid = self.sessions.create_session()
+                rows = [self._pending_row("<stale>"), self._pending_row("<latest>", "Eve", "budget")]
+                await self._pending_reply_turn(
+                    sid, 'reply to the email from Dan about launch in "" account saying Thanks at 6',
+                    rows, "source_selector_ambiguous")
+                await self._pending_reply_turn(
+                    sid, f'the email from Eve {when} about budget in "" account', rows,
+                    "source_selector_ambiguous", restart=True)
+                pending = await self._pending_reply_turn(
+                    sid, 'in "Work Account" account', rows,
+                    "reply_schedule_unsupported" if when else "language_clarification", restart=True)
+                self.assertEqual(pending.plan.parameters["reference_hints"].value,
+                                 {"sender": "Eve", "topic": "budget", "account": "Work Account"})
+                self.assertEqual(pending.plan.subject.value, "Thanks at 6")
+                fields = pending.plan.parameters["reply_intent_fields"].value
+                self.assertEqual(fields["body"]["status"], "unresolved")
+                self.assertEqual(fields["body"]["value"], "Thanks at 6")
+                self.assertEqual(fields["timing"]["status"], "known" if when else "unresolved")
+
+    async def test_payload_field_resolution_keeps_explicit_delivery_intent(self):
+        for when in ("", "tomorrow"):
+            with self.subTest(when=when):
+                sid = self.sessions.create_session()
+                await self._pending_reply_turn(
+                    sid, f'reply to the email from Dan {when} about launch in "" account saying Thanks at 6',
+                    [], "source_selector_ambiguous")
+                corrected = await self._pending_reply_turn(sid, "part of the message", [],
+                                                           "source_selector_ambiguous", restart=True)
+                fields = corrected.plan.parameters["reply_intent_fields"].value
+                self.assertEqual(fields["body"]["status"], "known")
+                self.assertEqual(fields["body"]["value"], "Thanks at 6")
+                self.assertEqual(fields["timing"]["status"], "known" if when else "absent")
+                record = fields["body"]
+                final = await self._pending_reply_turn(sid, 'from Eve in "" account', [],
+                                                       "source_selector_ambiguous", restart=True)
+                self.assertEqual(final.plan.parameters["reply_intent_fields"].value["body"], record)
+                self.assertEqual(final.plan.parameters["reply_intent_fields"].value["timing"], fields["timing"])
+
+    async def test_short_timing_fragments_share_preflight_and_persistence(self):
+        for fragment in ('tomorrow in "" account', 'at 18:00 in "" account', 'next Friday in "" account', 'Friday'):
+            with self.subTest(fragment=fragment):
+                sid = self.sessions.create_session()
+                await self._pending_reply_turn(sid, 'reply to the email from Dan about launch saying Thanks',
+                                               [], "source_no_match")
+                rows = [self._pending_row("<stale>")]
+                await self._pending_reply_turn(sid, fragment, rows,
+                                               "reply_schedule_unsupported" if fragment == "Friday" else "source_selector_ambiguous",
+                                               restart=True)
+                await self._pending_reply_turn(sid, 'in "Work Account" account', rows,
+                                               "reply_schedule_unsupported", restart=True)
+
+    async def test_trailing_unsupported_clock_evidence_survives_courtesy_and_minute_words(self):
+        for prompt in ("remind me tomorrow to take medicine at half six please",
+                       "remind me tomorrow to take medicine at 25pm please",
+                       "remind me tomorrow to take medicine at 6:7 please",
+                       "remind me to take medicine at six thirty tomorrow",
+                "remind me tomorrow to take medicine at 25pm, thanks",
+                "remind me tomorrow to take medicine six thirty tomorrow please",
+                "remind me tomorrow to take medicine at six please",
+                "remind me tomorrow to take medicine at six oh five please",
+                "remind me tomorrow to take medicine at 6 oh five please"):
+            with self.subTest(prompt=prompt):
+                sid = self.sessions.create_session()
+                turn = await self.prepare(sid, prompt)
+                self.assertFalse(turn.executable)
+                self.assertEqual(turn.plan.temporal.absolute_iso, "")
+                self.assertEqual(turn.plan.steps, [])
+                self.assertIn("temporal.time", turn.plan.missing_slots)
+                self.assertTrue(has_unsupported_alert_clock(prompt))
+                scoped = reminder_temporal_text(prompt)
+                self.assertEqual(reminder_temporal_text(scoped), scoped)
+
+    async def test_subject_clock_words_do_not_override_explicit_schedule(self):
+        for subject in ("reserve a table for six", "discuss half six with my tutor",
+                        "review the invalid timestamp 25pm", "prepare for my 1:1",
+                        "meet at 6pm and prepare for my 1:1",
+                        "meet at 6pm and reserve a table for six",
+                        "look at tenacity in my notes about half six"):
+            with self.subTest(subject=subject):
+                sid = self.sessions.create_session()
+                prompt = "remind me tomorrow at 9am to " + subject
+                turn = await self.prepare(sid, prompt)
+                self.assertTrue(turn.executable)
+                self.assertEqual(turn.plan.intent, "reminder.create")
+                self.assertEqual(turn.plan.subject.value, subject)
+                self.assertEqual(turn.plan.temporal.absolute_iso, "2026-09-10T09:00")
+                self.assertEqual([step.tool for step in turn.plan.steps], ["add_reminder"])
+                self.assertFalse(has_unsupported_alert_clock(prompt))
+                self.assertEqual(resolve_alert_datetime(prompt, now=NOW).hour, 9)
+        for prompt, subject in (
+                ("remind me to reserve a table for six tomorrow at 9am", "reserve a table for six"),
+                ("remind me at 9am tomorrow to reserve a table for six", "reserve a table for six")):
+            with self.subTest(prompt=prompt):
+                turn = await self.prepare(self.sessions.create_session(), prompt)
+                self.assertTrue(turn.executable)
+                self.assertEqual(turn.plan.subject.value, subject)
+                self.assertEqual(turn.plan.temporal.absolute_iso, "2026-09-10T09:00")
+        for prompt in ("remind me to take medicine tomorrow at half six",
+                       "remind me tomorrow at 9am to take medicine tomorrow at half six",
+                       "remind me to take medicine for six tomorrow",
+                       "remind me tomorrow at 9am to take medicine at 123:45 tomorrow",
+                       "remind me at quarter to six tomorrow to take medicine",
+                       "set an alarm tomorrow 25:00 to take medicine",
+                       "set an alarm tomorrow 6:7 to take medicine",
+                       "set an alarm at six thirty tomorrow to take medicine",
+                       "set an alarm six thirty tomorrow to take medicine"):
+            with self.subTest(prompt=prompt):
+                turn = await self.prepare(self.sessions.create_session(), prompt)
+                self.assertFalse(turn.executable)
+                self.assertIn("temporal.time", turn.plan.missing_slots)
+                self.assertEqual(turn.plan.temporal.absolute_iso, "")
+
+    def test_overlapping_clock_and_date_spans_are_idempotent(self):
+        for prompt in (
+                "remind me to reserve a table for six tomorrow at 9am",
+                "remind me to take medicine tomorrow at half six",
+                "remind me to take medicine tomorrow at 9am",
+                "remind me tomorrow to take medicine at 9am",
+                "remind me to take medicine at six thirty tomorrow please"):
+            with self.subTest(prompt=prompt):
+                scoped = reminder_temporal_text(prompt)
+                self.assertEqual(reminder_temporal_text(scoped), scoped)
+
+    async def test_correction_prefix_cannot_default_an_unsupported_clock(self):
+        for initial in ("set an alarm at half six tomorrow to take medicine",
+                        "reschedule my medicine reminder"):
+            self.assistant.add_manual("medicine", (NOW + timedelta(days=2)).timestamp())
+            for reply in ("actually half six tomorrow", "please make it half six tomorrow",
+                          "around half six tomorrow", "make it around half six tomorrow",
+                          "I meant half six tomorrow", "actually tomorrow at 6:7",
+                          "actually 6:7 tomorrow", "I meant 25:00 tomorrow",
+                          "please make it tomorrow at 25:00"):
+                with self.subTest(initial=initial, reply=reply):
+                    sid = self.sessions.create_session()
+                    first = await self.prepare(sid, initial)
+                    self.assertFalse(first.executable)
+                    snapshot = self.sessions.active_task(sid)
+                    second = await self.prepare(sid, reply)
+                    self.assertFalse(second.executable)
+                    self.assertEqual(second.event, "clock_clarification")
+                    self.assertEqual(second.plan.steps, [])
+                    self.assertEqual(self.sessions.active_task(sid), snapshot)
+                    final = await self.prepare(sid, "6:30 am tomorrow")
+                    self.assertTrue(final.executable)
+                    self.assertEqual(final.plan.id, first.plan.id)
+                    self.assertEqual(final.plan.temporal.absolute_iso, "2026-09-10T06:30")
+
+    async def test_subject_answer_is_not_consumed_as_a_time_answer(self):
+        for subject in ("reserve a table for six", "prepare for my 1:1",
+                        "discuss half six with my tutor", "review 25pm tomorrow"):
+            with self.subTest(subject=subject):
+                sid = self.sessions.create_session()
+                first = await self.prepare(sid, "remind me")
+                self.assertIn("subject", first.plan.missing_slots)
+                second = await self.prepare(sid, subject)
+                self.assertFalse(second.executable)
+                self.assertEqual(second.plan.subject.value, subject)
+                self.assertEqual(second.plan.temporal.absolute_iso, "")
+                self.assertIn("temporal.time", second.plan.missing_slots)
+                final = await self.prepare(sid, "9am tomorrow")
+                self.assertTrue(final.executable)
+                self.assertEqual(final.plan.subject.value, subject)
+                self.assertEqual(final.plan.temporal.absolute_iso, "2026-09-10T09:00")
+
+    async def test_pending_clock_preserves_new_requests_questions_and_cancellation(self):
+        sid = self.sessions.create_session()
+        await self.prepare(sid, "set an alarm at half six tomorrow to take medicine")
+        snapshot = self.sessions.active_task(sid)
+        for prompt in ("actually show my notes about half six", "what does half six mean?",
+                       "please explain what half six means", "check my email"):
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(await self.prepare(sid, prompt))
+                self.assertEqual(self.sessions.active_task(sid), snapshot)
+        cancelled = await self.prepare(sid, "cancel")
+        self.assertFalse(cancelled.executable)
+        self.assertEqual(cancelled.plan.status, "cancelled")
+        fresh = await self.prepare(sid, "remind me tomorrow at noon to drink water")
+        self.assertTrue(fresh.executable)
+        self.assertEqual(fresh.plan.temporal.absolute_iso, "2026-09-10T12:00")
+
+    async def test_capability_inventory_declines_typed_entry_then_routes_read_only(self):
+        for prompt in ("Can you send texts and create reminders?",
+                       "Can you send texts or create reminders for tomorrow at 3pm?",
+                       "Are you able to send texts and create reminders for tomorrow at 3pm?",
+                       "Can you send text messages, create reminders, and read browser history?"):
+            for pending in (False, True):
+                with self.subTest(prompt=prompt, pending=pending):
+                    sid = self.sessions.create_session()
+                    if pending:
+                        await self.prepare(sid, "remind me to drink water")
+                    snapshot = self.sessions.active_task(sid)
+                    self.assertIsNone(await self.prepare(sid, prompt))
+                    self.assertEqual(self.sessions.active_task(sid), snapshot)
+                    d = await R.route(prompt)
+                    self.assertEqual(d.tool_subset, ["wisp_capabilities"])
+                    self.assertEqual(d.reminder_action, "")
+                    self.assertFalse(CREATION.intersection(d.tool_subset))
+
+    async def test_capability_inventory_preserves_pending_legacy_workflow(self):
+        for initial, answer, waiting in (
+                ("schedule a message to Mom with my calendar summary", "tomorrow at 3pm", "waiting_for_time"),
+                ("send Mom my email summaries and my calendar for this month", "Messages", "waiting_for_channel"),
+                ("send my calendar summary via Messages", "Mom", "waiting_for_recipient")):
+            with self.subTest(initial=initial):
+                sid = self.sessions.create_session()
+                self.assertIsNone(await self.prepare(sid, initial))
+                first = prepare_legacy_turn(self.sessions, sid, initial)
+                self.assertEqual(first.plan.status, waiting)
+                snapshot = self.sessions.active_workflow(sid)
+                for inventory in ("Can you send texts and create reminders?",
+                                  "Are you able to send texts and create reminders for tomorrow at 3pm?"):
+                    self.assertIsNone(await self.prepare(sid, inventory))
+                    self.assertIsNone(prepare_legacy_turn(self.sessions, sid, inventory))
+                    self.assertEqual(self.sessions.active_workflow(sid), snapshot)
+                    self.assertIsNone(self.sessions.active_task(sid))
+                    decision = await R.route(inventory)
+                    self.assertEqual(decision.tool_subset, ["wisp_capabilities"])
+                self.assertIsNone(await self.prepare(sid, answer))
+                resumed = prepare_legacy_turn(self.sessions, sid, answer)
+                self.assertEqual(resumed.plan.id, first.plan.id)
+                self.assertIsNotNone(resumed.decision)
+                self.assertEqual(resumed.plan.status, "running")
+                self.assertIn("lookup_contact", resumed.decision.tool_subset)
+                self.assertIn("schedule_send" if waiting == "waiting_for_time" else "send_message",
+                              resumed.decision.tool_subset)
+                if waiting == "waiting_for_time":
+                    self.assertEqual(resumed.plan.when, answer)
+
+    async def test_capability_words_inside_real_request_remain_content(self):
+        prompt = "text Mom saying Can you send texts and create reminders?"
+        turn = await self.prepare(self.sessions.create_session(), prompt)
+        self.assertIsNotNone(turn)
+        self.assertEqual(turn.plan.intent, "message.send")
+        self.assertEqual(turn.plan.subject.value, "Can you send texts and create reminders?")
+        turn = await self.prepare(self.sessions.create_session(),
+                                  "remind me tomorrow to ask what can you do")
+        self.assertEqual(turn.plan.intent, "reminder.create")
+        self.assertEqual(turn.plan.subject.value, "ask what can you do")
+
+    async def test_future_reminder_content_never_mutates_existing_target(self):
+        row = self.assistant.add_manual("dentist", (NOW + timedelta(days=2)).timestamp())
+        snapshot = self.assistant.get(row["id"])
+        for verb in ("reschedule", "delete", "complete", "rename", "update"):
+            with self.subTest(verb=verb):
+                sid = self.sessions.create_session()
+                subject = verb + " my dentist reminder"
+                turn = await self.prepare(sid, "remind me tomorrow to " + subject)
+                self.assertEqual(turn.plan.intent, "reminder.create")
+                self.assertEqual(turn.plan.subject.value, subject)
+                self.assertTrue(turn.executable)
+                self.assertEqual([step.tool for step in turn.plan.steps], ["add_reminder"])
+                self.assertEqual(turn.plan.resolved_targets, [])
+                self.assertEqual(self.assistant.get(row["id"]), snapshot)
+                # The same subject with no time is still creation after a
+                # time follow-up; it cannot switch to an existing-item edit.
+                sid = self.sessions.create_session()
+                first = await self.prepare(sid, "remind me to " + subject)
+                self.assertFalse(first.executable)
+                final = await self.prepare(sid, "9am tomorrow")
+                self.assertTrue(final.executable)
+                self.assertEqual(final.plan.intent, "reminder.create")
+                self.assertEqual(final.plan.subject.value, subject)
+                self.assertEqual([step.tool for step in final.plan.steps], ["add_reminder"])
+                self.assertEqual(self.assistant.get(row["id"]), snapshot)
+        # Actual present-tense operations retain their existing typed intent.
+        for prompt, intent in (("reschedule my dentist reminder", "reminder.update"),
+                               ("delete my dentist reminder", "reminder.delete"),
+                               ("delete the reminder named remind me", "reminder.delete"),
+                               ("complete my dentist reminder", "reminder.complete")):
+            with self.subTest(prompt=prompt):
+                turn = await self.prepare(self.sessions.create_session(), prompt)
+                self.assertEqual(turn.plan.intent, intent)
+
+    async def test_plural_note_edits_reach_note_route_without_calendar_authority(self):
+        for prompt in ("add a line to my meeting notes", "add agenda items to my meeting notes",
+                       "add a bullet to the meeting note", "add a sentence to my meeting notes",
+                       "add this line to the meeting note"):
+            with self.subTest(prompt=prompt):
+                sid = self.sessions.create_session()
+                self.assertIsNone(await self.prepare(sid, prompt))
+                self.assertIsNone(self.sessions.active_task(sid))
+                d = await R.route(prompt)
+                self.assertEqual(set(d.tool_subset), {"search_notes", "append_note"})
+                self.assertFalse(CREATION.intersection(d.tool_subset))
+                self.assertEqual(d.force_first_tool, "append_note")
+        sid = self.sessions.create_session()
+        self.assertIsNone(await self.prepare(
+            sid, "find my overdue dentist reminder and search my notes for dentist"))
+
+    async def test_audit_negation_public_product_and_checklist_ownership_matrix(self):
+        for prompt in (
+            "show my calendar tomorrow and do not show reminders",
+            "do not show reminders and show my calendar tomorrow",
+        ):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertIn("get_upcoming", decision.tool_subset)
+                self.assertNotIn("search_reminders", decision.tool_subset)
+                self.assertIn("search_reminders", decision.forbidden_tools)
+        for prompt, expected in (
+            ("add a reminder to not forget medicine tomorrow at 9", "add_reminder"),
+            ("show my calendar for meetings not related to work tomorrow", "get_upcoming"),
+        ):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertIn(expected, decision.tool_subset)
+                self.assertNotIn(expected, decision.forbidden_tools)
+        for prompt in (
+            "what's happening with Apple Calendar right now?",
+            "what's new with the Calendar app?",
+        ):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["web_search"])
+                self.assertEqual(decision.direct_calls, [("web_search", {"query": prompt})])
+                self.assertNotIn("get_upcoming", decision.tool_subset)
+        for prompt, destination in (
+            ("create a checklist in Notes from my calendar tomorrow", "create_note"),
+            ("create a checklist in Reminders from my calendar tomorrow", "add_reminder"),
+        ):
+            with self.subTest(prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["get_upcoming", destination])
+                self.assertEqual(decision.force_first_tool, "get_upcoming")
+                self.assertEqual(decision.required_tool_groups,
+                                 (frozenset({"get_upcoming"}), frozenset({destination})))
+
+    async def test_structural_ownership_cross_product_matrix(self):
+        for separator in ("and", ",", ";", "but"):
+            for positive, rejected, keep, omit in (
+                ("show my calendar tomorrow", "do not show reminders", "get_upcoming", "search_reminders"),
+                ("show my reminders tomorrow", "do not show calendar", "search_reminders", "get_upcoming"),
+            ):
+                for prompt in (f"{positive} {separator} {rejected}",
+                               f"{rejected} {separator} {positive}"):
+                    with self.subTest(kind="clause-local", prompt=prompt):
+                        decision = await R.route(prompt)
+                        self.assertIn(keep, decision.tool_subset)
+                        self.assertNotIn(omit, decision.tool_subset)
+                        self.assertIn(omit, decision.forbidden_tools)
+            for prompt, omit in (
+                (f"do not show reminders {separator} calendar tomorrow", "get_upcoming"),
+                (f"do not show calendar {separator} reminders tomorrow", "search_reminders"),
+            ):
+                with self.subTest(kind="shared", prompt=prompt):
+                    decision = await R.route(prompt)
+                    self.assertIn(omit, decision.forbidden_tools)
+        for prompt, expected in (
+            ("add a reminder to never skip medication tomorrow at 9", "add_reminder"),
+            ("add a reminder for no caffeine after 6 tomorrow at 9", "add_reminder"),
+            ("show my calendar events with no attendees tomorrow", "get_upcoming"),
+            ("show reminders not about work", "search_reminders"),
+        ):
+            with self.subTest(kind="content", prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertIn(expected, decision.tool_subset)
+                self.assertNotIn(expected, decision.forbidden_tools)
+        for opening in ("what's", "what is"):
+            for update in ("new", "happening"):
+                for product in ("Apple Calendar", "the Calendar app"):
+                    prompt = f"{opening} {update} with {product} right now?"
+                    with self.subTest(kind="product", prompt=prompt):
+                        decision = await R.route(prompt)
+                        self.assertEqual(decision.tool_subset, ["web_search"])
+                        self.assertEqual(decision.direct_calls, [("web_search", {"query": prompt})])
+        personal = await R.route("what is new with my calendar tomorrow?")
+        self.assertNotIn("web_search", personal.tool_subset or [])
+        for verb in ("create", "draft"):
+            for source_text, source_tool in (
+                ("from my calendar tomorrow", "get_upcoming"),
+                ("from my reminders", "search_reminders"),
+            ):
+                for destination_text, destination_tool in (
+                    ("in Notes", "create_note"),
+                    ("in Reminders", "add_reminder"),
+                    ("in Calendar", "add_calendar_event"),
+                ):
+                    for prompt in (f"{verb} a checklist {destination_text} {source_text}",
+                                   f"{verb} a checklist {source_text} {destination_text}"):
+                        with self.subTest(kind="checklist", prompt=prompt):
+                            decision = await R.route(prompt)
+                            self.assertEqual(decision.tool_subset, [source_tool, destination_tool])
+                            self.assertEqual(decision.force_first_tool, source_tool)
+                            self.assertEqual(decision.required_tool_groups,
+                                             (frozenset({source_tool}), frozenset({destination_tool})))
+                            self.assertNotIn("lookup_contact", decision.tool_subset)
+        excluded = await R.route("create a checklist in Notes from my calendar tomorrow, not Reminders")
+        self.assertEqual(excluded.tool_subset, ["get_upcoming", "create_note"])
+        self.assertIn("add_reminder", excluded.forbidden_tools)
+
+
+    async def test_full_clause_product_and_checklist_ownership_matrices(self):
+        positive_reads = (
+            ("show my {domain} tomorrow",),
+            ("what is on my {domain} tomorrow",),
+            ("do I have any {domain} tomorrow",),
+            ("which {domain} items are tomorrow",),
+        )
+        domains = (
+            ("calendar", "reminders", "get_upcoming", "search_reminders"),
+            ("reminders", "calendar", "search_reminders", "get_upcoming"),
+        )
+        for templates in positive_reads:
+            for domain, rejected_domain, keep, omit in domains:
+                positive = templates[0].format(domain=domain)
+                rejected = f"do not show {rejected_domain}"
+                for separator in ("and", ",", ";", "but"):
+                    for prompt in (f"{positive} {separator} {rejected}",
+                                   f"{rejected} {separator} {positive}"):
+                        with self.subTest(matrix="clause-64", prompt=prompt):
+                            decision = await R.route(prompt)
+                            self.assertIn(keep, decision.tool_subset)
+                            self.assertNotIn(omit, decision.tool_subset)
+
+        product_variants = []
+        for product in ("Apple Calendar", "the Calendar app"):
+            for state in ("current", "latest", "new", "happening", "updates", "updated"):
+                product_variants.extend((
+                    f"what is {state} with {product}?",
+                    f"what's {state} with {product}?",
+                ))
+        self.assertEqual(len(product_variants), 24)
+        for prompt in product_variants:
+            with self.subTest(matrix="public-24", prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["web_search"])
+                self.assertEqual(decision.direct_calls, [("web_search", {"query": prompt})])
+        for prompt in ("what is on my calendar tomorrow?",
+                       "what's happening on my schedule tomorrow?",
+                       "show my Calendar app events tomorrow"):
+            with self.subTest(matrix="personal-local", prompt=prompt):
+                decision = await R.route(prompt)
+                self.assertNotIn("web_search", decision.tool_subset or [])
+
+        base_count = 0
+        for verb in ("create", "draft"):
+            for relation in ("from", "using", "based on"):
+                for source_domain, source_tool in (("calendar", "get_upcoming"),
+                                                   ("reminders", "search_reminders")):
+                    source = f"{relation} my {source_domain}"
+                    for destination, destination_tool in (
+                        ("in Notes", "create_note"),
+                        ("in Reminders", "add_reminder"),
+                        ("in Calendar", "add_calendar_event"),
+                        ("in Wisp", None),
+                    ):
+                        for prompt in (f"{verb} a checklist {destination} {source}",
+                                       f"{verb} a checklist {source} {destination}"):
+                            base_count += 1
+                            with self.subTest(matrix="checklist-96", prompt=prompt):
+                                decision = await R.route(prompt)
+                                expected = [source_tool] + ([destination_tool]
+                                                           if destination_tool else [])
+                                self.assertEqual(decision.tool_subset, expected)
+                                self.assertEqual(decision.force_first_tool, source_tool)
+                                self.assertEqual(decision.required_tool_groups,
+                                                 tuple(frozenset({name}) for name in expected))
+                                self.assertNotIn("lookup_contact", decision.tool_subset)
+                                if destination_tool != "add_calendar_event":
+                                    self.assertNotIn("add_calendar_event", decision.tool_subset)
+        self.assertEqual(base_count, 96)
+
+        negated_count = 0
+        for verb in ("create", "draft"):
+            for source_domain, source_tool in (("calendar", "get_upcoming"),
+                                               ("reminders", "search_reminders")):
+                for excluded_source in (f"not from my {source_domain}",
+                                        f"not using my {source_domain}"):
+                    for destination, destination_tool in (
+                        ("in Notes", "create_note"),
+                        ("in Reminders", "add_reminder"),
+                        ("in Wisp", None),
+                    ):
+                        for prompt in (f"{verb} a checklist {destination} {excluded_source}",
+                                       f"{verb} a checklist {excluded_source} {destination}"):
+                            negated_count += 1
+                            with self.subTest(matrix="negated-source-48", prompt=prompt):
+                                decision = await R.route(prompt)
+                                expected = [destination_tool] if destination_tool else []
+                                self.assertEqual(decision.tool_subset, expected)
+                                self.assertNotIn(source_tool, decision.tool_subset)
+                                self.assertNotIn("lookup_contact", decision.tool_subset)
+                                self.assertNotIn("add_calendar_event", decision.tool_subset)
+        self.assertEqual(negated_count, 48)
+
+    async def test_reminder_titles_own_embedded_web_negation_matrix(self):
+        count = 0
+        for verb in ("add", "create", "set", "make"):
+            for title in ("never use the oven", "don't use the oven"):
+                prompt = f"{verb} a reminder to {title} tomorrow at 9"
+                count += 1
+                with self.subTest(matrix="reminder-title-8", prompt=prompt):
+                    decision = await R.route(prompt)
+                    self.assertIn("add_reminder", decision.tool_subset or [])
+                    self.assertNotIn("add_reminder", decision.forbidden_tools)
+                    self.assertEqual(decision.reminder_action, "create")
+        self.assertEqual(count, 8)
+
+    async def test_no_browse_dependent_continuations_fail_closed_matrix(self):
+        sources = (
+            "latest news about Iran",
+            "current news about clean energy",
+            "breaking news about Japan",
+            "recent updates on the Mars mission",
+        )
+        opt_outs = (
+            "never browse",
+            "don't browse",
+            "do not use the web",
+            "stay offline",
+        )
+        continuations = (
+            "save it in Notes",
+            "record that in Notes",
+            "store the summary in my Notes",
+            "log the findings into Apple Notes",
+            "text Mom a summary",
+            "send Mom the summary",
+            "message Dad with the findings",
+            "text me the results",
+            "email Mom a summary",
+            "send the summary to me by email",
+            "email dad@example.com the findings",
+            "send an email to me with the results",
+        )
+        count = 0
+        for source in sources:
+            for opt_out in opt_outs:
+                for continuation in continuations:
+                    prompt = f"{source}; {opt_out}; {continuation}"
+                    count += 1
+                    with self.subTest(matrix="no-browse-continuation-192", prompt=prompt):
+                        decision = await R.route(prompt)
+                        self.assertEqual(decision.tool_subset, [])
+                        self.assertFalse(decision.needs_tools)
+                        self.assertIsNone(decision.force_first_tool)
+                        self.assertEqual(decision.direct_calls, [])
+                        self.assertEqual(decision.required_tool_groups, ())
+                        self.assertEqual(decision.tool_argument_bindings, {})
+                        self.assertTrue({
+                            "web_search", "search_notes", "view_emails",
+                            "summarize_messages", "lookup_contact", "send_message",
+                            "send_email",
+                        }.issubset(decision.forbidden_tools))
+        self.assertEqual(count, 192)
+
+    async def test_no_browse_keeps_only_independently_authored_local_note(self):
+        for content in ("Call Sam at noon", "Buy milk after class"):
+            prompt = f"latest news about Iran; never browse; save {content} in Notes"
+            with self.subTest(content=content):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, ["create_note"])
+                self.assertEqual(decision.force_first_tool, "create_note")
+                self.assertEqual(decision.required_tool_groups,
+                                 (frozenset({"create_note"}),))
+                self.assertNotIn("create_note", decision.forbidden_tools)
+                self.assertTrue({
+                    "web_search", "search_notes", "view_emails",
+                    "summarize_messages", "lookup_contact", "send_message",
+                    "send_email",
+                }.issubset(decision.forbidden_tools))
+
+    async def test_strong_no_browse_public_continuation_matrix(self):
+        topics = (
+            "climate change", "Iran", "clean energy", "Japan",
+            "the Mars mission", "quantum computing", "electric vehicles",
+            "global markets", "space exploration", "public health",
+            "renewable energy", "artificial intelligence",
+        )
+        sources = tuple(f"latest news about {topic}" for topic in topics) + tuple(
+            f"research {topic}" for topic in topics
+        )
+        opt_outs = (
+            "do not browse", "never browse", "avoid browsing", "keep it offline",
+        )
+        continuations = ("save it in Notes", "text Mom a summary")
+        count = 0
+        for source in sources:
+            for opt_out in opt_outs:
+                for continuation in continuations:
+                    prompt = f"{source}; {opt_out}; {continuation}"
+                    count += 1
+                    with self.subTest(matrix="strong-no-browse-192", prompt=prompt):
+                        decision = await R.route(prompt)
+                        self.assertEqual(decision.tool_subset, [])
+                        self.assertFalse(decision.needs_tools)
+                        self.assertIsNone(decision.force_first_tool)
+                        self.assertEqual(decision.direct_calls, [])
+                        self.assertEqual(decision.required_tool_groups, ())
+                        self.assertEqual(decision.tool_argument_bindings, {})
+                        self.assertTrue({
+                            "web_search", "search_notes", "view_emails",
+                            "summarize_messages", "lookup_contact", "send_message",
+                            "send_email", "create_note",
+                        }.issubset(decision.forbidden_tools))
+        self.assertEqual(count, 192)
+
+    async def test_no_browse_dependent_content_and_authored_local_actions(self):
+        for continuation in (
+            "save the latest news in Notes",
+            "remind me about the results tomorrow at 9",
+        ):
+            prompt = f"research climate change; never browse; {continuation}"
+            with self.subTest(kind="dependent", continuation=continuation):
+                decision = await R.route(prompt)
+                self.assertEqual(decision.tool_subset, [])
+                self.assertFalse(decision.needs_tools)
+                self.assertTrue({
+                    "search_notes", "create_note", "add_reminder", "lookup_contact",
+                    "send_message", "send_email",
+                }.issubset(decision.forbidden_tools))
+
+        authored = (
+            ("save Call Sam at noon in Notes", "create_note"),
+            ("remind me to call Sam tomorrow at 9", "add_reminder"),
+        )
+        for continuation, expected in authored:
+            prompt = f"research climate change; never browse; {continuation}"
+            with self.subTest(kind="authored", continuation=continuation):
+                decision = await R.route(prompt)
+                self.assertIn(expected, decision.tool_subset or [])
+                self.assertNotIn(expected, decision.forbidden_tools)
+                self.assertNotIn("web_search", decision.tool_subset or [])
+                self.assertNotIn("search_notes", decision.tool_subset or [])
+
+    async def test_no_browse_dependent_checklist_matrix(self):
+        sources = (
+            "latest news about climate change",
+            "search the web for climate change",
+            "research climate change",
+        )
+        opt_outs = (
+            "do not browse", "never browse", "avoid browsing", "keep it offline",
+        )
+        destinations = (
+            ("Notes", "create_note"),
+            ("Reminders", "add_reminder"),
+            ("Calendar", "add_calendar_event"),
+        )
+        contents = ("the results", "the latest news")
+        count = 0
+        for source in sources:
+            for opt_out in opt_outs:
+                for destination, effect in destinations:
+                    for content in contents:
+                        prompt = (
+                            f"{source}; {opt_out}; create a checklist in "
+                            f"{destination} from {content}"
+                        )
+                        count += 1
+                        with self.subTest(matrix="dependent-checklist-72", prompt=prompt):
+                            decision = await R.route(prompt)
+                            self.assertEqual(decision.tool_subset, [])
+                            self.assertFalse(decision.needs_tools)
+                            self.assertIsNone(decision.force_first_tool)
+                            self.assertEqual(decision.direct_calls, [])
+                            self.assertEqual(decision.required_tool_groups, ())
+                            self.assertIn(effect, decision.forbidden_tools)
+                            self.assertTrue({
+                                "web_search", "search_notes", "lookup_contact",
+                                "send_message", "send_email",
+                            }.issubset(decision.forbidden_tools))
+        self.assertEqual(count, 72)
+
+    async def test_no_browse_preserves_independently_authored_delivery_and_calendar(self):
+        cases = (
+            ("text Mom that dinner is at 7", {"lookup_contact", "send_message"}),
+            ("email Mom that dinner is at 7", {"lookup_contact", "send_email"}),
+            ("create a calendar event called Dinner tomorrow at 7",
+             {"add_calendar_event"}),
+        )
+        count = 0
+        for opt_out in ("do not browse", "never browse", "avoid browsing", "keep it offline"):
+            for action, expected in cases:
+                prompt = f"research climate change; {opt_out}; {action}"
+                count += 1
+                with self.subTest(matrix="authored-effects-12", prompt=prompt):
+                    decision = await R.route(prompt)
+                    self.assertEqual(set(decision.tool_subset or ()), expected)
+                    self.assertEqual(
+                        decision.required_tool_groups,
+                        tuple(frozenset({name}) for name in decision.tool_subset),
+                    )
+                    self.assertFalse(expected.intersection(decision.forbidden_tools))
+                    self.assertNotIn("web_search", decision.tool_subset or [])
+                    self.assertNotIn("search_notes", decision.tool_subset or [])
+                    if "send_message" in expected:
+                        self.assertNotIn("view_messages", decision.tool_subset or [])
+                    if "send_email" in expected:
+                        self.assertNotIn("view_emails", decision.tool_subset or [])
+        self.assertEqual(count, 12)
+
+    async def test_no_browse_preserves_private_source_checklist_matrix(self):
+        public_sources = ("latest news about Iran", "research climate change")
+        opt_outs = (
+            "do not browse", "never browse", "avoid browsing", "keep it offline",
+        )
+        private_sources = (
+            ("my calendar tomorrow", "get_upcoming"),
+            ("my reminders", "search_reminders"),
+        )
+        destinations = (
+            ("Notes", "create_note"),
+            ("Reminders", "add_reminder"),
+            ("Calendar", "add_calendar_event"),
+            ("Wisp", None),
+        )
+        count = 0
+        for public_source in public_sources:
+            for opt_out in opt_outs:
+                for private_source, source_tool in private_sources:
+                    for destination, destination_tool in destinations:
+                        prompt = (
+                            f"{public_source}; {opt_out}; create a checklist in "
+                            f"{destination} from {private_source}"
+                        )
+                        count += 1
+                        with self.subTest(matrix="private-checklist-64", prompt=prompt):
+                            decision = await R.route(prompt)
+                            expected = [source_tool] + (
+                                [destination_tool] if destination_tool else [])
+                            self.assertEqual(decision.tool_subset, expected)
+                            self.assertEqual(decision.force_first_tool, source_tool)
+                            self.assertEqual(
+                                decision.required_tool_groups,
+                                tuple(frozenset({name}) for name in expected),
+                            )
+                            self.assertFalse(set(expected).intersection(
+                                decision.forbidden_tools))
+                            self.assertNotIn("web_search", decision.tool_subset or [])
+        self.assertEqual(count, 64)
+
+    async def test_no_browse_authored_action_syntax_matrix(self):
+        delivery_cases = (
+            ("text Mom that dinner is at 7", "send_message", "Mom", "dinner is at 7"),
+            ("text Mom: dinner is at 7", "send_message", "Mom", "dinner is at 7"),
+            ("message Mom saying dinner is at 7", "send_message", "Mom", "dinner is at 7"),
+            ("send Mom a message saying dinner is at 7", "send_message", "Mom", "dinner is at 7"),
+            ("send a message to Mom saying dinner is at 7", "send_message", "Mom", "dinner is at 7"),
+            ("draft a message to Mom saying dinner is at 7", "draft_message", "Mom", "dinner is at 7"),
+            ("draft Mom a message saying dinner is at 7", "draft_message", "Mom", "dinner is at 7"),
+            ("text +14155550123: dinner is at 7", "send_message", "+14155550123", "dinner is at 7"),
+            ("text +14155550123 saying dinner is at 7", "send_message", "+14155550123", "dinner is at 7"),
+            ("email Mom that dinner is at 7", "send_email", "Mom", "dinner is at 7"),
+            ("email Mom: dinner is at 7", "send_email", "Mom", "dinner is at 7"),
+            ("email mom@example.com Dinner is at 7", "send_email", "mom@example.com", "Dinner is at 7"),
+            ("send Mom an email saying dinner is at 7", "send_email", "Mom", "dinner is at 7"),
+            ("send an email to Mom saying dinner is at 7", "send_email", "Mom", "dinner is at 7"),
+            ("draft an email to Mom saying dinner is at 7", "draft_email", "Mom", "dinner is at 7"),
+            ("draft Mom an email saying dinner is at 7", "draft_email", "Mom", "dinner is at 7"),
+            ("email mom@example.com: dinner is at 7", "send_email", "mom@example.com", "dinner is at 7"),
+        )
+        calendar_cases = (
+            ("create a calendar event called Dinner tomorrow at 7", "Dinner"),
+            ("put Dinner on my calendar tomorrow at 7", "Dinner"),
+        )
+        public_sources = ("latest news about Iran", "research climate change")
+        opt_outs = ("do not browse", "never browse", "avoid browsing", "keep it offline")
+        count = 0
+        for public_source in public_sources:
+            for opt_out in opt_outs:
+                for action, effect, recipient, payload in delivery_cases:
+                    prompt = f"{public_source}; {opt_out}; {action}"
+                    count += 1
+                    with self.subTest(matrix="authored-actions-152", prompt=prompt):
+                        decision = await R.route(prompt)
+                        literal = "@" in recipient or recipient.startswith("+")
+                        expected = [effect] if literal else ["lookup_contact", effect]
+                        self.assertEqual(decision.tool_subset, expected)
+                        self.assertEqual(
+                            decision.required_tool_groups,
+                            tuple(frozenset({name}) for name in expected),
+                        )
+                        if not literal:
+                            self.assertEqual(
+                                decision.tool_argument_bindings["lookup_contact"],
+                                {"name": recipient},
+                            )
+                        binding = decision.tool_argument_bindings[effect]
+                        self.assertEqual(binding["to"], recipient)
+                        self.assertEqual(
+                            binding["text" if "message" in effect else "body"],
+                            payload,
+                        )
+                        self.assertFalse(set(expected).intersection(
+                            decision.forbidden_tools))
+                        self.assertNotIn("view_messages", decision.tool_subset or [])
+                        self.assertNotIn("view_emails", decision.tool_subset or [])
+                for action, title in calendar_cases:
+                    prompt = f"{public_source}; {opt_out}; {action}"
+                    count += 1
+                    with self.subTest(matrix="authored-actions-152", prompt=prompt):
+                        decision = await R.route(prompt)
+                        self.assertEqual(decision.tool_subset, ["add_calendar_event"])
+                        self.assertEqual(
+                            decision.tool_argument_bindings["add_calendar_event"],
+                            {"title": title},
+                        )
+                        self.assertNotIn("add_calendar_event", decision.forbidden_tools)
+                        self.assertNotIn("get_upcoming", decision.tool_subset or [])
+        self.assertEqual(count, 152)
+
+    async def test_no_browse_colonless_text_matrix(self):
+        count = 0
+        for public_source in ("latest news about Iran", "research climate change"):
+            for opt_out in (
+                "do not browse", "never browse", "avoid browsing", "keep it offline",
+            ):
+                prompt = f"{public_source}; {opt_out}; text Mom dinner is at 7"
+                count += 1
+                with self.subTest(matrix="colonless-text-8", prompt=prompt):
+                    decision = await R.route(prompt)
+                    self.assertEqual(
+                        decision.tool_subset, ["lookup_contact", "send_message"])
+                    self.assertEqual(
+                        decision.required_tool_groups,
+                        (frozenset({"lookup_contact"}), frozenset({"send_message"})),
+                    )
+                    self.assertEqual(
+                        decision.tool_argument_bindings["lookup_contact"],
+                        {"name": "Mom"},
+                    )
+                    self.assertEqual(
+                        decision.tool_argument_bindings["send_message"],
+                        {"to": "Mom", "text": "dinner is at 7"},
+                    )
+                    self.assertNotIn("send_message", decision.forbidden_tools)
+                    self.assertNotIn("view_messages", decision.tool_subset or [])
+        self.assertEqual(count, 8)
+
+    async def test_no_browse_write_stays_draft_and_matches_standalone_semantics(self):
+        cases = (
+            ("write an email to Mom saying dinner is at 7", "draft_email", "body"),
+            ("write Mom a message saying dinner is at 7", "draft_message", "text"),
+        )
+        count = 0
+        for public_source in ("latest news about Iran", "research climate change"):
+            for opt_out in (
+                "do not browse", "never browse", "avoid browsing", "keep it offline",
+            ):
+                for action, draft_tool, content_key in cases:
+                    prompt = f"{public_source}; {opt_out}; {action}"
+                    count += 1
+                    with self.subTest(kind="prefixed", prompt=prompt):
+                        decision = await R.route(prompt)
+                        self.assertEqual(
+                            decision.tool_subset, ["lookup_contact", draft_tool])
+                        self.assertNotIn(
+                            "send_email" if draft_tool == "draft_email" else "send_message",
+                            decision.tool_subset,
+                        )
+                        self.assertIn(
+                            "send_email" if draft_tool == "draft_email" else "send_message",
+                            decision.forbidden_tools,
+                        )
+                        self.assertEqual(
+                            decision.tool_argument_bindings["lookup_contact"],
+                            {"name": "Mom"},
+                        )
+                        binding = decision.tool_argument_bindings[draft_tool]
+                        self.assertEqual(binding["to"], "Mom")
+                        self.assertEqual(binding[content_key], "dinner is at 7")
+        self.assertEqual(count, 16)
+
+        for action, draft_tool, _ in cases:
+            with self.subTest(kind="standalone", action=action):
+                decision = await R.route(action)
+                executable = (
+                    "send_email" if draft_tool == "draft_email" else "send_message"
+                )
+                self.assertEqual(
+                    decision.tool_subset, ["lookup_contact", draft_tool])
+                self.assertNotIn(executable, decision.tool_subset)
+                self.assertIn(executable, decision.forbidden_tools)
+                self.assertEqual(
+                    decision.tool_argument_bindings["lookup_contact"],
+                    {"name": "Mom"},
+                )
+                binding = decision.tool_argument_bindings[draft_tool]
+                self.assertEqual(binding["to"], "Mom")
+                self.assertEqual(
+                    binding["body" if draft_tool == "draft_email" else "text"],
+                    "dinner is at 7",
+                )
+                self.assertFalse(any(name == executable for name, _ in decision.direct_calls))
+
+
+if __name__ == "__main__":
+    unittest.main()

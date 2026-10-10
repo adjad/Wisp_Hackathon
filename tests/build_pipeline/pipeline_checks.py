@@ -1,0 +1,2397 @@
+from __future__ import annotations
+
+from argparse import Namespace
+from contextlib import ExitStack, contextmanager
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import plistlib
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "build-support"))
+import pipeline as p
+import release
+
+
+class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.meta = {"version": p.CONFIG["version"], "build_number": "12", "commit": "a" * 40,
+                     "source_epoch": 1700000000, "dirty": False, "architecture": "arm64", "minimum_macos": "14.0"}
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @contextmanager
+    def synthetic_profile_metadata(self):
+        """Unit tests generate policy without querying tools inside Seatbelt.
+
+        The separate check_* entry points still query the host and execute real
+        sandbox probes before the full QA sandbox is entered.
+        """
+        def query(command, **kwargs):
+            if command == ["xcode-select", "-p"]:
+                return str(self.root / "developer")
+            if command == ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"]:
+                return str(self.root / "os-temp")
+            raise AssertionError("Unexpected profile metadata query")
+        def git(*args):
+            return ".git" if args == ("rev-parse", "--git-common-dir") else "a" * 40
+        with patch.object(p, "git", side_effect=git), patch.object(p.subprocess, "check_output", side_effect=query):
+            yield
+
+    def fixture(self):
+        bundle = self.root / "Wisp.app"
+        for rel in ("Contents/MacOS/Wisp", "Contents/Resources/AppIcon.icns", "Contents/Resources/build-info.json",
+                    "Contents/Resources/backend/.venv/bin/python3", "Contents/Resources/backend/service/main.py",
+                    "Contents/Resources/backend/service/config/models.yaml", "Contents/Resources/backend/service/config/policy.yaml",
+                    "Contents/Resources/backend/service/skills/bundled/interview-me/SKILL.md",
+                    "Contents/Resources/backend/service/skills/bundled/idea-refine/SKILL.md"):
+            path = bundle / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture")
+        (bundle / "Contents/MacOS/Wisp").chmod(0o755)
+        (bundle / "Contents/Resources/backend/.venv/bin/python3").chmod(0o755)
+        (bundle / "Contents/Resources/backend/.venv/bin/python").symlink_to("python3")
+        (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps(p.plist(self.meta)))
+        return bundle
+
+    def test_valid_bundle(self):
+        p.validate_structure(self.fixture(), self.meta)
+
+    def test_missing_resource(self):
+        bundle = self.fixture()
+        (bundle / "Contents/Resources/backend/service/config/policy.yaml").unlink()
+        with self.assertRaisesRegex(p.BuildError, "Missing"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_absolute_symlink(self):
+        bundle = self.fixture()
+        (bundle / "escape").symlink_to("/usr/bin/python3")
+        with self.assertRaisesRegex(p.BuildError, "symlink"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_relative_symlink_escape(self):
+        bundle = self.fixture()
+        (self.root / "outside").write_text("outside")
+        (bundle / "escape").symlink_to("../outside")
+        with self.assertRaisesRegex(p.BuildError, "symlink"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_reject_state_credentials_and_host_venv(self):
+        for name in ("private.db", "identity.p12", "AuthKey.p8", "pyvenv.cfg", ".env"):
+            with self.subTest(name=name):
+                bundle = self.fixture() if not (self.root / "Wisp.app").exists() else self.root / "Wisp.app"
+                path = bundle / name
+                path.write_text("must be rejected")
+                with self.assertRaisesRegex(p.BuildError, "Unwanted"):
+                    p.validate_structure(bundle, self.meta)
+                path.unlink()
+
+    def test_version_mismatch(self):
+        bundle = self.fixture()
+        with self.assertRaisesRegex(p.BuildError, "Info.plist mismatch"):
+            p.validate_structure(bundle, dict(self.meta, version="999.0.0"))
+
+    def test_mode_validation(self):
+        bundle = self.fixture()
+        (bundle / "Contents/MacOS/Wisp").chmod(0o644)
+        with self.assertRaisesRegex(p.BuildError, "not executable"):
+            p.validate_structure(bundle, self.meta)
+
+    def test_archive_is_repeatable_and_preserves_symlinks(self):
+        bundle = self.fixture()
+        first, second = self.root / "a.zip", self.root / "b.zip"
+        p.archive(bundle, first, self.meta["source_epoch"])
+        os.utime(bundle / "Contents/Info.plist", (1800000000, 1800000000))
+        p.archive(bundle, second, self.meta["source_epoch"])
+        self.assertEqual(p.digest(first), p.digest(second))
+        with zipfile.ZipFile(first) as z:
+            info = z.getinfo("Wisp.app/Contents/Resources/backend/.venv/bin/python")
+            self.assertTrue(stat.S_ISLNK(info.external_attr >> 16))
+            self.assertEqual(z.read(info), b"python3")
+
+    def artifact(self):
+        bundle = self.fixture()
+        p.json_write(self.root / "simulation-qa.json", self.qa_report())
+        p.json_write(self.root / "provenance.json", {"source": self.meta, "signature": "ad-hoc", "notarized": False,
+            "simulation_sha256": p.digest(self.root / "simulation-qa.json")})
+        p.json_write(self.root / "bundle-manifest.json", p.inventory(bundle))
+        p.archive(bundle, self.root / "Wisp.zip", self.meta["source_epoch"])
+        p.checksums(self.root)
+        return bundle
+
+    def qa_report(self):
+        from native_peer_gate import MODULE, EXPECTED
+        native={'schema_version':1,'scope':'reserved-disposable-loopback-and-native-inspection',
+                'candidate_sha':self.meta['commit'],'ending_sha':self.meta['commit'],
+                'clean_start':True,'clean_end':True,'dirty_allowed':False,'status':'PASS','returncode':0,
+                'ports':list(range(51001,51008)),
+                'cases':{'collected':len(EXPECTED),'exitstatus':0,'rows':[
+                    {'nodeid':node,'phase':phase,'outcome':'passed','xfail':False}
+                    for node in sorted(EXPECTED) for phase in ('setup','call','teardown')]}}
+        from browser_bridge_gate import MODULE as BROWSER_MODULE, EXPECTED as BROWSER_EXPECTED, PROBES
+        browser = dict(schema_version=1, scope='disposable-signed-af-unix',
+            candidate_sha=self.meta['commit'], ending_sha=self.meta['commit'], clean_start=True,
+            clean_end=True, dirty_allowed=False, status='PASS', returncode=0,
+            probes={name: True for name in PROBES},
+            cases=dict(collected=len(BROWSER_EXPECTED), exitstatus=0, rows=[
+                dict(nodeid=node, phase=phase, outcome='passed', xfail=False)
+                for node in sorted(BROWSER_EXPECTED) for phase in ('setup', 'call', 'teardown')]))
+        from release_performance_gate import MODULE as BENCHMARK_MODULE, EXPECTED as BENCHMARK_EXPECTED, PROBES as BENCHMARK_PROBES
+        benchmark = dict(schema_version=1, scope="offline-benchmark-reserved-loopback",
+            candidate_sha=self.meta["commit"], ending_sha=self.meta["commit"], clean_start=True,
+            clean_end=True, dirty_allowed=False, status="PASS", returncode=0, port=51010,
+            probes={name: True for name in BENCHMARK_PROBES},
+            cases=dict(collected=len(BENCHMARK_EXPECTED), exitstatus=0, rows=[
+                dict(nodeid=node, phase=phase, outcome="passed", xfail=False)
+                for node in sorted(BENCHMARK_EXPECTED) for phase in ("setup", "call", "teardown")]))
+        return {"schema_version": 3, "status": "PASS", "candidate_sha": self.meta["commit"],
+                "ending_sha": self.meta["commit"], "sha_stable": True, "worktree_clean": True,
+                "dirty_allowed": False, "profiles": ["full"], "safety_mode": "offline",
+                "native_mode": "included", "totals": {"gates": 3, "passed_gates": 3,
+                "failed_gates": 0, "blocked_gates": 0},
+                'results':[{'name':MODULE,'status':'PASS','returncode':0,'passed':9,'failed':0,'skipped':0,
+                            'stdout':json.dumps({'native_gate':native})},
+                           {'name':BROWSER_MODULE,'status':'PASS','returncode':0,'passed':len(BROWSER_EXPECTED),'failed':0,'skipped':0,
+                            'stdout':json.dumps({'browser_bridge_gate':browser})},
+                           {"name":BENCHMARK_MODULE,"status":"PASS","returncode":0,"passed":len(BENCHMARK_EXPECTED),"failed":0,"skipped":0,
+                            "stdout":json.dumps({"benchmark_gate":benchmark})}]}
+
+    def test_native_peer_evidence_is_mandatory_and_exact(self):
+        from native_peer_gate import validate
+        report=self.qa_report()
+        with self.assertRaises(p.BuildError):p.validate_simulation({**report,'results':[]},self.meta['commit'])
+        native=json.loads(report['results'][0]['stdout'])['native_gate']
+        for mutation in ('missing','duplicate','skip','xfail','stale','port8000'):
+            changed=json.loads(json.dumps(native))
+            if mutation=='missing':changed['cases']['rows'].pop()
+            if mutation=='duplicate':changed['cases']['rows'].append(changed['cases']['rows'][0])
+            if mutation=='skip':changed['cases']['rows'][0]['outcome']='skipped'
+            if mutation=='xfail':changed['cases']['rows'][0]['xfail']=True
+            if mutation=='stale':changed['ending_sha']='b'*40
+            if mutation=='port8000':changed['ports'][0]=8000
+            with self.subTest(mutation=mutation),self.assertRaises(ValueError):validate(changed,self.meta['commit'])
+
+    def test_browser_bridge_evidence_is_mandatory_in_artifact_verification(self):
+        from browser_bridge_gate import validate, load_pinned
+        report = self.qa_report()
+        browser = json.loads(report['results'][1]['stdout'])['browser_bridge_gate']
+        for mutation in ('missing', 'duplicate', 'skip', 'xfail', 'stale', 'dirty', 'probe', 'count'):
+            changed = json.loads(json.dumps(browser))
+            if mutation == 'missing': changed['cases']['rows'].pop()
+            if mutation == 'duplicate': changed['cases']['rows'].append(changed['cases']['rows'][0])
+            if mutation == 'skip': changed['cases']['rows'][0]['outcome'] = 'skipped'
+            if mutation == 'xfail': changed['cases']['rows'][0]['xfail'] = True
+            if mutation == 'stale': changed['ending_sha'] = 'b' * 40
+            if mutation == 'dirty': changed['clean_end'] = False
+            if mutation == 'probe': changed['probes'].pop('dedicated_ip_denied')
+            if mutation == 'count': changed['cases']['collected'] = len(browser['cases']['rows']) // 3 - 1
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                validate(changed, self.meta['commit'])
+        evidence = self.root / 'browser.json'
+        evidence.write_text(json.dumps(browser))
+        load_pinned(evidence, p.digest(evidence), self.meta['commit'])
+        with self.assertRaises(ValueError):
+            load_pinned(evidence, '0' * 64, self.meta['commit'])
+        with self.assertRaises(FileNotFoundError):
+            load_pinned(self.root / 'absent', '0' * 64, self.meta['commit'])
+        self.artifact()
+        # Rehash the damaged combined report: the mandatory evidence validator
+        # must reject it even when the outer artifact hashes are self-consistent.
+        report['results'].pop(1)
+        p.json_write(self.root / 'simulation-qa.json', report)
+        provenance = json.loads((self.root / 'provenance.json').read_text())
+        provenance['simulation_sha256'] = p.digest(self.root / 'simulation-qa.json')
+        p.json_write(self.root / 'provenance.json', provenance)
+        p.checksums(self.root)
+        with self.assertRaisesRegex(p.BuildError, 'browser bridge'):
+            p.verify_artifacts(self.root)
+        report = self.qa_report()
+        report['results'].append(report['results'][1])
+        with self.assertRaises(p.BuildError):
+            p.validate_simulation(report, self.meta['commit'])
+
+    def test_benchmark_fixture_evidence_is_mandatory_complete_and_sha_bound(self):
+        from release_performance_gate import validate, load_pinned
+        report = self.qa_report()
+        benchmark = json.loads(report["results"][2]["stdout"])["benchmark_gate"]
+        for mutation in ("missing", "duplicate", "skip", "xfail", "stale", "dirty", "probe", "port8000", "renamed"):
+            changed = json.loads(json.dumps(benchmark))
+            if mutation == "missing": changed["cases"]["rows"].pop()
+            if mutation == "duplicate": changed["cases"]["rows"].append(changed["cases"]["rows"][0])
+            if mutation == "skip": changed["cases"]["rows"][0]["outcome"] = "skipped"
+            if mutation == "xfail": changed["cases"]["rows"][0]["xfail"] = True
+            if mutation == "stale": changed["ending_sha"] = "b" * 40
+            if mutation == "dirty": changed["clean_end"] = False
+            if mutation == "probe": changed["probes"]["denied_loopback"] = False
+            if mutation == "port8000": changed["port"] = 8000
+            if mutation == "renamed": changed["cases"]["rows"][0]["nodeid"] = "different::case"
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                validate(changed, self.meta["commit"])
+        evidence = self.root / "benchmark.json"
+        evidence.write_text(json.dumps(benchmark))
+        load_pinned(evidence, p.digest(evidence), self.meta["commit"])
+        with self.assertRaises(ValueError):
+            load_pinned(evidence, "0" * 64, self.meta["commit"])
+        report["results"].pop(2)
+        with self.assertRaisesRegex(p.BuildError, "benchmark"):
+            p.validate_simulation(report, self.meta["commit"])
+
+    def test_benchmark_fixture_profile_preserves_generic_network_and_home_denials(self):
+        import release_performance_gate as gate
+        native_git = self.root / "developer/usr/bin/git"
+        native_git.parent.mkdir(parents=True)
+        native_git.write_text("synthetic native git")
+        native_git.chmod(0o700)
+        native_git = native_git.resolve()
+        with patch.object(gate.subprocess, "run", return_value=Namespace(stdout=str(native_git))) as selection:
+            selected = gate.select_native_git()
+            with self.synthetic_profile_metadata():
+                policy = gate.profile(self.root, Path(sys.executable), 51010, self.root / "canary", selected)
+            with patch.object(sys, "path", [str(ROOT), *sys.path]):
+                env = gate.fixture_environment(self.root, selected)
+        selection.assert_called_once_with(["/usr/bin/xcrun", "--find", "git"], check=True,
+            env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(selected, native_git)
+        self.assertEqual(gate.shutil.which("git", path=env["PATH"]), str(selected))
+        self.assertTrue(env["PATH"].startswith(str(selected.parent) + os.pathsep))
+        self.assertNotIn("DEVELOPER_DIR", env)
+        self.assertIn("(deny network*)", policy)
+        self.assertIn('(allow network-outbound (remote ip "localhost:51010"))', policy)
+        self.assertIn('(allow network-bind network-inbound (local ip "localhost:51010"))', policy)
+        self.assertNotIn('localhost:8000', policy)
+        execution = next(line for line in policy.splitlines() if line.startswith("(allow process-exec "))
+        self.assertNotIn("subpath", execution)
+        for prohibited in ("/bin/sh", "/bin/bash", "/usr/bin/env", "/bin/rm", "/usr/bin/swiftc", str(self.root)):
+            self.assertNotIn('(literal ' + json.dumps(prohibited) + ')', execution)
+        self.assertNotIn('(literal "/usr/bin/git")', execution)
+        self.assertIn('(literal ' + json.dumps(str(selected)) + ')', execution)
+        self.assertNotIn("xcodebuild", execution)
+        self.assertIn('(literal ' + json.dumps(str(Path(sys.executable).resolve())) + ')', execution)
+        self.assertNotIn('(subpath ' + json.dumps(str(p.STATE.resolve())) + ')', policy)
+        for invalid in (8000, 0, "51010", True):
+            with self.assertRaises(ValueError): gate.profile(self.root, Path(sys.executable), invalid, self.root / "canary", selected)
+        with patch.object(gate.subprocess, "run", return_value=Namespace(stdout="/usr/bin/git")):
+            with self.assertRaisesRegex(ValueError, "benchmark_fixture_git_invalid"):
+                gate.select_native_git()
+
+    def test_native_fixture_timeout_closes_descendant_descriptors(self):
+        import select
+        from native_peer_gate import fixture_process
+        reader,writer=os.pipe()
+        child="import os,signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);os.write(int(__import__('sys').argv[1]),b'ready');time.sleep(60)"
+        parent="import subprocess,sys,time;subprocess.Popen([sys.executable,'-I','-c',sys.argv[1],sys.argv[2]],pass_fds=(int(sys.argv[2]),));time.sleep(60)"
+        try:
+            result=fixture_process([sys.executable,'-I','-c',parent,child,str(writer)],timeout=3,
+                pass_fds=(writer,),stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            self.assertEqual(result.returncode,124)
+            os.close(writer);writer=None
+            self.assertTrue(select.select([reader],[],[],1)[0])
+            self.assertEqual(os.read(reader,5),b'ready')
+            self.assertTrue(select.select([reader],[],[],1)[0])
+            self.assertEqual(os.read(reader,1),b'')  # No surviving writer, including the TERM-ignoring descendant.
+        finally:
+            os.close(reader)
+            if writer is not None:os.close(writer)
+
+    def test_candidate_rejects_partial_stale_or_dirty_qa(self):
+        for change in ({"candidate_sha": "b" * 40}, {"status": "FAIL"},
+                       {"native_mode": "skip"}, {"profiles": ["routing"]},
+                       {"dirty_allowed": True}, {"worktree_clean": False},
+                       {"totals": {"gates": 2, "passed_gates": 1, "failed_gates": 0, "blocked_gates": 1}}):
+            with self.subTest(change=change), self.assertRaises(p.BuildError):
+                p.validate_simulation(dict(self.qa_report(), **change), self.meta["commit"])
+
+    def test_archive_roundtrip_never_calls_release_signing(self):
+        bundle = self.fixture()
+        archive = self.root / "Wisp.zip"
+        p.archive(bundle, archive, self.meta["source_epoch"])
+        calls = []
+        class FakeRunner:
+            logs = self.root
+            def run(inner, label, command):
+                calls.append(command)
+                if label == "extract-distribution":
+                    import shutil
+                    shutil.copytree(bundle, Path(command[-1]) / "Wisp.app", symlinks=True)
+        with patch.object(p, "relocation_smoke"), patch.object(p, "verify_bundle_signature") as verify:
+            runner = FakeRunner()
+            p.distribution_roundtrip(runner, archive, bundle, self.meta)
+            verify.assert_called_once()
+            self.assertEqual(verify.call_args.args[1], "ad-hoc")
+        self.assertFalse(any("--sign" in c for c in calls))
+
+    def check_adhoc_sign_seals_bundle_for_strict_verification(self):
+        import shutil
+        bundle = self.fixture()
+        # A real Mach-O main executable; the fixture's placeholder text cannot be sealed.
+        shutil.copyfile("/bin/echo", bundle / "Contents/MacOS/Wisp")
+        (bundle / "Contents/MacOS/Wisp").chmod(0o755)
+
+        class DirectRunner:
+            logs = self.root
+
+            def run(inner, label, command, **kwargs):
+                result = subprocess.run([str(c) for c in command], check=True, env=p.clean_env(),
+                                        capture_output=True, text=True)
+                log = self.root / (label + ".log")
+                log.write_text(result.stdout + result.stderr)
+                return 0, log
+
+        # Fails loudly if the bundle cannot be sealed or strictly verified.
+        p.sign_adhoc(DirectRunner(), bundle)
+        self.assertTrue((bundle / "Contents/_CodeSignature/CodeResources").is_file())
+        subprocess.run(["codesign", "--verify", "--deep", "--strict", str(bundle)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        described = subprocess.run(["codesign", "-dvv", str(bundle)], capture_output=True, text=True).stderr
+        self.assertIn("Signature=adhoc", described)
+        self.assertNotIn("Sealed Resources=none", described)
+        self.assertNotIn("TeamIdentifier=", described.replace("TeamIdentifier=not set", ""))
+
+    def test_signing_permission_is_separate_from_general_simulation(self):
+        python = Path(sys.executable)
+        with patch.object(p, "git", return_value=".git"), patch.object(p.subprocess, "check_output",
+                side_effect=lambda command, **kwargs: "/Library/Developer/CommandLineTools" if command[0] == "xcode-select" else str(self.root)):
+            normal = p.simulation_profile(self.root, python)
+            signing = p.simulation_profile(self.root, python, local_signing=True)
+        self.assertNotIn('(literal "/usr/bin/codesign")', normal)
+        self.assertIn('(literal "/usr/bin/openssl")', normal)
+        self.assertEqual(signing.replace(' (literal "/usr/bin/codesign")', ''), normal)
+        for rule in ('(deny network*)', '(deny appleevent-send)', '(deny process-exec)', '(deny file-write*)'):
+            self.assertIn(rule, signing)
+        self.assertNotIn('(literal "/usr/bin/security")', signing)
+
+    def test_simulation_requires_fixed_node_runtime(self):
+        original = Path.is_file
+        def without_node(path):
+            return False if str(path) in ("/usr/local/bin/node", "/opt/homebrew/bin/node") else original(path)
+        with self.synthetic_profile_metadata(), patch.object(Path, "is_file", without_node):
+            with self.assertRaisesRegex(p.BuildError, "Node is required"):
+                p.simulation_profile(self.root, Path(sys.executable), node_runtime="/usr/local/bin/node")
+
+    def test_simulation_node_permission_is_one_literal_not_a_directory(self):
+        with self.synthetic_profile_metadata():
+            profile = p.simulation_profile(self.root, Path(sys.executable), node_runtime=str(p._qa_node_runtime()))
+        selected = next(path for path in (Path("/usr/local/bin/node"), Path("/opt/homebrew/bin/node"))
+                        if path.is_file() and os.access(path, os.X_OK)).resolve()
+        self.assertIn('(literal ' + json.dumps(str(selected)) + ')', profile)
+        for prefix in ("/usr/local", "/usr/local/bin", "/opt/homebrew", "/opt/homebrew/bin"):
+            self.assertNotIn('(subpath ' + json.dumps(prefix) + ')', profile)
+        for rule in ('(deny network*)', '(deny appleevent-send)', '(deny process-exec)', '(deny file-write*)'):
+            self.assertIn(rule, profile)
+
+    def test_simulation_rejects_node_alias_outside_approved_prefix(self):
+        original = Path.resolve
+        def resolve(path, *args, **kwargs):
+            if str(path) in ("/usr/local/bin/node", "/opt/homebrew/bin/node"):
+                return self.root / "untrusted" / "node"
+            return original(path, *args, **kwargs)
+        with self.synthetic_profile_metadata(), patch.object(Path, "resolve", resolve):
+            with self.assertRaisesRegex(p.BuildError, "approved installation prefix"):
+                p.simulation_profile(self.root, Path(sys.executable), node_runtime="/usr/local/bin/node")
+
+    def test_native_only_simulation_does_not_require_or_authorize_node(self):
+        import native_peer_gate
+        import browser_bridge_gate
+        import release_performance_gate
+        calls = []
+        class FakeRunner:
+            logs = self.root
+            env = {"PATH": "/usr/bin:/bin", "QA_NODE_RUNTIME": "/untrusted/inherited/node"}
+            def run(inner, label, command, **kwargs):
+                calls.append((label, command, kwargs))
+                if "--report" in command:
+                    Path(command[command.index("--report") + 1]).write_text("{}")
+                return 0, self.root / "unused.log"
+        with self.synthetic_profile_metadata(), patch.object(p, "_qa_node_runtime", side_effect=p.BuildError("Node is required")) as resolver, \
+                patch.object(native_peer_gate, "validate"), patch.object(browser_bridge_gate, "validate"), patch.object(release_performance_gate, "validate"), patch.object(p, "validate_simulation"):
+            p.simulation_tests(FakeRunner(), Path(sys.executable), native_only=True)
+        resolver.assert_not_called()
+        self.assertNotIn("node-sandbox-contract", [label for label, _, _ in calls])
+        _, command, kwargs = next(call for call in calls if call[0] == "simulation-qa")
+        self.assertIn("--only-native", command)
+        self.assertNotIn("QA_NODE_RUNTIME", kwargs["env"])
+        profile = command[command.index("-p") + 1]
+        for candidate in ("/usr/local/bin/node", "/opt/homebrew/bin/node"):
+            self.assertNotIn('(literal ' + json.dumps(str(Path(candidate).resolve())) + ')', profile)
+
+    def test_full_simulation_requires_node_before_launching_gates(self):
+        from unittest.mock import Mock
+        runner = Mock()
+        with patch.object(p, "_qa_node_runtime", side_effect=p.BuildError("Node is required")):
+            with self.assertRaisesRegex(p.BuildError, "Node is required"):
+                p.simulation_tests(runner, Path(sys.executable))
+        runner.run.assert_not_called()
+
+    def test_full_simulation_pins_runtime_and_requires_node_preflight(self):
+        import native_peer_gate
+        import browser_bridge_gate
+        import release_performance_gate
+        calls = []
+        selected = str(p._qa_node_runtime())
+        class FakeRunner:
+            logs = self.root
+            env = {"PATH": "/usr/bin:/bin", "QA_NODE_RUNTIME": "/untrusted/inherited/node"}
+            def run(inner, label, command, **kwargs):
+                calls.append((label, command, kwargs))
+                if "--report" in command:
+                    Path(command[command.index("--report") + 1]).write_text("{}")
+                return 0, self.root / "unused.log"
+        with self.synthetic_profile_metadata(), patch.object(native_peer_gate, "validate"), patch.object(browser_bridge_gate, "validate"), patch.object(release_performance_gate, "validate"), patch.object(p, "validate_simulation"):
+            p.simulation_tests(FakeRunner(), Path(sys.executable))
+        names = [label for label, _, _ in calls]
+        self.assertLess(names.index("node-sandbox-contract"), names.index("simulation-qa"))
+        self.assertLess(names.index("browser-disposable-transport-security"), names.index("simulation-qa"))
+        for label, command, kwargs in calls:
+            if label in ("node-sandbox-contract", "simulation-qa"):
+                self.assertEqual(kwargs["env"]["QA_NODE_RUNTIME"], selected)
+                self.assertEqual(kwargs["env"]["PATH"], "/usr/bin:/bin")
+            if label == "simulation-qa":
+                self.assertIn("BENCHMARK_GATE_REPORT", kwargs["env"])
+                self.assertEqual(len(kwargs["env"]["BENCHMARK_GATE_SHA256"]), 64)
+                self.assertIn("BROWSER_BRIDGE_GATE_REPORT", kwargs["env"])
+                self.assertEqual(len(kwargs["env"]["BROWSER_BRIDGE_GATE_SHA256"]), 64)
+                self.assertNotIn("--only-native", command)
+                profile = command[command.index("-p") + 1]
+                self.assertIn('(literal ' + json.dumps(selected) + ')', profile)
+
+    def test_node_only_profile_grants_no_shell_or_executable_subpaths(self):
+        selected = str(p._qa_node_runtime())
+        with self.synthetic_profile_metadata():
+            profile = p.simulation_profile(self.root, Path(sys.executable), node_runtime=selected, node_only=True)
+        rule = next(line for line in profile.splitlines() if line.startswith("(allow process-exec "))
+        self.assertEqual(rule, '(allow process-exec (literal ' + json.dumps(selected) + '))')
+        for rule in ('(deny network*)', '(deny appleevent-send)', '(deny process-exec)', '(deny file-write*)'):
+            self.assertIn(rule, profile)
+        with self.assertRaises(p.BuildError):
+            p.simulation_profile(self.root, Path(sys.executable), node_only=True)
+        with self.assertRaises(p.BuildError):
+            p.simulation_profile(self.root, Path(sys.executable), node_runtime=selected, node_only=True, local_signing=True)
+
+    def test_node_only_write_rule_is_scratch_only(self):
+        scratch = self.root / "scratch"
+        selected = str(p._qa_node_runtime())
+        with self.synthetic_profile_metadata(), patch.object(p, "STATE", self.root / "build-state"):
+            narrow = p.simulation_profile(scratch, Path(sys.executable), node_runtime=selected, node_only=True)
+            generic = p.simulation_profile(scratch, Path(sys.executable))
+        rule = next(line for line in narrow.splitlines() if line.startswith("(allow file-write* "))
+        self.assertEqual(rule, '(allow file-write* (subpath ' + json.dumps(str(scratch.resolve())) + '))')
+        # Preserve the independently qualified legacy profile's existing rights.
+        generic_rule = next(line for line in generic.splitlines() if line.startswith("(allow file-write* "))
+        self.assertIn('(subpath ' + json.dumps(str((self.root / "build-state").resolve())) + ')', generic_rule)
+
+    def check_local_signing_sandbox(self):
+        # Required separate native gate: never grants codesign to general Python QA.
+        python = Path(sys.executable)
+        normal = p.simulation_profile(self.root, python)
+        signing = p.simulation_profile(self.root, python, local_signing=True)
+        # Use only executables allowed by the profile, and never consult the
+        # runner's private Git config when creating disposable fixture repos.
+        env = dict(p.clean_env(), TMPDIR=str(self.root), PATH="/usr/bin:/bin:/usr/sbin:/sbin",
+                   GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+        def run(profile, args):
+            return subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(python), "-B", *args],
+                                  env=env, capture_output=True, text=True, timeout=120)
+        probe = "import subprocess; subprocess.run(['/usr/bin/codesign','--version'],check=True)"
+        self.assertNotEqual(run(normal, ["-c", probe]).returncode, 0)
+        result = run(signing, [str(Path(__file__).resolve()),
+                              "PipelineTests.check_adhoc_sign_seals_bundle_for_strict_verification", "-q"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        native = run(signing, [str(ROOT / "tests/build_pipeline/managed_live_qa_checks.py"),
+            "ManagedQAStagingTests.test_native_unavailable_contract_compiles_runs_and_blocks_without_child",
+            "ManagedQAStagingTests.test_compiled_native_inventory_rejects_special_mode_mutations", "-q"])
+        self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+        self.assertNotIn("codesign unavailable", native.stderr)
+        crypto = run(normal, ["-m", "pytest", "-q",
+                              str(ROOT / "tests/test_artifact_signature.py") + "::test_valid_signature"])
+        self.assertEqual(crypto.returncode, 0, crypto.stdout + crypto.stderr)
+        network = run(normal, ["-c", "import socket\ntry:\n socket.create_connection(('127.0.0.1',1),timeout=1)\n"
+                               "except PermissionError:\n pass\nelse:\n raise AssertionError('network was not denied')"])
+        self.assertEqual(network.returncode, 0, network.stdout + network.stderr)
+        for profile in (normal, signing):
+            for denied in ("/usr/bin/security", "/bin/date"):
+                result = run(profile, ["-c", "import subprocess; subprocess.run([" + repr(denied) + "],check=True)"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("PermissionError", result.stderr)
+
+    def check_node_sandbox(self):
+        self.check_browser_fixtures_with_real_home()
+        python = Path(sys.executable)
+        node = p._qa_node_runtime(os.environ.get("QA_NODE_RUNTIME"))
+        scratch = self.root / "node-scratch"
+        scratch.mkdir()
+        private_home = self.root / "private-home"
+        private_home.mkdir()
+        sentinel = private_home / "sentinel"
+        sentinel.write_text("synthetic private data")
+        build_state = self.root / "build-state"
+        build_state.mkdir()
+        state_existing = build_state / "existing"
+        state_existing.write_text("must remain unchanged")
+        synthetic_os_temp = self.root / "native-temp"
+        native_temp = synthetic_os_temp / "TemporaryItems"
+        native_temp.mkdir(parents=True)
+        native_replacement = native_temp / "NSIRD_wispqa-scratch-fixture_123"
+        native_replacement.mkdir()
+        (scratch / "outside-link").symlink_to(build_state, target_is_directory=True)
+        import shutil
+        scratch_executable = scratch / "not-node"
+        shutil.copyfile("/bin/echo", scratch_executable)
+        scratch_executable.chmod(0o755)
+        original_check_output = p.subprocess.check_output
+        def metadata(command, **kwargs):
+            if command == ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"]:
+                return str(synthetic_os_temp)
+            return original_check_output(command, **kwargs)
+        with patch.object(Path, "home", return_value=private_home), patch.object(p, "STATE", build_state), \
+                patch.object(p.subprocess, "check_output", side_effect=metadata):
+            profile = p.simulation_profile(scratch, python, node_runtime=str(node), node_only=True)
+        env = dict(p.clean_env(), HOME=str(private_home), TMPDIR=str(scratch),
+                   PATH="/usr/bin:/bin:/usr/sbin:/sbin")
+        suite = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(node),
+            "--test", "--test-reporter=tap", str(ROOT / "tests/browser_dom/page-extractor.test.cjs")],
+            env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(suite.returncode, 0, suite.stdout + suite.stderr)
+        self.assertIn("# fail 0", suite.stdout)
+        self.assertRegex(suite.stdout, r"# tests [1-9][0-9]*")
+        script = """
+const fs = require('node:fs'), net = require('node:net'), cp = require('node:child_process');
+function denied(fn) { try { fn(); } catch (e) { if (e.code === 'EPERM' || e.code === 'EACCES') return; throw e; } throw Error('boundary opened'); }
+denied(() => fs.readFileSync(process.argv[1]));
+denied(() => fs.writeFileSync(process.argv[2], 'forbidden'));
+const writeTargets = JSON.parse(process.argv[5]);
+for (const target of writeTargets) denied(() => fs.writeFileSync(target, 'forbidden'));
+denied(() => fs.unlinkSync(process.argv[6]));
+denied(() => fs.linkSync(process.argv[6], process.argv[7] + '.hardlink'));
+denied(() => fs.renameSync(process.argv[6], process.argv[7] + '.renamed'));
+fs.writeFileSync(process.argv[7], 'scratch allowed');
+if (fs.readFileSync(process.argv[7], 'utf8') !== 'scratch allowed') throw Error('scratch unavailable');
+for (const [binary, args] of [['/bin/sh', ['-c', 'true']], ['/bin/bash', ['-c', 'true']],
+  ['/usr/bin/env', ['/bin/sh', '-c', 'true']], ['/bin/date', []],
+  [process.argv[3], ['-c', 'pass']], [process.argv[4], ['synthetic']]]) {
+  const other = cp.spawnSync(binary, args);
+  if (!other.error || !['EPERM', 'EACCES'].includes(other.error.code)) throw Error('other exec opened: ' + binary);
+}
+const server = net.createServer();
+server.on('error', e => { if (!['EPERM', 'EACCES'].includes(e.code)) throw e; });
+server.listen(0, '127.0.0.1', () => { server.close(); throw Error('network opened'); });
+"""
+        probe = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(node), "-e", script,
+            str(sentinel), str(self.root / "forbidden-write"), str(python), str(scratch_executable),
+            json.dumps([str(build_state / "marker"), str(state_existing), str(native_temp / "marker"),
+                        str(native_replacement / "marker"), str(scratch / "outside-link" / "escape")]),
+            str(state_existing), str(scratch / "allowed-write")], env=env,
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+        self.assertFalse((self.root / "forbidden-write").exists())
+        self.assertEqual(state_existing.read_text(), "must remain unchanged")
+        self.assertEqual(sorted(path.name for path in build_state.iterdir()), ["existing"])
+        self.assertFalse((native_temp / "marker").exists())
+        self.assertFalse((native_replacement / "marker").exists())
+        self.assertEqual((scratch / "allowed-write").read_text(), "scratch allowed")
+
+    def check_browser_fixtures_with_real_home(self):
+        # Keep the real HOME ancestor denied: a temporary HOME hides Node's
+        # package-scope lookup above this checkout before fixture code runs.
+        node = p._qa_node_runtime(os.environ.get("QA_NODE_RUNTIME"))
+        profile = p.simulation_profile(self.root, Path(sys.executable), node_runtime=str(node))
+        env = dict(p.clean_env(), TMPDIR=str(self.root), QA_NODE_RUNTIME=str(node),
+                   PATH="/usr/bin:/bin:/usr/sbin:/sbin")
+        # HOME always exists; HOME/package.json need not exist on CI runners.
+        denied = """
+try { require('node:fs').readdirSync(process.argv[1]); }
+catch (e) { if (['EPERM', 'EACCES'].includes(e.code)) process.exit(0); throw e; }
+throw Error('private HOME directory became readable');
+"""
+        probe = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(node), "-e", denied,
+                                str(Path.home())], cwd=ROOT, env=env,
+                               capture_output=True, text=True, timeout=30)
+        self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+        result = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, sys.executable,
+            "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            "tests/browser_dom/test_page_extractor.py", "tests/browser_dom/test_live_capture.py",
+            "tests/browser_chrome/test_chrome_acquisition.py",
+            "tests/browser_actions/test_action_executor.py"], cwd=ROOT, env=env,
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_bootstrap_rejects_corrupt_downloads(self):
+        import bootstrap_uv
+        with patch.object(bootstrap_uv, "download", return_value=b"corrupt"), patch.object(bootstrap_uv.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "archive checksum"):
+                bootstrap_uv.ensure_uv(p.CONFIG, self.root)
+            with self.assertRaisesRegex(RuntimeError, "archive checksum"):
+                bootstrap_uv.ensure_python_archive(p.CONFIG, self.root)
+
+    def test_runtime_extractor_rejects_traversal_and_escaping_links(self):
+        import bootstrap_uv
+        import tarfile
+        state = self.root / "state"
+        archive = state / "python-downloads/fixture/runtime.tar.gz"
+        archive.parent.mkdir(parents=True)
+        for name, target in (("../escape", None), ("python/link", "../../escape")):
+            with self.subTest(name=name):
+                with tarfile.open(archive, "w:gz") as tar:
+                    member = tarfile.TarInfo(name)
+                    if target:
+                        member.type = tarfile.SYMTYPE
+                        member.linkname = target
+                    tar.addfile(member)
+                config = dict(p.CONFIG, python_build="fixture",
+                              python_archive_url="https://example.invalid/runtime.tar.gz",
+                              python_archive_sha256=p.digest(archive))
+                with self.assertRaisesRegex(RuntimeError, "Unsafe Python archive"):
+                    bootstrap_uv.unpack_runtime(config, state, self.root / "runtime")
+                self.assertFalse((self.root / "runtime").exists())
+                self.assertFalse((self.root / "escape").exists())
+
+    def runtime_archive(self, entries):
+        import io
+        import tarfile
+        archive = self.root / "state/python-downloads/fixture/runtime.tar.gz"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, "w:gz") as tar:
+            for name, kind, value in entries:
+                member = tarfile.TarInfo(name)
+                member.mode = 0o755
+                member.type = kind
+                if kind == tarfile.REGTYPE:
+                    data = value.encode()
+                    member.size = len(data)
+                    tar.addfile(member, io.BytesIO(data))
+                else:
+                    member.linkname = value
+                    tar.addfile(member)
+        return dict(p.CONFIG, python_build="fixture",
+                    python_archive_url="https://example.invalid/runtime.tar.gz",
+                    python_archive_sha256=p.digest(archive))
+
+    def test_runtime_symlink_graph_rejects_chained_escape_before_writes(self):
+        import bootstrap_uv
+        import tarfile
+        config = self.runtime_archive([
+            *[(name, tarfile.DIRTYPE, "") for name in ("python", "python/a", "python/x", "python/bin")],
+            ("python/a/b", tarfile.SYMTYPE, "../x"),
+            ("python/unsafe", tarfile.SYMTYPE, "a/b/../../outside"),
+            ("python/bin/python3", tarfile.SYMTYPE, "../a/b/../../outside"),
+        ])
+        with patch.object(bootstrap_uv.tempfile, "TemporaryDirectory") as scratch:
+            with self.assertRaisesRegex(RuntimeError, "escaping symlink chain"):
+                bootstrap_uv.unpack_runtime(config, self.root / "state", self.root / "runtime")
+            scratch.assert_not_called()
+        self.assertFalse((self.root / "runtime").exists())
+        self.assertFalse((self.root / "outside").exists())
+
+    def test_runtime_graph_rejects_missing_loop_special_and_link_parent(self):
+        import bootstrap_uv
+        import tarfile
+        cases = [
+            [("python/a", tarfile.SYMTYPE, "missing")],
+            [("python/a", tarfile.SYMTYPE, "/absolute")],
+            [("python/a", tarfile.SYMTYPE, "")],
+            [("python/a", tarfile.SYMTYPE, "a")],
+            [("python/a", tarfile.SYMTYPE, "b"), ("python/b", tarfile.SYMTYPE, "a")],
+            [("python/a", tarfile.FIFOTYPE, ""), ("python/b", tarfile.SYMTYPE, "a")],
+            [("python/a", tarfile.CHRTYPE, "")],
+            [("python/a", tarfile.LNKTYPE, "python/b")],
+            [("python/a", tarfile.SYMTYPE, "x"), ("python/a/child", tarfile.REGTYPE, "fixture")],
+            [("python/a", tarfile.REGTYPE, "fixture"), ("python/b", tarfile.SYMTYPE, "a/../a")],
+            [("python/a", tarfile.REGTYPE, "first"), ("python/./a", tarfile.REGTYPE, "second")],
+        ]
+        for entries in cases:
+            with self.subTest(entries=entries):
+                config = self.runtime_archive(entries)
+                with patch.object(bootstrap_uv.tempfile, "TemporaryDirectory") as scratch:
+                    with self.assertRaisesRegex(RuntimeError, "Unsafe Python archive"):
+                        bootstrap_uv.unpack_runtime(config, self.root / "state", self.root / "runtime")
+                    scratch.assert_not_called()
+
+    def test_runtime_preserves_relative_chains_without_tar_extraction_filters(self):
+        import bootstrap_uv
+        import tarfile
+        config = self.runtime_archive([
+            ("python/a", tarfile.DIRTYPE, ""),
+            ("python/x", tarfile.DIRTYPE, ""),
+            ("python/bin/python3", tarfile.SYMTYPE, "../a/b/../real"),
+            ("python/a/b", tarfile.SYMTYPE, "../x"),
+            ("python/bin/python", tarfile.SYMTYPE, "python3"),
+            ("python/real", tarfile.REGTYPE, "fixture interpreter bytes"),
+        ])
+        with patch.object(tarfile.TarFile, "extractall", side_effect=AssertionError("version-dependent extraction")):
+            bootstrap_uv.unpack_runtime(config, self.root / "state", self.root / "runtime")
+        runtime = self.root / "runtime"
+        self.assertEqual(os.readlink(runtime / "bin/python3"), "../a/b/../real")
+        self.assertEqual((runtime / "bin/python").read_text(), "fixture interpreter bytes")
+        self.assertEqual((runtime / "bin/python").resolve(), (runtime / "real").resolve())
+        self.assertTrue(os.access(runtime / "bin/python", os.X_OK))
+
+    def test_interpreter_read_roots_refuses_a_home_wide_prefix(self):
+        home = self.root / "home"
+        python = home / "bin/python"
+        python.parent.mkdir(parents=True)
+        python.write_text("fixture, never executed")
+        with patch.object(Path, "home", return_value=home):
+            with self.assertRaisesRegex(p.BuildError, "dedicated runtime prefix"):
+                p.interpreter_read_roots(python)
+
+    def test_external_virtualenv_is_readable_without_opening_private_home(self):
+        self.external_virtualenv_contract(execute=False)
+
+    def check_external_virtualenv_sandbox(self):
+        # Explicit integration entry point: Seatbelt cannot be nested. The build
+        # driver requires this check before starting the sandboxed full QA run.
+        self.external_virtualenv_contract(execute=True)
+
+    def external_virtualenv_contract(self, *, execute):
+        home = self.root / "home"
+        venv = home / "external-venv"
+        scratch = self.root / "qa-scratch"
+        scratch.mkdir()
+        subprocess.run([sys.executable, "-I", "-B", "-m", "venv", "--without-pip", str(venv)],
+                       check=True, capture_output=True)
+        packages = venv / "lib" / ("python%d.%d" % sys.version_info[:2]) / "site-packages"
+        (packages / "wisp_prefix_fixture.py").write_text("VALUE = 'fixture-only'\n")
+        (home / "private.txt").write_text("must remain unreadable")
+        alias = home / "venv-alias"
+        alias.symlink_to(venv, target_is_directory=True)
+        selected = alias / "bin/python"
+        self.assertTrue(selected.is_symlink())
+        metadata = lambda command, **kwargs: str(self.root / ("developer" if command[0] == "xcode-select" else "os-temp"))
+        with patch.object(Path, "home", return_value=home), patch.object(p, "git", return_value=str(ROOT / ".git")), patch.object(p.subprocess, "check_output", side_effect=metadata):
+            profile = p.simulation_profile(scratch, selected)
+            roots = p.interpreter_read_roots(selected)
+            launcher = home / "launcher"
+            launcher.symlink_to(venv / "bin/python")
+            self.assertIn(venv.resolve(), p.interpreter_read_roots(launcher))
+        self.assertIn(venv.resolve(), roots)
+        self.assertNotIn(home.resolve(), roots)
+        for rule in ("(deny network*)", "(deny appleevent-send)", "(deny file-write*)"):
+            self.assertIn(rule, profile)
+        if not execute:
+            return
+        probe = f"""
+from pathlib import Path
+import sys, wisp_prefix_fixture
+assert wisp_prefix_fixture.VALUE == 'fixture-only'
+assert Path(sys.prefix).resolve() == Path({str(venv)!r}).resolve()
+assert (Path(sys.prefix)/'pyvenv.cfg').read_text()
+for action in (lambda: Path({str(home / 'private.txt')!r}).read_text(),
+               lambda: Path({str(venv / 'forbidden-write')!r}).write_text('forbidden')):
+    try: action()
+    except PermissionError: pass
+    else: raise AssertionError('sandbox boundary opened')
+Path({str(scratch / 'allowed-write')!r}).write_text('fixture')
+print('external venv readable; private home and writes denied')
+"""
+        result = subprocess.run(["/usr/bin/sandbox-exec", "-p", profile, str(selected), "-I", "-B", "-c", probe],
+                                env=p.clean_env(), text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((venv / "forbidden-write").exists())
+        self.assertTrue((scratch / "allowed-write").exists())
+
+    def signing_fixture(self):
+        bundle = self.fixture()
+        for name in ("Contents/MacOS/Wisp", "Contents/Resources/backend/.venv/bin/python3",
+                     "Contents/Frameworks/Helper.app/Contents/MacOS/Helper",
+                     "Contents/Frameworks/Helper.app/Contents/Frameworks/Example.framework/Versions/A/Example"):
+            path = bundle / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"\xcf\xfa\xed\xfe" + b"fixture")
+        return bundle
+
+    def signing_runner(self, failure=None):
+        root = self.root
+        class FakeRunner:
+            logs = root
+            records = []
+            env = p.clean_env()
+            def __init__(inner):
+                inner.calls = []
+            def run(inner, label, command):
+                inner.calls.append(command)
+                if failure and failure in label:
+                    raise p.BuildError("fixture signing failure")
+                log = root / (label + ".log")
+                log.write_text("Signature=adhoc\nTeamIdentifier=not set\n" if "--display" in command else "")
+                return 0, log
+        return FakeRunner()
+
+    def test_adhoc_signing_is_nested_first_credential_free_and_verified(self):
+        bundle = self.signing_fixture()
+        with patch.dict(os.environ, {"WISP_SIGNING_IDENTITY": "FORBIDDEN", "GH_TOKEN": "FORBIDDEN"}):
+            runner = self.signing_runner()
+            p.sign_adhoc(runner, bundle)
+        signs = [command for command in runner.calls if "--sign" in command]
+        targets = [command[-1] for command in signs]
+        self.assertEqual(targets[-1], bundle)
+        self.assertEqual(len(targets), len(set(targets)))
+        for target in targets:
+            for ancestor in targets:
+                if target != ancestor and target.is_relative_to(ancestor):
+                    self.assertLess(targets.index(target), targets.index(ancestor))
+        for command in signs:
+            self.assertEqual(command[0], "/usr/bin/codesign")
+            self.assertEqual(command[command.index("--sign") + 1], "-")
+            self.assertIn("--timestamp=none", command)
+            self.assertNotIn("--keychain", command)
+            self.assertNotIn("FORBIDDEN", command)
+        self.assertNotIn("GH_TOKEN", runner.env)
+        self.assertNotIn("WISP_SIGNING_IDENTITY", runner.env)
+        self.assertIn("--verify", runner.calls[-2])
+        self.assertIn("--deep", runner.calls[-2])
+        self.assertIn("--strict", runner.calls[-2])
+
+    def test_signing_failure_stops_before_parent_and_verification(self):
+        bundle = self.signing_fixture()
+        runner = self.signing_runner(failure="adhoc-sign-0")
+        with self.assertRaisesRegex(p.BuildError, "signing failure"):
+            p.sign_adhoc(runner, bundle)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertNotEqual(runner.calls[0][-1], bundle)
+
+    def test_strict_signature_failure_and_provenance_mismatch_fail_closed(self):
+        descriptions = [("ad-hoc", "Signature=adhoc\nTeamIdentifier=not set", True),
+                        ("ad-hoc", "Authority=Developer ID Application: Fixture\nTeamIdentifier=TEAM", False),
+                        ("Developer ID Application", "Signature=adhoc\nTeamIdentifier=not set", False),
+                        ("Developer ID Application", "Authority=Developer ID Application: Fixture\nTeamIdentifier=TEAM", True)]
+        for expected, description, allowed in descriptions:
+            results = [subprocess.CompletedProcess([], 0, "", ""), subprocess.CompletedProcess([], 0, "", description)]
+            with self.subTest(expected=expected, description=description), patch.object(p.subprocess, "run", side_effect=results) as run:
+                if allowed:
+                    p.verify_bundle_signature(self.root, expected)
+                else:
+                    with self.assertRaisesRegex(p.BuildError, "differs from provenance"):
+                        p.verify_bundle_signature(self.root, expected)
+                self.assertIn("--deep", run.call_args_list[0].args[0])
+                self.assertIn("--strict", run.call_args_list[0].args[0])
+        with patch.object(p.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "invalid seal")):
+            with self.assertRaisesRegex(p.BuildError, "Strict bundle"):
+                p.verify_bundle_signature(self.root, "ad-hoc")
+
+    def test_adhoc_artifact_cannot_claim_notarization(self):
+        self.artifact()
+        provenance = json.loads((self.root / "provenance.json").read_text())
+        provenance["notarized"] = True
+        p.json_write(self.root / "provenance.json", provenance)
+        p.checksums(self.root)
+        with self.assertRaisesRegex(p.BuildError, "must not claim notarization"):
+            p.verify_artifacts(self.root)
+
+    def test_host_path_scan_rejects_macho_leaks_in_multiple_encodings(self):
+        bundle = self.signing_fixture()
+        executable = bundle / "Contents/MacOS/Wisp"
+        for marker in (str(ROOT), "/Users/fixture/Desktop/OtherRepo", "/home/runner/work/repo", "/private/var/folders/fixture"):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                with self.subTest(marker=marker, encoding=encoding):
+                    executable.write_bytes(b"\xcf\xfa\xed\xfe" + marker.encode(encoding))
+                    with self.assertRaisesRegex(p.BuildError, "Host build path"):
+                        p.scan_host_paths(bundle)
+        executable.write_bytes(b"\xcf\xfa\xed\xfe/wisp/source/app/Sources/main.swift")
+        p.scan_host_paths(bundle)
+
+    def test_host_checkout_scan_covers_nested_dependencies(self):
+        bundle = self.signing_fixture()
+        native = bundle / "Contents/Resources/dependency.so"
+        for marker in (str(ROOT), "/Users/adijain/private-checkout", "/Users/adijain/Desktop/MOE_Project"):
+            native.write_bytes(b"\xcf\xfa\xed\xfe" + marker.encode())
+            with self.assertRaisesRegex(p.BuildError, "Host build path"):
+                p.scan_host_paths(bundle)
+
+    def test_native_cleanup_strips_before_signing_and_rejects_unsafe_rpaths(self):
+        bundle = self.signing_fixture()
+        runner = self.signing_runner()
+        original = runner.run
+        def run(label, command):
+            code, log = original(label, command)
+            if "signing-load-commands" in label:
+                log.write_text("cmd LC_RPATH\ncmdsize 40\npath /build/deps (offset 12)\n"
+                               "cmd LC_LOAD_DYLIB\ncmdsize 40\nname @rpath/libcustom.dylib (offset 24)\n")
+            return code, log
+        runner.run = run
+        with self.assertRaisesRegex(p.BuildError, "non-system dependencies"):
+            p.prepare_native_for_signing(runner, bundle)
+        self.assertEqual(runner.calls[0][:2], ["/usr/bin/strip", "-S"])
+        self.assertFalse(any("--sign" in command or "-delete_rpath" in command for command in runner.calls))
+
+    def test_production_staging_removes_only_development_fallback(self):
+        path = ROOT / "app/Sources/WispApp/BackendManager.swift"
+        before = path.read_text()
+        after = p.production_backend_source(before)
+        self.assertNotIn("let devRoot", after)
+        self.assertNotIn("/Users/", after)
+        self.assertIn('Bundle.main.resourceURL?.appendingPathComponent("backend")', after)
+        self.assertEqual(path.read_text(), before)
+        with self.assertRaisesRegex(p.BuildError, "expected one development fallback"):
+            p.production_backend_source(after)
+
+    def test_protected_signing_replaces_adhoc_signatures_in_same_order(self):
+        bundle = self.signing_fixture()
+        identity = "Developer ID Application: Fixture (TEAM)"
+        keychain = self.root / "fixture.keychain"
+        empty = release.canonical_entitlements({})
+        app = release.canonical_entitlements(
+            {"com.apple.security.automation.apple-events": True})
+        class Entitlements:
+            expected = {"app": app, "python": empty}
+            def argument(inner, role):
+                descriptor = 91 if role == "app" else 92
+                return f"/dev/fd/{descriptor}", descriptor
+        def extracted(target):
+            return (app if release.entitlement_role(bundle, target) == "app"
+                    else empty)
+        with patch.object(release, "secret_run") as sign, \
+                patch.object(release, "verify_bundle_signature") as verify, \
+                patch.object(release, "signed_entitlements", side_effect=extracted):
+            release.developer_sign(self.signing_runner(), bundle, identity, keychain,
+                                   Entitlements())
+        self.assertEqual([call.args[0][-1] for call in sign.call_args_list], p.signing_targets(bundle))
+        for call in sign.call_args_list:
+            command = call.args[0]
+            self.assertIn("--force", command)
+            self.assertEqual(command[command.index("--sign") + 1], identity)
+            self.assertIn(keychain, command)
+            self.assertIn("--timestamp", command)
+            self.assertIn("runtime", command)
+            entitlement = command[command.index("--entitlements") + 1]
+            self.assertEqual(call.kwargs["pass_fds"], (int(entitlement.rsplit("/", 1)[1]),))
+        self.assertEqual(verify.call_args.args[1], "Developer ID Application")
+
+    def test_finalize_checks_signature_before_writing_manifests(self):
+        bundle = self.fixture()
+        runner = self.signing_runner()
+        with patch.object(p, "verify_bundle_signature", side_effect=p.BuildError("unsealed bundle")):
+            with self.assertRaisesRegex(p.BuildError, "unsealed"):
+                p.finalize(runner, bundle, self.root, self.meta, {})
+        self.assertFalse((self.root / "bundle-manifest.json").exists())
+        self.assertFalse(list(self.root.glob("*.zip")))
+
+    def test_finalize_records_signed_bytes_and_truthful_provenance(self):
+        bundle = self.fixture()
+        (bundle / "Contents/MacOS/Wisp").write_bytes(b"fixture signed bytes")
+        seal = bundle / "Contents/_CodeSignature/CodeResources"
+        seal.parent.mkdir();seal.write_text("fixture seal")
+        p.json_write(self.root / "simulation-qa.json", self.qa_report())
+        destination = self.root / "output";destination.mkdir()
+        runner = self.signing_runner()
+        with patch.object(p, "verify_bundle_signature"), patch.object(p, "notes", return_value="fixture"), patch.object(p, "distribution_roundtrip"):
+            p.finalize(runner, bundle, destination, self.meta, {})
+        provenance = json.loads((destination / "provenance.json").read_text())
+        self.assertEqual(provenance["signature"], "ad-hoc")
+        self.assertIs(provenance["notarized"], False)
+        self.assertEqual(json.loads((destination / "bundle-manifest.json").read_text()), p.inventory(bundle))
+        with zipfile.ZipFile(next(destination.glob("*.zip"))) as zipped:
+            self.assertEqual(zipped.read("Wisp.app/Contents/MacOS/Wisp"), b"fixture signed bytes")
+            self.assertEqual(zipped.read("Wisp.app/Contents/_CodeSignature/CodeResources"), b"fixture seal")
+
+    def test_artifact_manifest(self):
+        self.artifact()
+        with patch.object(p, "verify_bundle_signature") as verify:
+            p.verify_artifacts(self.root)
+            verify.assert_called_once_with(self.root / "Wisp.app", "ad-hoc")
+
+    def test_artifact_verification_allows_contained_runtime_symlink(self):
+        bundle = self.artifact()
+        alias = bundle / "Contents/Resources/backend/.venv/bin/python"
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(os.readlink(alias), "python3")
+        with patch.object(p, "verify_bundle_signature"):
+            p.verify_artifacts(self.root)
+
+    def test_verified_upload_descriptors_survive_path_swap(self):
+        self.artifact()
+        archive = self.root / "Wisp.zip"
+        expected = archive.read_bytes()
+        replacement = self.root.parent / "replacement.zip"
+        replacement.write_bytes(b"com.wisp.app.summary-qa")
+        with p.BoundReleaseAssets(self.root) as assets:
+            with patch.object(p, "verify_bundle_signature"):
+                p.verify_artifacts(self.root, bound_assets=assets)
+            archive.unlink()
+            archive.symlink_to(replacement)
+            descriptor = assets.descriptors["Wisp.zip"]
+            self.assertEqual(os.pread(descriptor, len(expected), 0), expected)
+            with self.assertRaisesRegex(p.BuildError, "identity changed|symlinks"):
+                assets.assert_paths_unchanged()
+
+    def test_bound_assets_reject_in_place_content_mutation(self):
+        self.artifact()
+        archive = self.root / "Wisp.zip"
+        original = archive.read_bytes()
+        with p.BoundReleaseAssets(self.root) as assets:
+            with patch.object(p, "verify_bundle_signature"):
+                p.verify_artifacts(self.root, bound_assets=assets)
+            archive.write_bytes(b"x" * len(original))
+            with self.assertRaisesRegex(p.BuildError, "content changed"):
+                assets.read_bytes("Wisp.zip")
+
+    def test_bound_archive_replacement_window_cannot_change_distribution_or_checksums(self):
+        bundle = self.artifact()
+        archive = self.root / "Wisp.zip"
+        expected = archive.read_bytes()
+        (self.root / "SHA256SUMS").unlink()
+        class DescriptorRunner:
+            logs = self.root
+            def run(inner, label, command, **kwargs):
+                if label == "extract-distribution":
+                    self.assertEqual(kwargs["pass_fds"], (descriptor,))
+                    self.assertEqual(Path(command[3]).read_bytes(), expected)
+                    p.shutil.copytree(bundle, Path(command[4]) / "Wisp.app", symlinks=True)
+                return 0, self.root / "unused.log"
+        with p.BoundReleaseAssets(self.root) as assets:
+            descriptor = assets.descriptors["Wisp.zip"]
+            archive.unlink()
+            archive.write_bytes(b"replacement-after-binding")
+            with patch.object(p, "verify_bundle_signature"), \
+                    patch.object(p, "relocation_smoke"):
+                p.distribution_roundtrip(DescriptorRunner(), archive, bundle, self.meta,
+                                         archive_descriptor=descriptor)
+            with self.assertRaisesRegex(p.BuildError, "identity changed"):
+                assets.write_checksums()
+
+    def test_descriptor_uploader_retries_with_exact_name_mime_and_body(self):
+        body = b"PK\x03\x04exact-bound-zip"
+        asset = self.root / "Wisp 1.2-arm64.zip"
+        asset.write_bytes(body)
+        calls = []
+        statuses = iter((503, 201))
+        class Response:
+            def __init__(inner, status): inner.status = status
+            def read(inner, _limit): return b"{}"
+        class Connection:
+            def __init__(inner, host, timeout):
+                self.assertEqual((host, timeout), ("uploads.github.com", 120))
+            def request(inner, method, endpoint, body=None, headers=None):
+                calls.append((method, endpoint, headers.copy(), body.read()))
+            def getresponse(inner): return Response(next(statuses))
+            def close(inner): pass
+        descriptor = os.open(asset, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            uploader = p.GitHubReleaseUploader("owner/repo", 42, "fixture-token",
+                connection_factory=Connection, sleeper=lambda _delay: None)
+            uploader.upload(asset.name, p.release_asset_content_type(asset.name), descriptor,
+                            hashlib.sha256(body).hexdigest(), len(body))
+        finally:
+            os.close(descriptor)
+        self.assertEqual(len(calls), 2)
+        for method, endpoint, headers, supplied in calls:
+            self.assertEqual(method, "POST")
+            self.assertEqual(supplied, body)
+            self.assertEqual(headers["Content-Type"], "application/zip")
+            self.assertEqual(headers["Content-Length"], str(len(body)))
+            from urllib.parse import parse_qs, urlsplit
+            self.assertEqual(parse_qs(urlsplit(endpoint).query), {"name": [asset.name]})
+
+    def test_uploader_rejects_in_place_mutation_before_retry(self):
+        asset = self.root / "Wisp.zip"
+        original, replacement = b"original-bound-archive", b"replacement-archive!!!"
+        self.assertEqual(len(original), len(replacement))
+        asset.write_bytes(original)
+        attempts = []
+        class Response:
+            status = 503
+            def read(inner, _limit): return b"retry"
+        class Connection:
+            def __init__(inner, _host, timeout): self.assertEqual(timeout, 120)
+            def request(inner, _method, _endpoint, body=None, headers=None):
+                attempts.append(body.read())
+                asset.write_bytes(replacement)
+            def getresponse(inner): return Response()
+            def close(inner): pass
+        descriptor = os.open(asset, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            uploader = p.GitHubReleaseUploader("owner/repo", 42, "fixture-token",
+                connection_factory=Connection, sleeper=lambda _delay: None)
+            with self.assertRaisesRegex(p.BuildError, "content changed"):
+                uploader.upload(asset.name, p.release_asset_content_type(asset.name), descriptor,
+                                hashlib.sha256(original).hexdigest(), len(original))
+        finally:
+            os.close(descriptor)
+        self.assertEqual(attempts, [original])
+
+    def test_notes_reader_is_independent_and_not_uploaded(self):
+        self.artifact()
+        notes = self.root / "release-notes.md"
+        notes.write_bytes(b"exact release notes\n")
+        p.checksums(self.root, exclude={notes.name})
+        with p.BoundReleaseAssets(self.root) as assets:
+            with self.assertRaisesRegex(p.BuildError, "Incomplete"):
+                assets.validate_checksums()
+            assets.validate_checksums(allow_unpublished_notes=True)
+            notes_fd = assets.descriptors[notes.name]
+            with open(f"/dev/fd/{notes_fd}", "rb") as reader:
+                self.assertEqual(reader.read(), b"exact release notes\n")
+            uploads = assets.upload_assets()
+            upload_names = {entry[0] for entry in uploads}
+            checksum_names = {line.split("  ", 1)[1]
+                              for line in assets.read_text("SHA256SUMS").splitlines()}
+            self.assertNotIn(notes.name, upload_names)
+            self.assertNotIn(notes.name, checksum_names)
+            self.assertEqual(checksum_names, upload_names - {"SHA256SUMS"})
+            self.assertIn("Wisp.zip", upload_names)
+
+    def test_bound_candidate_copy_rejects_metadata_path_replacement(self):
+        self.artifact()
+        notes = self.root / "release-notes.md"
+        notes.write_bytes(b"reviewed release notes\n")
+        (self.root / "dependencies.json").write_text("{}\n")
+        p.checksums(self.root)
+        destination = self.root.with_name(self.root.name + "-signed-copy")
+        with p.BoundReleaseAssets(self.root) as assets:
+            with patch.object(p, "verify_bundle_signature"):
+                p.verify_artifacts(self.root, bound_assets=assets)
+            notes.unlink()
+            notes.write_bytes(b"replacement notes\n")
+            with self.assertRaisesRegex(p.BuildError, "identity changed"):
+                release.copy_bound_candidate(self.root, destination, assets)
+        self.assertTrue(destination.exists())
+        self.assertFalse((destination / notes.name).exists())
+
+    def test_bound_candidate_copy_rejects_bundle_swap_before_signing(self):
+        bundle = self.artifact()
+        notes = self.root / "release-notes.md"
+        notes.write_text("reviewed release notes\n")
+        (self.root / "dependencies.json").write_text("{}\n")
+        p.checksums(self.root)
+        destination = self.root.with_name(self.root.name + "-rejected-copy")
+        original_copytree = release.shutil.copytree
+        executable = bundle / "Contents/MacOS/Wisp"
+        def swap_then_copy(source, target, *args, **kwargs):
+            executable.write_bytes(b"post-verification replacement")
+            return original_copytree(source, target, *args, **kwargs)
+        with p.BoundReleaseAssets(self.root) as assets:
+            with patch.object(p, "verify_bundle_signature"):
+                p.verify_artifacts(self.root, bound_assets=assets)
+            with patch.object(release.shutil, "copytree", side_effect=swap_then_copy), \
+                    self.assertRaisesRegex(p.BuildError, "bound candidate inventory"):
+                release.copy_bound_candidate(self.root, destination, assets)
+
+    def test_private_signing_preflight_rejects_post_copy_executable_swap(self):
+        bundle = self.artifact()
+        notes = self.root / "release-notes.md"
+        notes.write_text("reviewed release notes\n")
+        (self.root / "dependencies.json").write_text("{}\n")
+        p.checksums(self.root)
+        destination = self.root.with_name(self.root.name + "-private-copy")
+        original = release.copy_bound_candidate
+        def copy_then_swap(*args, **kwargs):
+            copied, expected = original(*args, **kwargs)
+            (copied / "Contents/MacOS/Wisp").write_bytes(b"post-copy substitution")
+            return copied, expected
+        with p.BoundReleaseAssets(self.root) as assets, \
+                patch.object(release, "copy_bound_candidate", side_effect=copy_then_swap), \
+                patch.object(release, "secret_run") as credentials, \
+                patch.object(release, "developer_sign") as signer, \
+                self.assertRaisesRegex(p.BuildError, "changed after candidate copy"):
+            release.prepare_private_candidate(self.root, destination, assets)
+        credentials.assert_not_called()
+        signer.assert_not_called()
+
+    def test_bound_entitlement_descriptor_survives_private_path_substitution(self):
+        app = plistlib.dumps({"com.apple.security.automation.apple-events": True})
+        empty = plistlib.dumps({})
+        def blob(_commit, source):
+            return app if source.endswith("app.entitlements") else empty
+        directory = self.root / "private-entitlements"
+        with patch.object(release, "_git_blob", side_effect=blob), \
+                release.BoundEntitlements("a" * 40, directory) as entitlements:
+            original = entitlements.source_bytes["app"]
+            entitlements.paths["app"].unlink()
+            entitlements.paths["app"].write_bytes(plistlib.dumps({
+                "com.apple.security.automation.apple-events": True,
+                "com.apple.security.cs.allow-jit": True,
+            }))
+            argument, descriptor = entitlements.argument("app")
+            self.assertEqual(argument, f"/dev/fd/{descriptor}")
+            self.assertEqual(os.pread(descriptor, len(original) + 1, 0), original)
+
+    def test_bound_entitlement_descriptor_rewinds_for_repeated_native_consumers(self):
+        app = plistlib.dumps({"com.apple.security.automation.apple-events": True})
+        empty = plistlib.dumps({})
+        def blob(_commit, source):
+            return app if source.endswith("app.entitlements") else empty
+        directory = self.root / "reused-entitlements"
+        with patch.object(release, "_git_blob", side_effect=blob), \
+                release.BoundEntitlements("a" * 40, directory) as entitlements:
+            for role, expected in (("app", app), ("python", empty)):
+                self.assertEqual(plistlib.loads(expected),
+                                 {"com.apple.security.automation.apple-events": True}
+                                 if role == "app" else {})
+                for attempt in range(2):
+                    argument, descriptor = entitlements.argument(role)
+                    result = subprocess.run(
+                        ["/bin/cat", argument], pass_fds=(descriptor,),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected,
+                                     f"{role} entitlement attempt {attempt + 1}")
+
+    def test_real_nested_targets_then_app_root_preserve_exact_entitlement_roles(self):
+        bundle = self.root / "RealSequence.app"
+        main = bundle / "Contents/MacOS/Wisp"
+        helper = bundle / "Contents/Resources/backend/.venv/bin/python3"
+        main.parent.mkdir(parents=True)
+        helper.parent.mkdir(parents=True)
+        source = self.root / "sequence.swift"
+        source.write_text('@main enum Fixture { static func main() { print("fixture") } }\n')
+        cache = self.root / "sequence-cache"
+        environment = {**os.environ, "TMPDIR": str(self.root),
+            "CLANG_MODULE_CACHE_PATH": str(cache / "clang"),
+            "SWIFT_MODULECACHE_PATH": str(cache / "swift")}
+        for output in (main, helper):
+            compiled = subprocess.run(["/usr/bin/xcrun", "--sdk", "macosx", "swiftc",
+                "-parse-as-library", str(source), "-o", str(output)], env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleExecutable": "Wisp", "CFBundleIdentifier": "com.wisp.fixture",
+            "CFBundlePackageType": "APPL", "CFBundleVersion": "1",
+        }))
+        app = plistlib.dumps({"com.apple.security.automation.apple-events": True})
+        empty = plistlib.dumps({})
+        def blob(_commit, source_name):
+            return app if source_name.endswith("app.entitlements") else empty
+        with patch.object(release, "_git_blob", side_effect=blob), \
+                release.BoundEntitlements("a" * 40, self.root / "sequence-entitlements") as entitlements:
+            targets = p.signing_targets(bundle)
+            self.assertEqual(targets[-1], bundle)
+            self.assertIn(main, targets[:-1])
+            self.assertIn(helper, targets[:-1])
+            for target in targets:
+                role = release.entitlement_role(bundle, target)
+                argument, descriptor = entitlements.argument(role)
+                try:
+                    signed = subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-",
+                        "--timestamp=none", "--entitlements", argument, str(target)],
+                        pass_fds=(descriptor,), stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True, timeout=120)
+                except PermissionError as exc:
+                    if exc.filename != "/usr/bin/codesign":
+                        raise
+                    return
+                self.assertEqual(signed.returncode, 0, signed.stderr)
+            release.verify_signed_entitlements(bundle, entitlements)
+            self.assertEqual(release.signed_entitlements(main),
+                             release.canonical_entitlements(app))
+            self.assertEqual(release.signed_entitlements(helper),
+                             release.canonical_entitlements(empty))
+
+    def test_signed_entitlement_expansion_is_rejected(self):
+        bundle = self.signing_fixture()
+        empty = release.canonical_entitlements({})
+        app = release.canonical_entitlements(
+            {"com.apple.security.automation.apple-events": True})
+        expanded = release.canonical_entitlements({
+            "com.apple.security.automation.apple-events": True,
+            "com.apple.security.cs.allow-jit": True,
+        })
+        class Entitlements:
+            expected = {"app": app, "python": empty}
+        with patch.object(release, "signed_entitlements",
+                          side_effect=lambda target: expanded if target == bundle else empty), \
+                self.assertRaisesRegex(p.BuildError, "Signed entitlements differ"):
+            release.verify_signed_entitlements(bundle, Entitlements())
+
+    def test_inventories_bind_directory_modes_and_empty_topology(self):
+        bundle = self.fixture()
+        empty = bundle / "Contents/Resources/Empty"
+        empty.mkdir()
+        raw = p.inventory(bundle)
+        canonical = release.signature_insensitive_inventory(bundle)
+        empty.rmdir()
+        self.assertNotEqual(p.inventory(bundle), raw)
+        self.assertNotEqual(release.signature_insensitive_inventory(bundle), canonical)
+        empty.mkdir()
+        empty.chmod(0o777)
+        self.assertNotEqual(p.inventory(bundle), raw)
+        self.assertNotEqual(release.signature_insensitive_inventory(bundle), canonical)
+        empty.chmod(0o755)
+        added = empty / "Added"
+        added.mkdir()
+        self.assertNotEqual(p.inventory(bundle), raw)
+        self.assertNotEqual(release.signature_insensitive_inventory(bundle), canonical)
+
+    def test_signature_insensitive_inventory_ignores_only_code_signatures(self):
+        bundle = self.root / "Signed.app"
+        executable = bundle / "Contents/MacOS/Wisp"
+        executable.parent.mkdir(parents=True)
+        signature = b"first-signature"
+        header = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 2, 88, 0, 0)
+        segment = struct.pack("<II16sQQQQiiII", 0x19, 72, b"__LINKEDIT",
+                              0, 0x1000, 120, len(signature), 1, 1, 0, 0)
+        command = struct.pack("<IIII", 0x1D, 16, 120, len(signature))
+        executable.write_bytes(header + segment + command + signature)
+        executable.chmod(0o755)
+        resources = bundle / "Contents/Resources"
+        resources.mkdir()
+        (resources / "payload.txt").write_text("payload")
+        code_resources = bundle / "Contents/_CodeSignature/CodeResources"
+        code_resources.parent.mkdir()
+        code_resources.write_text("first")
+        before = release.signature_insensitive_inventory(bundle)
+        replacement = b"different-longer-signature"
+        resigned_segment = struct.pack("<II16sQQQQiiII", 0x19, 72, b"__LINKEDIT",
+            0, 0x2000, 120, len(replacement), 1, 1, 0, 0)
+        executable.write_bytes(header + resigned_segment
+            + struct.pack("<IIII", 0x1D, 16, 120, len(replacement)) + replacement)
+        executable.chmod(0o755)
+        code_resources.write_text("second")
+        self.assertEqual(release.signature_insensitive_inventory(bundle), before)
+        (resources / "payload.txt").write_text("changed")
+        self.assertNotEqual(release.signature_insensitive_inventory(bundle), before)
+
+    def test_signature_insensitive_inventory_accepts_real_macos_resigning(self):
+        bundle = self.root / "RealSigned.app"
+        executable = bundle / "Contents/MacOS/Fixture"
+        executable.parent.mkdir(parents=True)
+        source = self.root / "fixture.swift"
+        source.write_text('@main enum Fixture { static func main() { print("fixture") } }\n')
+        cache = self.root / "native-cache"
+        environment = {**os.environ, "TMPDIR": str(self.root),
+            "CLANG_MODULE_CACHE_PATH": str(cache / "clang"),
+            "SWIFT_MODULECACHE_PATH": str(cache / "swift")}
+        compiled = subprocess.run(["/usr/bin/xcrun", "--sdk", "macosx", "swiftc",
+            "-parse-as-library", str(source), "-o", str(executable)], env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        try:
+            subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", executable],
+                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except PermissionError as exc:
+            if exc.filename != "/usr/bin/codesign":
+                raise
+            return
+        before = release.signature_insensitive_inventory(bundle)
+        entitlements = self.root / "fixture.entitlements"
+        entitlements.write_text("""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><true/></dict></plist>
+""")
+        resigned = subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-",
+            "--entitlements", entitlements, executable], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        self.assertEqual(resigned.returncode, 0, resigned.stderr)
+        self.assertEqual(release.signature_insensitive_inventory(bundle), before)
+        self.assertEqual(release.signed_entitlements(executable),
+                         release.canonical_entitlements({
+                             "com.apple.security.cs.allow-jit": True}))
+
+    def test_universal_macho_alignment_is_validated_and_identity_bearing(self):
+        signature = b"fixture-signature"
+        thin_header = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 2, 88, 0, 0)
+        segment = struct.pack("<II16sQQQQiiII", 0x19, 72, b"__LINKEDIT",
+                              0, 0x1000, 120, len(signature), 1, 1, 0, 0)
+        command = struct.pack("<IIII", 0x1D, 16, 120, len(signature))
+        thin = thin_header + segment + command + signature
+        offset = 32
+        def universal(align):
+            header = struct.pack(">II", 0xCAFEBABE, 1)
+            arch = struct.pack(">IIIII", 0x0100000C, 0, offset, len(thin), align)
+            return header + arch + b"\0" * (offset - len(header) - len(arch)) + thin
+        aligned = release._macho_identity(universal(2))
+        relaxed = release._macho_identity(universal(0))
+        self.assertEqual(aligned["universal"][0]["align"], 2)
+        self.assertNotEqual(aligned, relaxed)
+        with self.assertRaisesRegex(p.BuildError, "Malformed signed universal"):
+            release._macho_identity(universal(6))
+
+    def test_fat64_macho_is_detected_and_reserved_field_is_validated(self):
+        signature = b"fixture-signature"
+        thin_header = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 2, 88, 0, 0)
+        segment = struct.pack("<II16sQQQQiiII", 0x19, 72, b"__LINKEDIT",
+                              0, 0x1000, 120, len(signature), 1, 1, 0, 0)
+        thin = thin_header + segment + struct.pack("<IIII", 0x1D, 16, 120, len(signature)) + signature
+        offset = 64
+        def universal(reserved=0):
+            header = struct.pack(">II", 0xCAFEBABF, 1)
+            arch = struct.pack(">IIQQII", 0x0100000C, 0, offset, len(thin), 2, reserved)
+            return header + arch + b"\0" * (offset - len(header) - len(arch)) + thin
+        path = self.root / "fat64"
+        path.write_bytes(universal())
+        self.assertTrue(p.is_macho(path))
+        self.assertTrue(release._macho_identity(universal())["fat64"])
+        with self.assertRaisesRegex(p.BuildError, "Malformed signed universal"):
+            release._macho_identity(universal(1))
+
+    def test_notarization_success_records_inside_prepared_output(self):
+        prepared = self.root / "prepared"
+        prepared.mkdir()
+        final = self.root / "final"
+        result = subprocess.CompletedProcess([], 0, json.dumps({
+            "id": "fixture-submission", "status": "Accepted", "message": "ok",
+            "ignored": "private",
+        }), "")
+        evidence = self.root / "notarization-evidence.json"
+        receipt = release.record_notarization(prepared, result, evidence)
+        self.assertEqual(receipt, {"id": "fixture-submission", "status": "Accepted",
+                                   "message": "ok"})
+        self.assertEqual(json.loads((prepared / "notarization.json").read_text()), receipt)
+        self.assertEqual(json.loads(evidence.read_text()), receipt)
+        self.assertFalse(final.exists())
+
+    def test_notarization_failure_preserves_sanitized_evidence(self):
+        prepared = self.root / "prepared-failure"
+        prepared.mkdir()
+        evidence = self.root / "notarization-failure.json"
+        result = subprocess.CompletedProcess([], 1, json.dumps({
+            "id": "fixture-submission", "status": "Invalid", "message": "rejected",
+            "private": "must-not-persist",
+        }), "")
+        with self.assertRaisesRegex(p.BuildError, "not accepted"):
+            release.record_notarization(prepared, result, evidence)
+        self.assertEqual(json.loads(evidence.read_text()), {
+            "id": "fixture-submission", "status": "Invalid", "message": "rejected"})
+
+    def test_local_release_output_precedes_publication_and_survives_failure(self):
+        events = []
+        class Runner:
+            def run(inner, label, command, **kwargs):
+                events.append(label)
+                self.assertTrue(destination.exists())
+                self.assertFalse(prepared.exists())
+                if fail_publish:
+                    raise p.BuildError("publish failed")
+                return 0, self.root / "unused.log"
+        for fail_publish in (False, True):
+            with self.subTest(fail_publish=fail_publish):
+                prepared = self.root / ("prepared-fail" if fail_publish else "prepared-ok")
+                destination = self.root / ("final-fail" if fail_publish else "final-ok")
+                prepared.mkdir()
+                (prepared / "artifact").write_text("verified")
+                events.clear()
+                if fail_publish:
+                    with self.assertRaisesRegex(p.BuildError, "publish failed"):
+                        release.install_then_publish(
+                            Runner(), prepared, destination, "v1.0.0", {})
+                else:
+                    release.install_then_publish(
+                        Runner(), prepared, destination, "v1.0.0", {})
+                self.assertEqual(events, ["publish-release"])
+                self.assertEqual((destination / "artifact").read_text(), "verified")
+
+    def test_failed_local_install_never_attempts_publication(self):
+        prepared = self.root / "prepared-install-failure"
+        prepared.mkdir()
+        destination = self.root / "final-install-failure"
+        class Runner:
+            def run(inner, *_args, **_kwargs):
+                self.fail("publication must not run")
+        with patch.object(release.os, "replace", side_effect=OSError("fixture")), \
+                self.assertRaisesRegex(p.BuildError, "draft remains unpublished"):
+            release.install_then_publish(Runner(), prepared, destination, "v1.0.0", {})
+
+    def test_archive_tampering(self):
+        self.artifact()
+        (self.root / "Wisp.zip").write_bytes(b"corrupt")
+        with self.assertRaisesRegex(p.BuildError, "checksum mismatch"):
+            p.verify_artifacts(self.root)
+
+    def test_bundle_tampering(self):
+        bundle = self.artifact()
+        (bundle / "Contents/Resources/backend/service/main.py").write_text("modified")
+        with self.assertRaisesRegex(p.BuildError, "Bundle contents differ"):
+            p.verify_artifacts(self.root)
+
+    def test_manifest_cannot_reference_parent(self):
+        self.artifact()
+        (self.root / "SHA256SUMS").write_text("a" * 64 + "  ../outside\n")
+        with self.assertRaisesRegex(p.BuildError, "Malformed"):
+            p.verify_artifacts(self.root)
+
+    def test_manifest_covers_every_artifact(self):
+        self.artifact()
+        (self.root / "extra.txt").write_text("unlisted")
+        with self.assertRaisesRegex(p.BuildError, "Incomplete"):
+            p.verify_artifacts(self.root)
+
+    def test_adapter_keeps_product_manifest_and_adds_build_checks(self):
+        import simulation
+        discovered = {str(f.relative_to(ROOT)) for f in (ROOT / "tests").rglob("test_*.py")}
+        self.assertEqual(set(simulation.qa._selected_tests(["full"])), discovered)
+        self.assertEqual(set(simulation.selected_tests(["full"])), discovered | simulation.BUILD_TESTS)
+        self.assertIn("tests/build_pipeline/pipeline_checks.py", simulation.BUILD_TESTS)
+
+    def native_runner(self, architecture="arm64", minimum="11.0", dependency="/usr/lib/libSystem.B.dylib"):
+        root = self.root
+        class FakeRunner:
+            logs = root
+            def run(self, label, command):
+                log = root / (label + ".log")
+                if label.startswith("macho-"):
+                    log.write_text(architecture)
+                elif label.startswith("load-commands-"):
+                    log.write_text("cmd LC_BUILD_VERSION\ncmdsize 32\nplatform 1\nminos " + minimum)
+                else:
+                    log.write_text("binary:\n\t" + dependency + " (compatibility version 1.0.0)\n")
+                return 0, log
+        return FakeRunner()
+
+    def test_native_inventory_rejects_newer_os_and_external_dylibs(self):
+        bundle = self.fixture()
+        for name in ("Contents/MacOS/Wisp", "Contents/Resources/backend/.venv/bin/python3"):
+            (bundle / name).write_bytes(b"\xcf\xfa\xed\xfe" + b"fixture")
+        p.validate_native(self.native_runner(), bundle, self.meta)
+        for runner, message in ((self.native_runner(architecture="x86_64"), "arm64"),
+                                (self.native_runner(minimum="26.0"), "advertised minimum"),
+                                (self.native_runner(dependency="/opt/homebrew/lib/libfixture.dylib"), "Nonportable")):
+            with self.subTest(message=message), self.assertRaisesRegex(p.BuildError, message):
+                p.validate_native(runner, bundle, self.meta)
+
+
+    def test_native_inventory_distinguishes_dylib_identity_from_loads(self):
+        bundle = self.fixture()
+        for name in ("Contents/MacOS/Wisp", "Contents/Resources/backend/.venv/bin/python3"):
+            (bundle / name).write_bytes(b"\xcf\xfa\xed\xfe" + b"fixture")
+        runner = self.native_runner(dependency="/wheel-build/library.dylib")
+        original = runner.run
+        def run(label, command):
+            code, log = original(label, command)
+            if label.startswith("load-commands-"):
+                log.write_text(log.read_text() + "\ncmd LC_ID_DYLIB\ncmdsize 88\nname /wheel-build/library.dylib (offset 24)\n")
+            return code, log
+        runner.run = run
+        p.validate_native(runner, bundle, self.meta)
+
+    def test_native_inventory_rejects_active_absolute_search_path(self):
+        bundle = self.fixture()
+        for name in ("Contents/MacOS/Wisp", "Contents/Resources/backend/.venv/bin/python3"):
+            (bundle / name).write_bytes(b"\xcf\xfa\xed\xfe" + b"fixture")
+        for dependency in ("/usr/lib/libSystem.B.dylib", "@rpath/library.dylib"):
+            runner = self.native_runner(dependency=dependency)
+            original = runner.run
+            def run(label, command):
+                code, log = original(label, command)
+                if label.startswith("load-commands-"):
+                    log.write_text(log.read_text() + "\ncmd LC_RPATH\ncmdsize 88\npath /wheel-build/lib (offset 12)\n")
+                return code, log
+            runner.run = run
+            if dependency.startswith("@rpath"):
+                with self.assertRaisesRegex(p.BuildError, "Absolute rpath"):
+                    p.validate_native(runner, bundle, self.meta)
+            else:
+                p.validate_native(runner, bundle, self.meta)
+
+    def test_dry_run_does_not_write_or_run_stage(self):
+        with patch.object(sys, "argv", ["pipeline.py", "release", "--dry-run"]), patch.object(p, "Runner") as runner:
+            self.assertEqual(p.main(), 0)
+            runner.assert_not_called()
+
+    def test_environment_has_no_credentials_or_injection(self):
+        with patch.dict(os.environ, {"GH_TOKEN": "test", "UV_INDEX_URL": "https://untrusted.invalid", "PYTHONPATH": "/bad", "WISP_LIVE_REMINDER_TEST": "1"}):
+            env = p.clean_env()
+        for key in ("GH_TOKEN", "UV_INDEX_URL", "PYTHONPATH", "WISP_LIVE_REMINDER_TEST"):
+            self.assertNotIn(key, env)
+        self.assertEqual(env.get("HOME"), os.environ.get("HOME"))
+
+    def test_release_preflight_has_no_side_effects_when_credentials_absent(self):
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root)
+        env = {"GITHUB_ACTIONS": "true", "WISP_RELEASE_APPROVED": "true", "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/tags/v" + p.CONFIG["version"]}
+        with patch("release.subprocess.run") as run:
+            with self.assertRaisesRegex(p.BuildError, "Missing required CI secrets"):
+                release.preflight(args, env)
+            run.assert_not_called()
+
+    def test_release_cli_fails_cleanly_without_running_external_steps(self):
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "TMPDIR")}
+        result = subprocess.run([sys.executable, "-B", str(p.SUPPORT / "pipeline.py"), "release", "--output", str(self.root)],
+                                capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("BUILD FAILED", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("→", result.stdout)
+
+    def test_release_rejects_local_execution(self):
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root)
+        with self.assertRaisesRegex(p.BuildError, "protected"):
+            release.preflight(args, {})
+
+    def test_release_rejects_non_tag_dispatch_and_preview(self):
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root)
+        env = {"GITHUB_ACTIONS": "true", "WISP_RELEASE_APPROVED": "true", "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main"}
+        with self.assertRaisesRegex(p.BuildError, "exact version tag"):
+            release.preflight(args, env)
+        args.allow_dirty = True
+        with self.assertRaisesRegex(p.BuildError, "preview"):
+            release.preflight(args, env)
+
+    def performance_args(self):
+        return Namespace(performance_receipt=self.root / "receipt.json",
+                         performance_baseline=self.root / "approval.json",
+                         performance_receipt_sha256="a" * 64, performance_baseline_sha256="b" * 64)
+
+    def test_both_publishers_require_performance_before_any_publication_steps(self):
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root)
+        for publisher, preflight in ((release.release, "preflight"), (release.release_ad_hoc, "ad_hoc_preflight")):
+            with self.subTest(publisher=publisher.__name__), patch.object(release, preflight), \
+                    patch.object(release, "verify_artifacts") as artifacts, \
+                    patch.object(release, "secret_run") as secrets, \
+                    patch.object(release, "create_public_draft") as publish:
+                with self.assertRaisesRegex(p.BuildError, "performance receipt"):
+                    publisher(Namespace(logs=self.root), args)
+                artifacts.assert_not_called()
+                secrets.assert_not_called()
+                publish.assert_not_called()
+
+    def test_performance_gate_derives_source_bindings_and_never_accepts_fixture_authority(self):
+        args = self.performance_args()
+        cases = [(0, {"verdict": "PASS", "authorizes_release": True}),
+                 (0, {"verdict": "PASS", "authorizes_release": False}),
+                 (1, {"verdict": "BLOCK", "authorizes_release": False}),
+                 (2, {"verdict": "INCONCLUSIVE", "authorizes_release": False}),
+                 (3, {"verdict": "REFUSED", "authorizes_release": False}),
+                 (4, {"verdict": "PASS", "authorizes_release": True})]
+        observed = []
+        class Checker:
+            def exec_module(inner, module):
+                module.load_bundle = lambda path: {"corpus_sha256": "c" * 64, "policy_sha256": "d" * 64}
+                module.harness_sha256 = lambda: "e" * 64
+                def check(opts):
+                    observed.append(opts)
+                    return cases[index]
+                module.check_receipt = check
+        for index in range(len(cases)):
+            with self.subTest(index=index), patch.object(release, "git", return_value="f" * 40), \
+                    patch.object(importlib.util, "spec_from_file_location", return_value=Namespace(name="synthetic_checker", loader=Checker())), \
+                    patch.object(importlib.util, "module_from_spec", return_value=Namespace()):
+                if index == 0:
+                    release.require_release_performance(Namespace(logs=self.root), args)
+                else:
+                    with self.assertRaisesRegex(p.BuildError, "did not authorize"):
+                        release.require_release_performance(Namespace(logs=self.root), args)
+        opts = observed[0]
+        self.assertEqual(opts.expect_candidate_sha, "f" * 40)
+        self.assertEqual(opts.expect_corpus_sha256, "c" * 64)
+        self.assertEqual(opts.expect_policy_sha256, "d" * 64)
+        self.assertEqual(opts.expect_harness_sha256, "e" * 64)
+        self.assertEqual(opts.expect_receipt_sha256, "a" * 64)
+        self.assertEqual(opts.approved_baseline_sha256, "b" * 64)
+        self.assertEqual(opts.lane, "desktop")
+        self.assertFalse(hasattr(opts, "accept_fixture_source"))
+        self.assertEqual(opts.repo, ROOT)
+
+    def test_actual_performance_checker_refuses_missing_and_scalar_evidence(self):
+        args = self.performance_args()
+        for body in (None, "null", "[]", "7", "{}"):
+            if body is not None:
+                args.performance_receipt.write_text(body)
+                args.performance_receipt_sha256 = p.digest(args.performance_receipt)
+            with self.subTest(body=body), patch.object(release, "git", return_value="f" * 40):
+                with self.assertRaisesRegex(p.BuildError, "did not authorize"):
+                    release.require_release_performance(Namespace(logs=self.root), args)
+        evidence = json.loads((self.root / "release-performance-gate.json").read_text())
+        self.assertFalse(evidence["authorizes_release"])
+
+    def test_release_workflows_require_external_receipt_and_baseline_bindings(self):
+        workflow = (ROOT / ".github/workflows/wisp-build.yml").read_text()
+        for name in ("performance_run_id", "performance_receipt_sha256", "performance_baseline_sha256"):
+            self.assertIn(name + ":", workflow)
+        self.assertEqual(workflow.count("name: wisp-release-performance-${{ github.sha }}"), 2)
+        self.assertEqual(workflow.count('d["status"] == "completed" and d["conclusion"] == "success"'), 2)
+        self.assertEqual(workflow.count('d["head_sha"] == os.environ["PERFORMANCE_CANDIDATE_SHA"]'), 2)
+        self.assertEqual(workflow.count('d["head_repository"]["full_name"] == os.environ["GITHUB_REPOSITORY"]'), 2)
+        self.assertEqual(workflow.count("--performance-receipt .wisp-build/performance/receipt.json"), 2)
+        self.assertEqual(workflow.count('--performance-receipt-sha256 "$PERFORMANCE_RECEIPT_SHA256"'), 2)
+        self.assertEqual(workflow.count('--performance-baseline-sha256 "$PERFORMANCE_BASELINE_SHA256"'), 2)
+
+    # ---- Performance waiver (ad-hoc only, per version, committed, digest-bound) ----
+    def waiver_record(self, **overrides):
+        record = {"schema": "wisp.release_performance.waiver/1", "version": p.CONFIG["version"],
+                  "decision": "waived", "approved_by": "owner (project owner)",
+                  "approved_on": "2026-10-06", "scope": "ad_hoc_release_only",
+                  "reason": "A fixture reason that is comfortably longer than the eighty character minimum for a waiver.",
+                  "evidence_ref": "docs/RELEASE_PERFORMANCE_BENCHMARK.md#waiver",
+                  "follow_up": "A later version must restore a passing release benchmark."}
+        record.update(overrides)
+        return {key: value for key, value in record.items() if value is not None}
+
+    def waiver_repo(self, record=None, *, raw=None, commit=True, relative=None, name="repo"):
+        """A real throwaway Git checkout holding one committed waiver record."""
+        checkout = self.root / name
+        relative = relative or f"docs/releases/{p.CONFIG['version']}-performance-waiver.json"
+        data = raw if raw is not None else (json.dumps(self.waiver_record() if record is None else record, indent=2) + "\n").encode()
+        environment = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",
+                           GIT_AUTHOR_NAME="fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
+                           GIT_COMMITTER_NAME="fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
+        def git(*arguments):
+            subprocess.run(["git", "-C", str(checkout), "-c", "commit.gpgsign=false", *arguments],
+                           check=True, capture_output=True, env=environment)
+        checkout.mkdir(parents=True)
+        git("init", "-q")
+        (checkout / "README").write_text("fixture")
+        git("add", "README")
+        (checkout / relative).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / relative).write_bytes(data)
+        if commit:
+            git("add", "--", relative)
+        git("commit", "-q", "-m", "fixture")
+        return checkout, relative, hashlib.sha256(data).hexdigest(), git
+
+    def waiver_gate(self, checkout, relative, digest, *, ref="default", waiver="default"):
+        logs = self.root / "waiver-logs"
+        logs.mkdir(exist_ok=True)
+        args = Namespace(logs=logs, performance_waiver=Path(relative if waiver == "default" else waiver) if waiver else None,
+                         performance_waiver_sha256=digest)
+        environment = {"GITHUB_REF": "refs/tags/v" + p.CONFIG["version"] if ref == "default" else ref,
+                       "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+        with patch.object(release, "ROOT", checkout), patch.dict(os.environ, environment):
+            return release.require_performance_waiver(Namespace(logs=logs), args)
+
+    def assert_waiver_refused(self, checkout, relative, digest, message=None, **kwargs):
+        with self.assertRaises(p.BuildError) as context:
+            self.waiver_gate(checkout, relative, digest, **kwargs)
+        if message:
+            self.assertRegex(str(context.exception), message)
+        self.assertFalse((self.root / "waiver-logs/release-performance-gate.json").exists())
+        return str(context.exception)
+
+    def test_waiver_valid_record_is_waived_never_pass_and_is_recorded(self):
+        checkout, relative, digest, _ = self.waiver_repo()
+        result = self.waiver_gate(checkout, relative, digest)
+        head = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+        self.assertEqual(result, {"verdict": "WAIVED", "waived": True, "authorizes_release": True,
+                                  "waiver_sha256": digest, "version": p.CONFIG["version"],
+                                  "candidate_sha": head, "approved_by": "owner (project owner)",
+                                  "approved_on": "2026-10-06"})
+        self.assertNotEqual(result["verdict"], "PASS")
+        self.assertEqual(json.loads((self.root / "waiver-logs/release-performance-gate.json").read_text()), result)
+
+    def test_committed_real_waiver_record_passes_its_own_gate(self):
+        relative = f"docs/releases/{p.CONFIG['version']}-performance-waiver.json"
+        source = ROOT / relative
+        if not source.is_file():
+            self.skipTest("this version has no performance waiver")
+        data = source.read_bytes()
+        checkout, relative, digest, _ = self.waiver_repo(raw=data)
+        result = self.waiver_gate(checkout, relative, digest)
+        self.assertEqual(result["verdict"], "WAIVED")
+        self.assertEqual(json.loads(data)["scope"], "ad_hoc_release_only")
+
+    def test_waiver_refuses_wrong_or_malformed_digest(self):
+        checkout, relative, digest, _ = self.waiver_repo()
+        mutated = bytearray(bytes.fromhex(digest))
+        mutated[0] ^= 1
+        for label, value in (("wrong", "0" * 64), ("one-bit", bytes(mutated).hex()), ("missing", None),
+                             ("empty", ""), ("upper", digest.upper()), ("short", digest[:63]),
+                             ("newline", digest + "\n"), ("long", digest + "0")):
+            with self.subTest(label=label):
+                self.assert_waiver_refused(checkout, relative, value, "does not match" if label in ("wrong", "one-bit") else "^Performance waiver requires")
+
+    def test_waiver_digest_must_match_file_bytes_by_one_byte(self):
+        record = json.dumps(self.waiver_record(), indent=2) + "\n"
+        checkout, relative, _, _ = self.waiver_repo(raw=record.encode())
+        changed = record.replace("owner", "0wner").encode()
+        self.assertEqual(len(changed), len(record.encode()))
+        self.assert_waiver_refused(checkout, relative, hashlib.sha256(changed).hexdigest(), "does not match")
+        self.assert_waiver_refused(checkout, relative, None, "^Performance waiver requires")
+
+    def test_waiver_refuses_missing_path_argument(self):
+        checkout, relative, digest, _ = self.waiver_repo()
+        self.assert_waiver_refused(checkout, relative, digest, "committed record", waiver=None)
+
+    def test_waiver_refuses_wrong_scope_version_decision_schema_and_fields(self):
+        base = self.waiver_record()
+        cases = {"version": self.waiver_record(version="9.9.9"), "scope-signed": self.waiver_record(scope="signed_release"),
+                 "scope-all": self.waiver_record(scope="all"), "decision-pass": self.waiver_record(decision="pass"),
+                 "decision-case": self.waiver_record(decision="Waived"), "schema": self.waiver_record(schema="wisp.release_performance.waiver/2"),
+                 "approved_by-empty": self.waiver_record(approved_by="  "), "approved_on-empty": self.waiver_record(approved_on=""),
+                 "approved_on-format": self.waiver_record(approved_on="2026-1-6"), "approved_on-invalid": self.waiver_record(approved_on="2026-13-01"),
+                 "approved_on-unicode": self.waiver_record(approved_on="２０２６-10-06"), "approved_on-time": self.waiver_record(approved_on="2026-10-06T00:00:00"),
+                 "reason-short": self.waiver_record(reason="x" * 79), "reason-padding": self.waiver_record(reason=" " * 100 + "short"),
+                 "evidence-empty": self.waiver_record(evidence_ref=""), "follow-empty": self.waiver_record(follow_up=""),
+                 "extra-key": dict(base, extra="x"), "missing-reason": self.waiver_record(reason=None),
+                 "missing-schema": self.waiver_record(schema=None), "non-string": self.waiver_record(approved_by=7),
+                 "bool-version": self.waiver_record(version=True), "empty-object": {}}
+        for label, record in cases.items():
+            with self.subTest(label=label):
+                checkout, relative, digest, _ = self.waiver_repo(record, name="repo-" + label)
+                self.assert_waiver_refused(checkout, relative, digest, "waiver")
+        checkout, relative, digest, _ = self.waiver_repo(self.waiver_record(reason="x" * 80), name="repo-boundary")
+        self.assertEqual(self.waiver_gate(checkout, relative, digest)["verdict"], "WAIVED")
+
+    def test_waiver_refuses_non_json_non_object_duplicate_and_oversized_records(self):
+        valid = json.dumps(self.waiver_record())
+        oversized = json.dumps(self.waiver_record(reason="r" * 17000)).encode()
+        cases = {"text": b"not json", "empty": b"", "array": b"[]", "null": b"null", "scalar": b"7",
+                 "bad-utf8": b"\xff\xfe{}", "nan": valid.replace('"waived"', "NaN").encode(),
+                 "duplicate": valid.replace('"decision": "waived"', '"decision": "pass", "decision": "waived"').encode(),
+                 "trailing": (valid + " garbage").encode(), "oversized": oversized}
+        self.assertGreater(len(oversized), 16 * 1024)
+        for label, raw in cases.items():
+            with self.subTest(label=label):
+                checkout, relative, digest, _ = self.waiver_repo(raw=raw, name="repo-" + label)
+                self.assert_waiver_refused(checkout, relative, digest)
+
+    def test_waiver_size_bound_holds_even_if_the_file_grows_after_stat(self):
+        raw = json.dumps(self.waiver_record(reason="r" * 17000)).encode()
+        checkout, relative, digest, _ = self.waiver_repo(raw=raw)
+        real = os.fstat
+        def small(descriptor):
+            info = real(descriptor)
+            return os.stat_result((info.st_mode, *info[1:6], 10, *info[7:]))
+        with patch.object(release.os, "fstat", side_effect=small):
+            self.assert_waiver_refused(checkout, relative, digest, "small regular file")
+
+    def test_waiver_refuses_an_invalid_candidate_sha(self):
+        checkout, relative, digest, _ = self.waiver_repo()
+        real = release._waiver_git
+        def git(*arguments):
+            return b"not-a-sha\n" if arguments == ("rev-parse", "HEAD") else real(*arguments)
+        with patch.object(release, "_waiver_git", side_effect=git):
+            self.assert_waiver_refused(checkout, relative, digest, "candidate SHA")
+
+    def test_waiver_error_text_never_carries_file_content(self):
+        secret = "SECRET-CANARY-CONTENT"
+        for label, raw in (("json", json.dumps(self.waiver_record(reason=secret, scope="other")).encode()),
+                           ("text", secret.encode()), ("decision", json.dumps(self.waiver_record(approved_by=secret, decision="no")).encode())):
+            with self.subTest(label=label):
+                checkout, relative, digest, _ = self.waiver_repo(raw=raw, name="repo-" + label)
+                self.assertNotIn(secret, self.assert_waiver_refused(checkout, relative, digest))
+                self.assertNotIn(secret, str(self.assert_waiver_refused(checkout, relative, "1" * 64)))
+
+    def test_waiver_refuses_symlinks_and_non_regular_files(self):
+        checkout, relative, digest, git = self.waiver_repo(name="repo-final")
+        target = checkout / relative
+        real = checkout / "real.json"
+        real.write_bytes(target.read_bytes())
+        git("add", "real.json")
+        target.unlink()
+        target.symlink_to("../../real.json")
+        git("add", "--", relative)
+        git("commit", "-q", "-m", "symlink")
+        self.assert_waiver_refused(checkout, relative, digest, "symbolic links")
+        # Even if a race hides the link from lstat, the descriptor is opened without following it.
+        with patch.object(release.os, "lstat", side_effect=os.stat):
+            self.assert_waiver_refused(checkout, relative, digest, "could not be opened")
+        # A symbolic-link directory component is refused as well.
+        checkout, relative, digest, git = self.waiver_repo(name="repo-dir")
+        (checkout / "docs/releases").rename(checkout / "docs/real-releases")
+        (checkout / "docs/releases").symlink_to("real-releases")
+        self.assert_waiver_refused(checkout, relative, digest, "symbolic links")
+        # A directory or FIFO in place of the record.
+        checkout, relative, digest, git = self.waiver_repo(name="repo-fifo")
+        (checkout / relative).unlink()
+        os.mkfifo(checkout / relative)
+        self.assert_waiver_refused(checkout, relative, digest, "small regular file")
+
+    def test_waiver_refuses_untracked_modified_staged_deleted_and_uncommitted_records(self):
+        checkout, relative, digest, git = self.waiver_repo(commit=False, name="repo-uncommitted")
+        self.assert_waiver_refused(checkout, relative, digest, "tracked")
+        checkout, relative, digest, git = self.waiver_repo(name="repo-modified")
+        (checkout / relative).write_bytes((checkout / relative).read_bytes() + b" ")
+        self.assert_waiver_refused(checkout, relative, digest)
+        self.assert_waiver_refused(checkout, relative, hashlib.sha256((checkout / relative).read_bytes()).hexdigest())
+        checkout, relative, digest, git = self.waiver_repo(name="repo-staged")
+        changed = (checkout / relative).read_bytes() + b" "
+        (checkout / relative).write_bytes(changed)
+        git("add", "--", relative)
+        self.assert_waiver_refused(checkout, relative, hashlib.sha256(changed).hexdigest())
+        checkout, relative, digest, git = self.waiver_repo(name="repo-hidden")
+        git("update-index", "--assume-unchanged", "--", relative)
+        (checkout / relative).write_bytes((checkout / relative).read_bytes() + b" ")
+        self.assert_waiver_refused(checkout, relative, hashlib.sha256((checkout / relative).read_bytes()).hexdigest(), "unmodified at HEAD")
+        # Identical bytes with a changed mode, or a staged change reverted in the tree, is still not HEAD.
+        checkout, relative, digest, git = self.waiver_repo(name="repo-mode")
+        (checkout / relative).chmod(0o755)
+        self.assert_waiver_refused(checkout, relative, digest, "unmodified at HEAD")
+        checkout, relative, digest, git = self.waiver_repo(name="repo-revert")
+        original = (checkout / relative).read_bytes()
+        (checkout / relative).write_bytes(original + b" ")
+        git("add", "--", relative)
+        (checkout / relative).write_bytes(original)
+        self.assert_waiver_refused(checkout, relative, digest, "unmodified at HEAD")
+        checkout, relative, digest, git = self.waiver_repo(name="repo-deleted")
+        (checkout / relative).unlink()
+        self.assert_waiver_refused(checkout, relative, digest)
+        # Newly added to the index but never committed.
+        checkout, relative, digest, git = self.waiver_repo(commit=False, name="repo-indexed")
+        git("add", "--", relative)
+        self.assert_waiver_refused(checkout, relative, digest, "tracked")
+
+    def test_waiver_must_be_this_versions_record_inside_docs_releases(self):
+        checkout, relative, digest, git = self.waiver_repo(name="repo-path")
+        data = (checkout / relative).read_bytes()
+        for other in ("docs/releases/1.1.5-performance-waiver.json", "docs/elsewhere/waiver.json",
+                      "waiver.json", f"docs/releases/{p.CONFIG['version']}-performance-waiver.json.bak",
+                      f"docs/releases/x/../{p.CONFIG['version']}-performance-waiver-x.json"):
+            (checkout / other).parent.mkdir(parents=True, exist_ok=True)
+            (checkout / other).write_bytes(data)
+            git("add", "-f", "--", other)
+            with self.subTest(other=other):
+                self.assert_waiver_refused(checkout, relative, digest, "committed record", waiver=other)
+        git("commit", "-q", "-m", "others")
+        for other in ("docs/releases/1.1.5-performance-waiver.json", "../outside.json", str(self.root / "outside.json"), "docs/releases", "."):
+            with self.subTest(committed=other):
+                self.assert_waiver_refused(checkout, relative, digest, "committed record", waiver=other)
+
+    def test_waiver_requires_the_exact_version_tag_ref(self):
+        checkout, relative, digest, _ = self.waiver_repo()
+        for ref in ("refs/heads/main", "refs/tags/v9.9.9", "", "refs/tags/" + p.CONFIG["version"]):
+            with self.subTest(ref=ref):
+                self.assert_waiver_refused(checkout, relative, digest, "version tag", ref=ref)
+
+    def test_waiver_and_evidence_are_mutually_exclusive_and_default_is_unchanged(self):
+        runner = Namespace(logs=self.root)
+        base = {"performance_waiver": Path("w.json"), "performance_waiver_sha256": "a" * 64}
+        for name, value in (("performance_receipt", self.root / "r"), ("performance_baseline", self.root / "b"),
+                            ("performance_receipt_sha256", "a" * 64), ("performance_baseline_sha256", "b" * 64)):
+            with self.subTest(argument=name), patch.object(release, "require_performance_waiver") as waiver, \
+                    patch.object(release, "require_release_performance") as evidence:
+                with self.assertRaisesRegex(p.BuildError, "mutually exclusive"):
+                    release.require_ad_hoc_performance_authority(runner, Namespace(**base, **{name: value}))
+                waiver.assert_not_called()
+                evidence.assert_not_called()
+        for partial in ({"performance_waiver": Path("w.json")}, {"performance_waiver_sha256": "a" * 64}):
+            with self.subTest(partial=partial), patch.object(release, "require_release_performance") as evidence:
+                with self.assertRaisesRegex(p.BuildError, "Performance waiver requires"):
+                    release.require_ad_hoc_performance_authority(runner, Namespace(**partial))
+                evidence.assert_not_called()
+        with patch.object(release, "require_performance_waiver") as waiver, \
+                patch.object(release, "require_release_performance", return_value="evidence") as evidence:
+            self.assertEqual(release.require_ad_hoc_performance_authority(runner, Namespace()), "evidence")
+            self.assertEqual(release.require_ad_hoc_performance_authority(runner, self.performance_args()), "evidence")
+            waiver.assert_not_called()
+            self.assertEqual(evidence.call_count, 2)
+            release.require_ad_hoc_performance_authority(runner, Namespace(**base))
+            waiver.assert_called_once()
+
+    def test_ad_hoc_publisher_checks_the_waiver_before_any_publication_step(self):
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root,
+                         performance_waiver=Path("docs/releases/missing.json"), performance_waiver_sha256="a" * 64)
+        with patch.object(release, "ad_hoc_preflight"), patch.object(release, "verify_artifacts") as artifacts, \
+                patch.object(release, "secret_run") as secrets, patch.object(release, "create_public_draft") as publish, \
+                patch.object(release, "require_release_performance") as evidence, \
+                patch.dict(os.environ, {"GITHUB_REF": "refs/tags/v" + p.CONFIG["version"]}):
+            with self.assertRaisesRegex(p.BuildError, "committed record"):
+                release.release_ad_hoc(Namespace(logs=self.root), args)
+        for call in (artifacts, secrets, publish, evidence):
+            call.assert_not_called()
+
+    def test_ad_hoc_preflight_conditions_are_unchanged_by_a_waiver(self):
+        waiver = {"performance_waiver": Path("w.json"), "performance_waiver_sha256": "a" * 64}
+        environment = {"GITHUB_ACTIONS": "true", "WISP_AD_HOC_RELEASE_APPROVED": "true", "GITHUB_EVENT_NAME": "workflow_dispatch",
+                       "GITHUB_REF": "refs/tags/v" + p.CONFIG["version"], "GH_TOKEN": "t", "GITHUB_REPOSITORY": "o/r"}
+        good = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root, **waiver)
+        release.ad_hoc_preflight(good, environment)
+        for label, args, env, message in (
+                ("local", good, {}, "explicit CI workflow dispatch"),
+                ("branch", good, dict(environment, GITHUB_REF="refs/heads/main"), "exact version tag"),
+                ("event", good, dict(environment, GITHUB_EVENT_NAME="push"), "explicit CI workflow dispatch"),
+                ("approval", good, dict(environment, WISP_AD_HOC_RELEASE_APPROVED="false"), "explicit CI workflow dispatch"),
+                ("token", good, {k: v for k, v in environment.items() if k != "GH_TOKEN"}, "credentials"),
+                ("dirty", Namespace(**dict(vars(good), allow_dirty=True)), environment, "preview"),
+                ("offline", Namespace(**dict(vars(good), offline=True)), environment, "offline")):
+            with self.subTest(label=label), self.assertRaisesRegex(p.BuildError, message):
+                release.ad_hoc_preflight(args, env)
+
+    def test_signed_release_refuses_any_waiver_argument_before_the_evidence_gate(self):
+        for arguments in ({"performance_waiver": Path("w.json")}, {"performance_waiver_sha256": "a" * 64},
+                          {"performance_waiver": Path("w.json"), "performance_waiver_sha256": "a" * 64},
+                          dict(vars(self.performance_args()), performance_waiver=Path("w.json"))):
+            with self.subTest(arguments=sorted(arguments)), patch.object(release, "preflight"), \
+                    patch.object(release, "require_release_performance") as evidence, \
+                    patch.object(release, "require_performance_waiver") as waiver, \
+                    patch.object(release, "verify_artifacts") as artifacts, patch.object(release, "secret_run") as secrets:
+                with self.assertRaisesRegex(p.BuildError, "never accepts a performance waiver"):
+                    release.release(Namespace(logs=self.root), Namespace(
+                        allow_dirty=False, test_python=None, offline=False, output=self.root, **arguments))
+                for call in (evidence, waiver, artifacts, secrets):
+                    call.assert_not_called()
+
+    def test_waiver_option_is_accepted_only_by_release_ad_hoc(self):
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "TMPDIR")}
+        for command in ("release", "all", "verify", "doctor", "test", "qa-assemble"):
+            for option in (("--performance-waiver", "x.json"), ("--performance-waiver-sha256", "a" * 64)):
+                with self.subTest(command=command, option=option[0]):
+                    result = subprocess.run([sys.executable, "-B", str(p.SUPPORT / "pipeline.py"), command, *option],
+                                            capture_output=True, text=True, env=env)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("only accepted by release-ad-hoc", result.stderr)
+                    self.assertNotIn("→", result.stdout)
+        result = subprocess.run([sys.executable, "-B", str(p.SUPPORT / "pipeline.py"), "release-ad-hoc",
+                                 "--output", str(self.root), "--performance-waiver", "x.json"],
+                                capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("only accepted", result.stderr)
+
+    def workflow_jobs(self):
+        workflow = (ROOT / ".github/workflows/wisp-build.yml").read_text()
+        signed = workflow.index("\n  release:\n")
+        adhoc = workflow.index("\n  publish-ad-hoc-release:\n")
+        self.assertLess(signed, adhoc)
+        return workflow, workflow[signed:adhoc], workflow[adhoc:]
+
+    def workflow_step(self, section, name):
+        marker = f"      - name: {name}\n"
+        self.assertEqual(section.count(marker), 1, name)
+        start = section.index(marker)
+        following = section.find("\n      - ", start + 1)
+        comment = section.find("\n      # ", start + 1)
+        end = min(value for value in (following, comment, len(section)) if value > 0)
+        return section[start:end]
+
+    def test_workflow_waiver_input_and_ad_hoc_step_conditions(self):
+        workflow, signed, adhoc = self.workflow_jobs()
+        self.assertEqual(workflow.count("      performance_waiver_sha256:\n"), 1)
+        declaration = workflow[workflow.index("      performance_waiver_sha256:\n"):]
+        declaration = declaration[:declaration.index("\npermissions:")]
+        self.assertIn("mutually exclusive with the three performance_* evidence inputs", declaration)
+        self.assertIn("docs/releases/<version>-performance-waiver.json", declaration)
+        self.assertIn("type: string", declaration)
+        for name in ("Require reviewed performance artifact bindings", "Download selected Desktop performance evidence",
+                     "Publish bound verified ad-hoc assets"):
+            with self.subTest(name=name):
+                step = self.workflow_step(adhoc, name)
+                self.assertEqual(step.count("if: "), 1)
+                self.assertIn("\n        if: inputs.performance_waiver_sha256 == ''\n", step)
+        publish = self.workflow_step(adhoc, "Publish bound verified ad-hoc assets")
+        self.assertIn('--performance-receipt-sha256 "$PERFORMANCE_RECEIPT_SHA256"', publish)
+        self.assertNotIn("--performance-waiver", publish)
+        self.assertNotIn("PERFORMANCE_WAIVER", publish)
+        waived = self.workflow_step(adhoc, "Publish waived ad-hoc assets")
+        self.assertIn("\n        if: inputs.performance_waiver_sha256 != ''\n", waived)
+        self.assertEqual(waived.count("if: "), 1)
+        for name in ("WISP_AD_HOC_RELEASE_APPROVED: 'true'", "GH_TOKEN: ${{ github.token }}",
+                     "PERFORMANCE_WAIVER_SHA256: ${{ inputs.performance_waiver_sha256 }}"):
+            self.assertIn(name, waived)
+        self.assertNotIn("secrets.", waived)
+        lines = [line.strip() for line in waived[waived.index("run: |\n") + 7:].splitlines() if line.strip()]
+        self.assertEqual(len(lines), 2)
+        guard, command = lines
+        for name in ("PERFORMANCE_RUN_ID", "PERFORMANCE_RECEIPT_SHA256", "PERFORMANCE_BASELINE_SHA256"):
+            self.assertIn(f'{name}: ${{{{ inputs.{name.lower()} }}}}', waived)
+            self.assertIn(f'"{name}"', guard)
+        self.assertIn('assert not any(os.environ[k] for k in', guard)
+        self.assertIn('re.fullmatch(r"[a-f0-9]{64}", os.environ["PERFORMANCE_WAIVER_SHA256"])', guard)
+        import shlex
+        tokens = shlex.split(command)
+        self.assertEqual(tokens, ["./scripts/wisp-build", "release-ad-hoc", "--output", "dist/candidate",
+                                  "--performance-waiver", f"docs/releases/{p.CONFIG['version']}-performance-waiver.json",
+                                  "--performance-waiver-sha256", "$PERFORMANCE_WAIVER_SHA256"])
+        self.assertIn('--performance-waiver-sha256 "$PERFORMANCE_WAIVER_SHA256"', command)
+        self.assertNotIn("--performance-receipt", command)
+        self.assertLess(adhoc.index("Publish bound verified ad-hoc assets"), adhoc.index("Publish waived ad-hoc assets"))
+        self.assertEqual(shlex.split(guard)[:3], ["python3", "-B", "-c"])
+        # Exactly one waived command exists, and the evidence strings are unchanged.
+        self.assertEqual(workflow.count("--performance-waiver "), 1)
+        self.assertEqual(workflow.count("--performance-waiver-sha256"), 1)
+        self.assertEqual(workflow.count("--performance-receipt .wisp-build/performance/receipt.json"), 2)
+
+    def test_workflow_signed_job_rejects_the_waiver_input(self):
+        workflow, signed, adhoc = self.workflow_jobs()
+        step = self.workflow_step(signed, "Refuse performance waiver on the signed release")
+        self.assertIn("\n        if: inputs.performance_waiver_sha256 != ''\n", step)
+        self.assertIn("exit 1", step)
+        self.assertLess(signed.index("Refuse performance waiver on the signed release"), signed.index("Rebuild without an untrusted"))
+        self.assertLess(signed.index("Refuse performance waiver on the signed release"), signed.index("Sign, notarize, verify and publish"))
+        self.assertEqual(signed.count("performance_waiver_sha256"), 1)
+        self.assertNotIn("--performance-waiver", signed)
+        self.assertNotIn("PERFORMANCE_WAIVER", signed)
+        # The signed job still demands every evidence step unconditionally.
+        for name in ("Require reviewed performance artifact bindings", "Download selected Desktop performance evidence"):
+            self.assertNotIn("if: ", self.workflow_step(signed, name))
+        self.assertNotIn("if: ", self.workflow_step(signed, "Sign, notarize, verify and publish"))
+
+    def test_workflow_waiver_change_keeps_pins_permissions_and_diagnostics(self):
+        workflow, signed, adhoc = self.workflow_jobs()
+        for line in workflow.splitlines():
+            if line.strip().startswith(("- uses:", "uses:")):
+                self.assertRegex(line, r"uses: [\w./-]+@[0-9a-f]{40}(\s+#.*)?$")
+        self.assertIn("    permissions:\n      contents: write\n      actions: read\n", adhoc)
+        self.assertIn("    permissions:\n      contents: write\n      actions: read\n", signed)
+        self.assertIn("permissions:\n  contents: read\n\nconcurrency:\n  group: wisp-build-${{ github.ref }}-${{ github.event_name }}\n", workflow)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.publish_ad_hoc && !inputs.publish && startsWith(github.ref, 'refs/tags/v')", adhoc)
+        diagnostics = self.workflow_step(adhoc, "Upload ad-hoc publication diagnostics")
+        self.assertIn("if: always()", diagnostics)
+        self.assertIn(".wisp-build/run-*/*.json", diagnostics)
+        self.assertEqual(workflow.count("environment: release"), 1)
+        self.assertNotIn("environment:", adhoc)
+
+    def adhoc_fixture(self):
+        checkout = self.root
+        self.root = checkout / "dist/candidate"
+        self.root.mkdir(parents=True)
+        self.artifact()
+        (self.root / "release-notes.md").write_text("Ad-hoc fixture notes")
+        provenance = json.loads((self.root / "provenance.json").read_text())
+        provenance.update(toolchain={"strict_toolchain": True},
+                          tests=[{"step": "fixture", "exit_code": 0}])
+        p.json_write(self.root / "provenance.json", provenance)
+        p.checksums(self.root)
+        return checkout
+
+    def run_adhoc_fixture(self, checkout, *, mutate=None, upload_error=False,
+                          existing=None, git_override=None):
+        events, uploaded = [], {}
+        root = self.root
+        class Runner:
+            logs = root
+            def run(inner, label, command, **kwargs):
+                events.append(label)
+                if label == "create-draft-release":
+                    self.assertIn("--draft", command)
+                    self.assertTrue(kwargs["pass_fds"])
+                    descriptor = kwargs["pass_fds"][0]
+                    self.adhoc_notes = os.pread(descriptor, os.fstat(descriptor).st_size, 0).decode()
+                    if mutate:
+                        mutate()
+                log = checkout / "release-id.log"
+                log.write_text("42")
+                return 0, log
+        class Uploader:
+            def __init__(inner, *args): pass
+            def upload(inner, name, mime, fd, digest, size):
+                events.append("upload")
+                if upload_error:
+                    raise p.BuildError("fixture upload failure")
+                body = os.pread(fd, size, 0)
+                self.assertEqual(hashlib.sha256(body).hexdigest(), digest)
+                uploaded[name] = body
+        def git(*args):
+            if git_override:
+                value = git_override(args)
+                if value is not None:
+                    return value
+            return "" if args[0] == "status" else self.meta["commit"]
+        environment = {"GITHUB_ACTIONS": "true", "WISP_AD_HOC_RELEASE_APPROVED": "true",
+            "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/tags/v" + p.CONFIG["version"],
+            "GH_TOKEN": "fixture-token", "GITHUB_REPOSITORY": "fixture/repo"}
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=root)
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, environment, clear=True))
+            stack.enter_context(patch.object(release, "ROOT", checkout))
+            # This fixture exercises asset publication mechanics. Gate behavior is tested separately.
+            stack.enter_context(patch.object(release, "require_release_performance"))
+            stack.enter_context(patch.object(release, "git", side_effect=git))
+            stack.enter_context(patch.object(p, "verify_bundle_signature"))
+            stack.enter_context(patch.object(release, "distribution_roundtrip"))
+            stack.enter_context(patch.object(release, "GitHubReleaseUploader", Uploader))
+            empty = subprocess.CompletedProcess([], 0, "[[]]", "")
+            draft = subprocess.CompletedProcess([], 0, json.dumps([[{
+                "id": 42, "tag_name": "v" + p.CONFIG["version"], "draft": True
+            }]]), "")
+            api = stack.enter_context(patch.object(release.subprocess, "run", side_effect=
+                [existing] if existing is not None else [empty, empty, draft]))
+            stack.enter_context(patch.object(release.time, "sleep"))
+            try:
+                release.release_ad_hoc(Runner(), args)
+            finally:
+                self.adhoc_events, self.adhoc_uploaded, self.adhoc_api_calls = events, uploaded, api.call_count
+        return events, uploaded
+
+    def test_ad_hoc_app_only_publishes_after_upload_with_app_first_notes(self):
+        checkout = self.adhoc_fixture()
+        events, uploaded = self.run_adhoc_fixture(checkout)
+        app_name = f"01-Wisp-{p.CONFIG['version']}-{self.meta['build_number']}-arm64.zip"
+        self.assertEqual(set(uploaded), {app_name})
+        self.assertEqual(uploaded[app_name], (self.root / "Wisp.zip").read_bytes())
+        self.assertEqual(self.adhoc_notes.splitlines()[0],
+                         "**[Download Wisp for Mac (Apple silicon)]"
+                         f"(https://github.com/fixture/repo/releases/download/v{p.CONFIG['version']}/{app_name})**")
+        self.assertIn("Ad-hoc fixture notes", self.adhoc_notes)
+        self.assertTrue((self.root / "SHA256SUMS").is_file())
+        self.assertEqual(events[-1], "publish-release")
+        self.assertLess(events.index("create-draft-release"), events.index("upload"))
+        self.assertEqual(self.adhoc_api_calls, 3)
+
+    def test_ad_hoc_unpublished_evidence_is_still_required_and_verified(self):
+        checkout = self.adhoc_fixture()
+        (self.root / "dependencies.json").write_text("tampered evidence")
+        with self.assertRaisesRegex(p.BuildError, "checksum"):
+            self.run_adhoc_fixture(checkout)
+        self.assertEqual(self.adhoc_api_calls, 0)
+        self.assertNotIn("create-draft-release", self.adhoc_events)
+
+    def test_public_download_helper_handles_signed_archive_without_extra_assets(self):
+        self.artifact()
+        signed_name = f"Wisp-{p.CONFIG['version']}-{self.meta['build_number']}-arm64.zip"
+        (self.root / "Wisp.zip").rename(self.root / signed_name)
+        p.checksums(self.root)
+        with p.BoundReleaseAssets(self.root) as assets:
+            app = release.public_release_archive(assets, self.meta)
+            self.assertEqual(app[0], "01-" + signed_name)
+            self.assertEqual(os.pread(app[2], app[4], 0), (self.root / signed_name).read_bytes())
+            self.assertIn("provenance.json", assets.descriptors)
+            self.assertIn("SHA256SUMS", assets.descriptors)
+
+    def test_ad_hoc_failed_upload_leaves_draft(self):
+        checkout = self.adhoc_fixture()
+        with self.assertRaisesRegex(p.BuildError, "upload failure"):
+            self.run_adhoc_fixture(checkout, upload_error=True)
+        self.assertIn("create-draft-release", self.adhoc_events)
+        self.assertNotIn("publish-release", self.adhoc_events)
+
+    def test_ad_hoc_rejects_asset_mutation_before_upload(self):
+        checkout = self.adhoc_fixture()
+        with self.assertRaisesRegex(p.BuildError, "content changed"):
+            self.run_adhoc_fixture(checkout,
+                mutate=lambda: (self.root / "Wisp.zip").write_bytes(b"changed"))
+        self.assertNotIn("upload", self.adhoc_events)
+        self.assertNotIn("publish-release", self.adhoc_events)
+
+    def test_ad_hoc_rejects_extra_unchecked_zip(self):
+        checkout = self.adhoc_fixture()
+        (self.root / "extra.zip").write_bytes(b"unchecked")
+        with self.assertRaisesRegex(p.BuildError, "Incomplete"):
+            self.run_adhoc_fixture(checkout)
+        self.assertEqual(self.adhoc_api_calls, 0)
+
+    def test_ad_hoc_refuses_existing_release_and_api_failure(self):
+        checkout = self.adhoc_fixture()
+        existing = json.dumps([[[{"id": 7, "tag_name": "v" + p.CONFIG["version"],
+                                 "draft": True}]][0]])
+        for result in (subprocess.CompletedProcess([], 0, existing, ""),
+                       subprocess.CompletedProcess([], 1, "", "HTTP 403")):
+            with self.subTest(result=result), self.assertRaises(p.BuildError):
+                self.run_adhoc_fixture(checkout, existing=result)
+            self.assertNotIn("create-draft-release", self.adhoc_events)
+
+    def test_ad_hoc_rejects_missing_or_malformed_created_draft(self):
+        checkout = self.adhoc_fixture()
+        malformed = subprocess.CompletedProcess([], 0, "{}", "")
+        with self.assertRaisesRegex(p.BuildError, "invalid data"):
+            self.run_adhoc_fixture(checkout, existing=malformed)
+
+    def test_ad_hoc_rejects_source_and_tag_mismatch_before_api(self):
+        checkout = self.adhoc_fixture()
+        for target in ("HEAD", "refs/tags/v" + p.CONFIG["version"] + "^{commit}"):
+            with self.subTest(target=target), self.assertRaises(p.BuildError):
+                self.run_adhoc_fixture(checkout,
+                    git_override=lambda args: "b" * 40 if args[-1] == target else None)
+            self.assertEqual(self.adhoc_api_calls, 0)
+
+    def test_ad_hoc_rejects_ineligible_provenance_before_api(self):
+        checkout = self.adhoc_fixture()
+        path = self.root / "provenance.json"
+        original = path.read_text()
+        variants = [lambda v: v["source"].update(dirty=True),
+                    lambda v: v["toolchain"].update(strict_toolchain=False),
+                    lambda v: v["tests"][0].update(exit_code=1),
+                    lambda v: v.update(signature="Developer ID Application"),
+                    lambda v: v.update(notarized=True)]
+        for change in variants:
+            value = json.loads(original)
+            change(value)
+            p.json_write(path, value)
+            p.checksums(self.root)
+            with self.subTest(value=value), self.assertRaises(p.BuildError):
+                self.run_adhoc_fixture(checkout)
+            self.assertEqual(self.adhoc_api_calls, 0)
+
+    def test_ad_hoc_local_and_nonversion_dispatch_rejected(self):
+        args = Namespace(allow_dirty=False, test_python=None, offline=False, output=self.root)
+        with self.assertRaisesRegex(p.BuildError, "explicit CI"):
+            release.ad_hoc_preflight(args, {})
+        env = {"GITHUB_ACTIONS": "true", "WISP_AD_HOC_RELEASE_APPROVED": "true",
+               "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/tags/v999"}
+        with self.assertRaisesRegex(p.BuildError, "exact version tag"):
+            release.ad_hoc_preflight(args, env)
+
+    def test_ad_hoc_release_workflow_is_tag_only_and_preserves_signed_release(self):
+        workflow = (ROOT / ".github/workflows/wisp-build.yml").read_text()
+        self.assertIn("publish_ad_hoc:", workflow)
+        self.assertIn("inputs.publish_ad_hoc && !inputs.publish", workflow)
+        self.assertIn("startsWith(github.ref, 'refs/tags/v')", workflow)
+        job = workflow.split("  publish-ad-hoc-release:", 1)[1]
+        self.assertIn("all --strict-toolchain --output dist/candidate", job)
+        self.assertIn("release-ad-hoc --output dist/candidate", job)
+        self.assertIn("WISP_AD_HOC_RELEASE_APPROVED: 'true'", job)
+        self.assertNotIn("gh release create", job)
+        self.assertNotIn("*.zip", job)
+
+
+    def test_git_source_list_handles_terminating_nul(self):
+        with patch.object(p, "git", return_value="service/main.py\0"):
+            self.assertEqual(p.source_files(), [ROOT / "service/main.py"])
+
+    def test_private_command_timeout_cannot_expose_password(self):
+        import traceback
+        command = ["security", "import", "fixture.p12", "-P", "SENTINEL-PRIVATE-PASSWORD"]
+        with patch("release.subprocess.run", side_effect=subprocess.TimeoutExpired(command, 120)):
+            try:
+                release.secret_run(command)
+            except p.BuildError:
+                output = traceback.format_exc()
+            else:
+                self.fail("Timeout must fail")
+        self.assertNotIn("SENTINEL-PRIVATE-PASSWORD", output)
+        self.assertIn("suppressed", output)
+
+    def test_private_apple_tools_receive_no_unrelated_ci_secrets(self):
+        sentinels = {"GH_TOKEN": "github-secret", "WISP_SIGNING_P12_BASE64": "p12-secret",
+                     "WISP_SIGNING_P12_PASSWORD": "password-secret",
+                     "WISP_APPLE_API_KEY_BASE64": "api-secret"}
+        with patch.dict(os.environ, sentinels, clear=False), \
+                patch("release.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            release.secret_run(["security", "list-keychains"])
+        environment = run.call_args.kwargs["env"]
+        self.assertTrue(all(key not in environment for key in sentinels))
+
+    def test_guard_allows_scratch_sqlite_uri_and_cleanup(self):
+        snippet = f"""
+import sys, sqlite3, shutil
+sys.path.insert(0, {str(p.SUPPORT)!r})
+from pathlib import Path
+import test_worker
+scratch=Path({str(self.root)!r})
+violations=test_worker.install_guard(Path({str(ROOT)!r}), scratch, Path(sys.base_prefix))
+folder=scratch/'data'
+folder.mkdir()
+with sqlite3.connect(str(folder/'fixture.db')) as db:
+    db.execute('create table fixture (name text)')
+with sqlite3.connect(f'file:{{folder}}/fixture.db?mode=ro', uri=True) as db:
+    assert db.execute('select count(*) from fixture').fetchone()[0] == 0
+shutil.rmtree(folder)
+assert not violations, violations
+"""
+        proc = subprocess.run([sys.executable, "-B", "-c", snippet], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_bootstrap_never_executes_bad_binary(self):
+        import bootstrap_uv
+        wrong = self.root / "wrong-uv"
+        wrong.write_text("not the pinned binary")
+        with patch("bootstrap_uv.shutil.which", return_value=str(wrong)):
+            with self.assertRaisesRegex(RuntimeError, "Offline bootstrap"):
+                bootstrap_uv.ensure_uv(p.CONFIG, self.root, offline=True)
+
+
+    def test_guard_caught_denial_still_fails(self):
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        forbidden = self.root / "outside.txt"
+        proc = subprocess.run([sys.executable, "-B", str(p.SUPPORT / "test_worker.py"), "guard-probe", str(forbidden),
+            "--root", str(ROOT), "--scratch", str(scratch)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 86, proc.stderr)
+        self.assertFalse(forbidden.exists())
+        self.assertIn("ISOLATION VIOLATIONS", proc.stderr)
+
+    def test_guard_denies_network_sqlite_and_subprocess(self):
+        # Run in a child because Python audit hooks cannot be removed.
+        snippet = f'''
+import sys
+sys.path.insert(0, {str(p.SUPPORT)!r})
+from pathlib import Path
+import test_worker, socket, sqlite3, subprocess
+violations=test_worker.install_guard(Path({str(ROOT)!r}), Path({str(self.root)!r}), Path(sys.base_prefix))
+for action in (lambda: socket.getaddrinfo("example.invalid", 80), lambda: sqlite3.connect("/tmp/wisp-forbidden.db"), lambda: subprocess.run(["/usr/bin/true"])):
+    try: action()
+    except PermissionError: pass
+assert len(violations)==3, violations
+'''
+        proc = subprocess.run([sys.executable, "-B", "-c", snippet], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

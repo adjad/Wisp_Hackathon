@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-from service.utterance_shape import is_mention, is_prohibition
+from service.utterance_shape import is_mention, is_prohibition, mask_quoted
 
 
 @dataclass(frozen=True)
@@ -73,6 +73,14 @@ def knowledge_envelope(text: str) -> KnowledgeEnvelope | None:
         addressed = re.match(prefix + r"(?:save|store|remember|read|show|list|"
             r"update|edit|replace|delete|remove|forget)\s+(?:my\s+)?(?:saved\s+)?(?:a\s+)?"
             + surface + r"\b", value, re.I)
-        if not why and not addressed:
+        # Invalid imports still address knowledge. Recognize their destination
+        # separately from the exact import grammar and source/container checks.
+        # Quoted text and authored title/body fields cannot establish that cue.
+        header = re.split(r"\btitled\b", mask_quoted(value), maxsplit=1, flags=re.I)[0]
+        import_addressed = (
+            re.match(prefix + r"(?:save|store|remember)\s+(?:email|messages)\b", header, re.I)
+            and re.search(r"\bas\s+(?:a\s+)?" + surface + r"\b", header, re.I)
+        )
+        if not why and not (addressed or imported or import_addressed):
             return None
     return KnowledgeEnvelope(tuple(tools), bindings)

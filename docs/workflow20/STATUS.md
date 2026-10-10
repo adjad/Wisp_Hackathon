@@ -129,6 +129,33 @@ positive controls. Models, native sinks and data are synthetic. Fresh committed
 head full checks, required CI, independent audit and distinct specialist QA are
 still required; the prior passes do not qualify this repair or all 20 workflows.
 
+The next frozen revision, `b7012e5143f9ee2db0733d1d849ff4522c85b3e4`, also
+passed all 198 offline gates (27,347 reported passes, zero failures, 155 skips,
+one unparsed legacy count). Independent audit blocked it on
+`W20KNOWLEDGEENTRY02`: an invalid Email/chat or Messages/account source-import
+pairing returned no knowledge envelope, allowing an authored title to reach
+Reminder parsing. Four actual HTTP regressions reproduced that failure with
+empty and populated Reminder stores; the fixtures refused unintended previews.
+
+The successor separates addressed import recognition from accepted import
+authority. An invalid full import, or an incomplete Email/Messages import with
+an explicit unquoted knowledge destination before its title, receives an empty
+clarification envelope. Quoted subject text and incidental knowledge words do
+not establish that destination. Exact accepted import grammar, source/container
+validation, source identities, policy and approval remain unchanged. No main,
+loop or task-compiler change is needed for this repair.
+
+Expanded synthetic HTTP tests cover incomplete headers and trailing actions,
+unchanged task/workflow/skill state, valid immutable Mail and normalized Messages
+evidence, denial/view-only policy, stale/unavailable Mail publications and
+current-request bindings that replace changed model arguments before approval.
+Intermediate fixture mistakes (SSE event naming and expecting binding rejection
+instead of exact host replacement) are preserved with their corrected runs.
+The expanded suite passes 179 cases, including the prior 132 unchanged cases;
+the focused cross-suite passes 14 files including that suite. These are
+development results.
+Fresh committed-head full checks, CI, audit and distinct QA remain necessary.
+
 ## Family 15 reference scope
 
 The [Sentient OS product page](https://sentient-os.ai/) describes selected local

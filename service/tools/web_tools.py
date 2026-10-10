@@ -1297,8 +1297,8 @@ _WEATHER_DAYS = ("today", "tomorrow", "the day after tomorrow")
     "need their state ('Dublin,CA' — plain 'Dublin' is Dublin, Ireland). "
     "If you do not know where the user is, ASK them; never guess a city, and "
     "never answer a weather question from memory. The result names the area it "
-    "resolved to — if that is not the place the user meant, say so rather than "
-    "reporting its numbers.",
+    "resolved to. California lookups verify the provider's city, state and "
+    "country before returning numbers; ambiguous city names require clarification.",
     {"type": "object",
      "properties": {
          "location": {"type": "string",
@@ -1311,12 +1311,17 @@ _WEATHER_DAYS = ("today", "tomorrow", "the day after tomorrow")
     category="web_read",
 )
 async def get_weather(location: str, period: str = "") -> str:
+    from service.tools.ca_locations import normalize_weather_location, provider_area_matches
     from service.workflows.compiler import is_temporal_location
     place = (location or "").strip()
     if not place or is_temporal_location(place):
         return ("(no location given — ask the user which city they want the "
                 "weather for; do not guess one)")
-    r = await _yahoo_get(f"https://wttr.in/{quote(place)}?format=j1")
+    try:
+        requested = normalize_weather_location(place)
+    except ValueError as exc:
+        return f"(no unambiguous location — {exc}; do not guess one)"
+    r = await _yahoo_get(f"https://wttr.in/{quote(requested.query)}?format=j1")
     if isinstance(r, str):
         return r.replace("Yahoo Finance", "the weather service")
     if r.status_code >= 400:
@@ -1327,12 +1332,21 @@ async def get_weather(location: str, period: str = "") -> str:
         d = r.json()
         cur = d["current_condition"][0]
         area = d["nearest_area"][0]
+        if not isinstance(cur, dict) or not isinstance(area, dict):
+            raise ValueError("invalid weather observation")
     except Exception:  # noqa: BLE001
         return f"(weather data for {place!r} came back in an unexpected shape)"
 
+    if requested.california_city and (len(d["nearest_area"]) != 1
+            or not provider_area_matches(area, requested.california_city)):
+        return (f"(weather lookup could not verify {requested.query!r}: the provider's "
+                "resolved city/state/country is missing or different; no weather "
+                "numbers are available for the requested place)")
+
     def _first(node, key: str) -> str:
         try:
-            return node[key][0]["value"]
+            value = node[key][0]["value"]
+            return value if isinstance(value, str) else ""
         except Exception:  # noqa: BLE001
             return ""
 
@@ -1346,6 +1360,8 @@ async def get_weather(location: str, period: str = "") -> str:
            f"humidity {cur.get('humidity')}%, "
            f"wind {cur.get('windspeedMiles')} mph"]
     forecast = d.get("weather") or []
+    if not isinstance(forecast, list) or any(not isinstance(day, dict) for day in forecast):
+        return f"(weather data for {place!r} came back in an unexpected shape)"
     if period:
         from datetime import datetime, timedelta
         from service.tools.timeranges import resolve_span, BadPeriod

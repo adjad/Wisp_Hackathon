@@ -458,7 +458,10 @@ def test_tomorrow_forecast_does_not_include_today(monkeypatch):
     from service.tools import web_tools
     from service.tools import timeranges
     response = SimpleNamespace(status_code=200, json=lambda: {
-        "current_condition": [{"temp_F": "99", "temp_C": "37"}], "nearest_area": [{}],
+        "current_condition": [{"temp_F": "99", "temp_C": "37"}],
+        "nearest_area": [{"areaName": [{"value": "Dublin"}],
+                          "region": [{"value": "California"}],
+                          "country": [{"value": "United States"}]}],
         "weather": [{"date": "2026-09-08", "maxtempF": "99"}, {"date": "2026-09-09", "maxtempF": "70"}]})
     monkeypatch.setattr(web_tools, "_yahoo_get", AsyncMock(return_value=response))
     real_resolve = timeranges.resolve_span

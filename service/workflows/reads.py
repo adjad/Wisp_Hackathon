@@ -297,6 +297,16 @@ def compile_read(prompt: str, *, last_user: str = "", last_tools: str = "",
                  last_stock_response: str = ""):
     if deliberate(prompt) is not None:
         return None
+    from service.workflows.workflow20 import mentioned_sources, personal_read
+    read = personal_read(prompt)
+    if read is not None and read.direct_calls:
+        return list(read.direct_calls), ""
+    if read is not None:
+        return None
+    # A one-source shortcut must consume the whole source contract. Preserve
+    # compound reads for routing instead of silently returning only Mail.
+    if len(mentioned_sources(prompt)) > 1:
+        return None
     text = _normalize(prompt).strip(" *_.?!")
     read_prefix = re.match(r"(?:can you |could you |please )?(?:what|show|check|list|compare)\b", text, re.I)
     if _OUTBOUND.search(text) and not _INLINE_EMAIL_SUMMARY.match(text) and not read_prefix:

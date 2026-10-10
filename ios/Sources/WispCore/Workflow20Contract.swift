@@ -24,6 +24,9 @@ public enum JSONValue: Codable, Equatable, Sendable {
     }
     public var object: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
     public var string: String? { if case .string(let value) = self { value } else { nil } }
+    public var array: [JSONValue]? { if case .array(let value) = self { value } else { nil } }
+    public var bool: Bool? { if case .bool(let value) = self { value } else { nil } }
+    public var number: Double? { if case .number(let value) = self { value } else { nil } }
 }
 public enum ContractError: Error, Equatable { case unsupportedVersion, duplicateID, invalidFamily, invalidScenario, invalidCase, oversizedCorpus }
 public struct Workflow20Corpus: Decodable, Sendable {

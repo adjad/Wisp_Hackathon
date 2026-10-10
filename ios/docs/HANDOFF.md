@@ -1,66 +1,64 @@
-# iPhone foundation handoff
+# iPhone semantic continuation handoff
 
-Owner: 01a12778-56ee-74e0-81bb-18b7b906bd3a, sole writer ios/** under Orchestrator ACK.
-Worktree: /Users/adijain/.codex/worktrees/wisp-iphone-port/MOE_Project.
-Branch: codex/wisp-iphone-port. Known base and fetched origin/main:
-ed361c0c3b2bce2bd8daf7242b805e3894572f7a.
+Outcome: a bounded source-record query prototype beyond the original all-unsupported
+foundation. The SwiftUI app and portable CLI execute the same independent engine.
+Calendar/contact/thread/grocery/unread/event and selected overview/priority/knowledge
+queries return evidence; missing/partial/ambiguous data remains visible. Exact
+user-entered action previews have immutable confirmation and zero external effects.
+This does not complete all twenty workflows or qualify live iPhone deployment.
 
-Delivered: standalone compilable iPhone SwiftUI shell, synthetic/demo and selected
-text-import source inspector, stable provenance, explicit source coverage and
-unsupported actions, permission-aware EventKit/Contacts source boundaries,
-disabled on-device FoundationModels integration, shared workflow20 v1 decoder and
-contract-only observation CLI. No shared Mac/Catch source edits.
+Ownership/base: sole ios/** builder 01a12778-56ee-74e0-81bb-18b7b906bd3a under
+WISP_IPHONE_NEWROOT_SEMANTIC_CONTINUATION_ACK_20261010.json.
+Repository: adjad/Wisp_Hackathon. Checkout:
+/Users/adijain/Documents/Codex/2026-10-10/wisp-iphone-hackathon.
+Branch: codex/iphone-workflows. Base:
+d20f834d6d3f7e15a36daf6228c722a088a4c40f.
+Old source worktree/45e0425 evidence stays preserved; no old ancestry is reused.
 
-Files changed: all under ios/: Package.swift, .gitignore, App/*.swift and
-Info.plist, Sources/WispCore/*.swift, Sources/WorkflowContractRunner/main.swift,
-Tests/WispCoreTests/*.swift, WispPhone.xcodeproj/project.pbxproj and shared scheme,
-scripts/generate_project.py, scripts/verify.py, README.md, docs/*.md.
+Changed paths: App/HomeView.swift and PlatformServices.swift; new Semantic*.swift,
+ActionDraft.swift and Workflow20SemanticAdapter.swift; JSONValue accessors in
+Workflow20Contract.swift; CLI main.swift; SemanticTests.swift; generated Xcode
+project; verify.py and audit_claims.py; README and docs. All under ios/**.
+No Mac service, shared fixture/contract, CI or integration paths changed.
 
-Pre-freeze checks: unsigned generic iOS simulator build PASS with Xcode 27.0
-(27A266a), SDK 27.0, arm64 and x86_64; Swift 6.4 offline tests PASS (22 test
-functions, parameterized state/family cases included). First supported synthetic
-flow: overview shows fictional mail, message and calendar excerpts with source
-IDs. No native sources, permissions, models or accounts used.
+Validation: 55 pre-freeze Swift test functions passed; generic unsigned iOS simulator
+build passed for arm64/x86_64 with Xcode 27 / Swift 6.4. A topic-filter failure was
+repaired and covered. Source-value/provenance audit validates canonical claims
+without reference facts. Final exact-SHA logs/results and PR CI status must be
+bound in the external frozen-candidate handoff; pre-freeze logs do not replace them.
 
-Shared contract: SHA256 94ed633be54f5610115c86cb0e2f7f51ee3c8a8e01c3ae8cd83d547575136f61,
-including approval.approved_effects. Read-only fixture hashes:
-- actions.json: 0ebadf9ca89a168f155efa512e9a32b1908a22437ea88a2887742284b5139b1e
-- read_query.json: 680d4258e62e3f88c77c6aeba1dafc8dcb0cc26a8db843e58550bf341cfdbbec
+Evaluation: 597 shared cases are consumed by the actual adapter. Gold family is
+ignored; expect/reference facts are excluded from execution. Canonical field claims
+have values/provenance independently checked. `facts` stays empty because arbitrary
+oracle aliases are unavailable to production. No alias guessing or hardcoded
+corpus answers. The shared grader fails full completion, including unsupported
+platform/actions and richer semantics; source audit/status counts are not accuracy.
+An evaluator bridge belongs to the Mac contract owner, outside the executor.
 
-Shared corpus consumption PASS: 597 observations, all unsupported, zero effects,
-zero facts, no inferred approvals and no inference executed. Independent shared
-Mac grader exits 1 because semantic completion is unsupported: 0 completion
-passes, 597 safe-handling results. This is a truthful product gap, not a benchmark
-pass or model measurement. Grader metadata identifies its own Mac dirty worktree;
-it is not exact-SHA iPhone mechanical evidence.
+Known risks/incomplete: bounded English matching and literal topics, no synthesized
+thread final-state claim, custom-range clarification, conservative weather-region
+metadata, no native inbox/Notes/contacts/calendar integration, no sends/invitations,
+no durable queue/memory/files/traffic/provider actions, no AI/runtime measurements,
+no signed physical-device or UI tests. A discovered action/read privacy-routing
+finding is pending Orchestrator repair-owner ACK before repair/freeze. All action
+effects remain empty. See CAPABILITIES.md for twenty-family limits.
 
-Initial simctl inventory failed under sandbox; escalated retry returned no available
-simulator devices after detecting a CoreSimulator version update. No simulator was
-booted and no physical device was provisioned or installed. AppIntents metadata
-extraction is skipped because the app defines no AppIntents. Device/UI/runtime and
-local inference feasibility remain unmeasured.
+Integration: only the designated integrator may merge after exact-head mechanical,
+required CI and registered independent review/specialist QA. Any repair or main
+reconciliation creates a new candidate. Mac owns tests/workflow20/** and
+docs/workflow20/**; consume them read-only. No same-path writer conflicts known.
+No original-repo changes, main mutation, release, installed-app replacement or
+device provisioning is performed by this builder.
 
-Final freeze procedure: fetch main (done, unchanged at known base), commit and
-nonforce push this ios-only branch, create/attach draft PR, then run
-`python3 ios/scripts/verify.py --expected-sha <candidate> --artifacts
-/private/tmp/wisp-iphone-final-<candidate> --fixtures <shared-cases-directory>`.
-Exact SHA/tree/changed-file list, result logs, PR and CI status will be in the
-external artifact handoff, leaving the frozen source checkout clean.
+User testing: RUN_ON_IPHONE.md contains separate-copy signing/setup instructions
+and a short fictional-data checklist. Notify the user at the reviewed test checkpoint
+and ask only for device model/iOS, test/question and observed error/result. A basic
+Personal Team install needs no live Wisp account or model. Do not collect credentials.
 
-Required before qualified readiness: Orchestrator registers exact SHA and triggers
-independent Release Auditor plus specialist synthetic QA for platform permissions,
-inference boundaries and new build target. No formal audit/QA was dispatched by
-this builder. Existing required PR CI remains required; local foundation checks
-cannot replace it. No main merge, release, app replacement or physical install.
-
-Incomplete: natural-language twenty-family adapter, real inbox/provider access,
-calendar/reminder writes, contacts lookup, live map/weather, drafts/sends/scheduled
-delivery, persistent memory/queue, file organization, share extension, signed device
-validation, permission/UI QA, actual model accuracy/latency and performance.
-See CAPABILITIES.md for all twenty families. No promise of desktop parity.
-
-Coordination: Root reads local handoffs after outbound cross-chat sends were
-automatically rejected with approval policy never. No retries or bypasses after
-Root's instruction. Mac owns tests/workflow20/**, docs/workflow20/** and shared
-runner; consume these read-only. No ownership conflict with Catch or existing
-service/SwiftMac paths. Future semantic changes require new exact-head evidence.
+Pending same-owner repair request also includes account negation/mixed-account
+scope, exclusive source restrictions overridden by family defaults, conflicting
+relative-date modifiers, non-Latin shopping-item dedupe, and explicit weather
+region qualification. The read-only helper identified these before freeze. They
+remain recorded limitations of this pre-review checkpoint; do not treat it as a
+merge-ready or user-device-tested candidate. The Orchestrator must acknowledge
+repair ownership before edits to these findings.

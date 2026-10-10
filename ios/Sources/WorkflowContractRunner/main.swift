@@ -19,7 +19,7 @@ do {
         }
     }
     for input in inputs {
-        var data = try encoder.encode(Workflow20FoundationAdapter().observe(input)); data.append(0x0a)
+        var data = try encoder.encode(Workflow20SemanticAdapter().observe(input)); data.append(0x0a)
         FileHandle.standardOutput.write(data)
     }
 } catch {

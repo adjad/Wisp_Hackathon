@@ -1,33 +1,48 @@
-# iPhone foundation checkpoint
+# iPhone semantic checkpoint
 
-Owner chat: 01a12778-56ee-74e0-81bb-18b7b906bd3a. Sole scope ios/**.
-Worktree: /Users/adijain/.codex/worktrees/wisp-iphone-port/MOE_Project
-Branch: codex/wisp-iphone-port
-Base: ed361c0c3b2bce2bd8daf7242b805e3894572f7a
+Owner: 01a12778-56ee-74e0-81bb-18b7b906bd3a. Scope: ios/** only.
+Checkout: /Users/adijain/Documents/Codex/2026-10-10/wisp-iphone-hackathon
+Branch: codex/iphone-workflows
+Base: d20f834d6d3f7e15a36daf6228c722a088a4c40f (single-root new repository).
+The old foundation commit/evidence remains preserved in its original checkout;
+no old ancestry is merged or published in this branch.
 
-Implemented: standalone SwiftUI app; deterministic synthetic/source-import inspector;
-explicit unsupported/partial/unknown-data states; EventKit/Contacts permission
-boundary source (not connected to UI); disabled on-device FoundationModels adapter
-with exact full-excerpt validation; read-only shared workflow20 v1 schema consumer
-that does not decode expect/reference facts into execution inputs.
+Implemented: shared deterministic planner/source-record engine used by app and
+portable adapter; query UI; canonical source-field claims; contact/thread identity
+ambiguity; local calendar/DST/date filters; bounded fuzzy event lookup; structured
+shopping completion/dedupe/conflict handling; explicit unread state; conservative
+weather location verification; in-memory structured/text import; exact typed
+local action preview and confirmation. Reference oracle and gold family do not
+control execution. No live account, permission, model or effect was invoked.
 
-Current evidence: pre-freeze generic simulator build PASS; 22 Swift test functions PASS.
-Shared consumer decoded 597 cases, all explicitly unsupported with zero effects.
-Shared grade exited 1 (0 semantic completions, 597 safe-handling results).
-Implementation complete for initial foundation; final exact-SHA freeze/gates pending.
-Xcode 27.0 (27A266a), Swift 6.4, iOS simulator SDK 27.0 available.
-`simctl list devices available` initially failed in sandbox; escalated retry detected
-CoreSimulator version update and returned no available devices. No simulator/device
-installation, model run, permission prompt or native data read performed.
+Pre-freeze tests: 55 Swift test functions PASS, including source/oracle mutation,
+source denial, missing metadata, DST overlap, sender/address ambiguity, historical
+thread corrections, unread uncertainty, shopping conflicts, forecast location
+mismatch and immutable preview approval. Unsigned generic simulator build PASS.
+A first test run caught a topic-filter error; regression repairs passed.
 
-Planned validation: `swift test --package-path ios --scratch-path /private/tmp/wisp-iphone-build/core`;
-unsigned generic simulator `xcodebuild -project ios/WispPhone.xcodeproj -scheme WispPhone -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath /private/tmp/wisp-iphone-build/app CODE_SIGNING_ALLOWED=NO build`;
-read portable cases from Mac worktree when published; output contract-only unsupported
-observations and grade independently. Fixture decoding is not semantic accuracy.
+Shared 597-case observations and canonical provenance integrity are captured
+outside the checkout. Source claims are not arbitrary v1 fact aliases; alias
+mapping requires independent evaluator ownership. Shared semantic completion is
+not qualified. A pre-freeze privacy-routing finding is recorded for the
+Orchestrator to acknowledge this builder as sole repair owner before repair.
+Status counts and source-value checks are not benchmark accuracy.
 
-Dependencies: shared CONTRACT.md SHA256 94ed633be54f5610115c86cb0e2f7f51ee3c8a8e01c3ae8cd83d547575136f61;
-Mac cases being written. No writes to their paths. No source overlap with Catch.
-Outbound coordination auto-review rejects status sends (approval policy never);
-Root will pull this checkpoint. Do not retry or bypass rejected sends.
+Final exact-head/CI/review evidence belongs in the external candidate handoff.
+Native integration/build-target/privacy risks trigger independent Release Auditor
+and specialist synthetic QA, registered by the Orchestrator for the same SHA.
+Device instructions are prepared in RUN_ON_IPHONE.md; user testing is not a
+substitute for these gates. No signed build, simulator interaction, physical-device
+run, local AI measurement, release or main merge has occurred.
 
-Shared corpus published: 597 cases, 20 families. Approval includes approved_effects; iOS emits no effects or approvals. Formal release audit/specialist QA still require Orchestrator exact-SHA registration.
+Root pulls /private/tmp/wisp-iphone-newroot-status-20261010.json. This status is a
+mirror/request, never the authoritative ownership registry. No retries of rejected
+outbound coordination sends. Shared Mac fixture/contract paths remain read-only.
+
+Pending same-owner repair request also includes account negation/mixed-account
+scope, exclusive source restrictions overridden by family defaults, conflicting
+relative-date modifiers, non-Latin shopping-item dedupe, and explicit weather
+region qualification. The read-only helper identified these before freeze. They
+remain recorded limitations of this pre-review checkpoint; do not treat it as a
+merge-ready or user-device-tested candidate. The Orchestrator must acknowledge
+repair ownership before edits to these findings.

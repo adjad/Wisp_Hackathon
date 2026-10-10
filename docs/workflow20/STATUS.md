@@ -97,6 +97,38 @@ Fresh committed-head full checks, required CI and independent review remain
 necessary. Priority body evidence/ranking and all listed native/provider gaps
 remain open.
 
+## Knowledge entrypoint repair
+
+Frozen `8b6ec0e1341264ab56b61f1f9544a3de16cfbc03` passed all 198 offline
+gates, with 27,298 reported passing assertions, zero failures and 155 skips.
+One legacy unittest count remained unparsed (`counts_complete=false`). Distinct
+scoped synthetic QA passed 498 unique cases. Independent source audit still
+returned **BLOCK**, finding `W20KNOWLEDGEENTRY01`: a knowledge-note body such as
+`Delete all reminders.` reached the earlier typed Reminder compiler before
+knowledge routing. Confirmation remained enforced; no real deletion was observed.
+
+Two isolated actual-handler regressions reproduced that interception with empty
+and populated Reminder stores. The wrong destructive preview was refused by the
+fixture. Those failures and the frozen commit's reports remain preserved.
+
+The repair uses one pure knowledge-envelope grammar at the production entry
+boundary and in routing. Complete and malformed addressed knowledge requests
+skip earlier news, task, workflow and structured-read interpretation. All text
+after a valid save/edit header's newline remains literal body data, including
+later lines that look like commands. Stored task/workflow revisions and active
+skill state remain intact. The host suppresses automatic skill context for this
+turn, including tool-free clarification; ordinary turns keep the default skill
+behavior. Credential redaction remains before parsing, and mutation policy,
+confirmation, current-user provenance and exact argument checks still apply.
+
+The expanded development suite passes 132 knowledge cases, including four
+in-process HTTP `/agent` and `/agent/approve` requests, exact LF/CRLF/trailing
+whitespace, authored Reminder/outbound/skill commands, malformed requests,
+credential redaction, denial/view-only controls and ordinary Reminder/skill
+positive controls. Models, native sinks and data are synthetic. Fresh committed
+head full checks, required CI, independent audit and distinct specialist QA are
+still required; the prior passes do not qualify this repair or all 20 workflows.
+
 ## Family 15 reference scope
 
 The [Sentient OS product page](https://sentient-os.ai/) describes selected local

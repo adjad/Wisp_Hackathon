@@ -1152,6 +1152,7 @@ async def run_agent(
     *,
     tools: list[str] | None = None,
     active_skill: str = "",
+    allow_skill_context: bool = True,
     max_steps: int = 8,
     # Sized to what agent steps ACTUALLY generate, not to a round number.
     # max_tokens is not free: oMLX's prefill guard admits a request against
@@ -1478,7 +1479,7 @@ async def run_agent(
     # Instructions from installed skills whose triggers match this turn (see
     # service/skills). Empty until the user installs one.
     skills_hint = ""
-    if not public_web_synthesis and not skills_external:
+    if allow_skill_context and not public_web_synthesis and not skills_external:
         try:
             from service.skills import skills_context_block
             last_user = next((m["content"] for m in reversed(messages)

@@ -417,6 +417,372 @@ def test_instruction_label_whitespace_preserves_exact_authored_data(storage):
     assert storage.read()['records'][0]['text'] == 'Bring Blue Folder.'
 
 
+@pytest.fixture
+def knowledge_entrypoint(storage, tmp_path, monkeypatch):
+    """Real /agent handler/loop/policy over disposable stores and fake inference."""
+    import asyncio
+    import socket
+    import subprocess
+    from unittest.mock import AsyncMock
+    from service import main
+    from service.agent import loop
+    from service.assistant.store import AssistantStore
+    from service.memory.store import SessionStore
+    from service.safety import policy, grants
+    from service.tasks import reply_engine
+    from service.workflows import engine, reads
+    from tests.test_direct_dispatch_exec import ScriptedClient
+
+    sessions = SessionStore(tmp_path / 'entry-sessions.db')
+    reminders = AssistantStore(tmp_path / 'entry-reminders.db')
+    monkeypatch.setattr(main, 'store', sessions)
+    monkeypatch.setattr(main, 'assistant_store', reminders)
+    monkeypatch.setattr('service.tools.assistant_tools.assistant_store', reminders)
+    monkeypatch.setattr(main, 'SESSIONS', {})
+    monkeypatch.setattr(main, 'ensure_omlx', AsyncMock())
+    monkeypatch.setattr(main, 'maybe_summarize', AsyncMock())
+    monkeypatch.setattr(main, 'cloud_super_model_enabled', lambda: False)
+    monkeypatch.setattr(main, 'models_config', lambda: {'tool_retrieval': {'provider': 'lexical'}})
+    monkeypatch.setattr(main, '_agent_memory_context_allowed', lambda *a, **kw: False)
+    monkeypatch.setattr(main, 'memory_block', lambda **kw: '')
+    monkeypatch.setattr('service.memory.identity.identity_prompt_block', lambda **kw: '')
+    monkeypatch.setattr(policy, '_FULL_ACCESS', False)
+    monkeypatch.setattr(policy, '_READ_ONLY', False)
+    monkeypatch.setattr(grants, 'check', lambda *a, **kw: None)
+    monkeypatch.setenv('WISP_TYPED_REMINDERS_SHADOW_ONLY', '0')
+    state = SimpleNamespace(sessions=sessions, reminders=reminders, knowledge=storage,
+                            early=[], tools=[], native=[], audits=[], events=[], clients=[],
+                            skill_context=[], skill_selection=[])
+    from service import skills
+    for name in ('skills_context_block', 'selected_skill_block', 'always_skills_block'):
+        original = getattr(skills, name)
+        def skill_context(*args, _original=original, _name=name, **kwargs):
+            state.skill_context.append(_name)
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(skills, name, skill_context)
+    for name in ('select_for_turn', 'turn_skill_names'):
+        original = getattr(skills, name)
+        def skill_selection(*args, _original=original, _name=name, **kwargs):
+            state.skill_selection.append(_name)
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(skills, name, skill_selection)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('No sockets, native processes or actual inference in entrypoint fixtures')
+    monkeypatch.setattr(socket.socket, 'connect', forbidden)
+    monkeypatch.setattr(socket.socket, 'connect_ex', forbidden)
+    monkeypatch.setattr(subprocess, 'Popen', forbidden)
+    async def native(*args, **kwargs):
+        state.native.append((args, kwargs))
+        return {'ok': False, 'error': 'Synthetic native sink unavailable'}
+    monkeypatch.setattr('service.assistant.outbox.request', native)
+
+    original_task = reply_engine.prepare_task_turn_async
+    async def task(*args, **kwargs):
+        state.early.append('task')
+        return await original_task(*args, **kwargs)
+    monkeypatch.setattr(reply_engine, 'prepare_task_turn_async', task)
+    for module, name, label in ((engine, 'prepare_news_selector_guard', 'news'),
+                                (main, 'prepare_turn', 'workflow'),
+                                (reads, 'compile_read', 'read')):
+        original = getattr(module, name)
+        def spy(*args, _original=original, _label=label, **kwargs):
+            state.early.append(_label)
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(module, name, spy)
+    actual_tool = loop.run_tool
+    async def tool(tool, args):
+        state.tools.append((tool.name, dict(args)))
+        return await actual_tool(tool, args)
+    monkeypatch.setattr(loop, 'run_tool', tool)
+    monkeypatch.setattr(loop, 'audit', lambda action, **fields: state.audits.append((action, fields)))
+
+    def run(prompt, script, *, approve=True, sid=None, transport='handler'):
+        client = ScriptedClient(script)
+        state.clients.append(client)
+        monkeypatch.setattr(main, 'client', client, raising=False)
+        sid = sid or sessions.create_session()
+        async def request():
+            if transport == 'asgi':
+                import httpx
+                from service.agent.approver import InteractiveApprover
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                             base_url='http://synthetic.invalid') as http:
+                    class HTTPApprover(InteractiveApprover):
+                        def __init__(self, emit):
+                            async def forward(event):
+                                await emit(event)
+                                if event['type'] == 'confirm':
+                                    allowed = event.get('tool') in {'save_knowledge', 'edit_knowledge', 'delete_knowledge'}
+                                    response = await http.post('/agent/approve', json={
+                                        'session_id': sid, 'request_id': event['request_id'],
+                                        'action_id': event['id'], 'approved': approve and allowed})
+                                    assert response.status_code == 200 and response.json()['ok'] is True
+                            super().__init__(forward)
+                    with monkeypatch.context() as patch:
+                        patch.setattr(main, 'InteractiveApprover', HTTPApprover)
+                        response = await http.post('/agent', json={'prompt': prompt, 'session_id': sid,
+                            'test_mode': False, 'debug': False})
+                        assert response.status_code == 200
+                    events = [json.loads(line.removeprefix('data: ')) for line in response.text.splitlines()
+                              if line.startswith('data: ')]
+                assert not main.SESSIONS
+                return events
+            response = await main.agent({'prompt': prompt, 'session_id': sid,
+                                         'test_mode': False, 'debug': False})
+            events = []
+            async for item in response.body_iterator:
+                event = json.loads(item.removeprefix('data: ').strip())
+                events.append(event)
+                if event['type'] == 'confirm':
+                    # A wrong destructive preview must never be approved by this
+                    # fixture. Real knowledge confirmation remains in the path.
+                    allowed = event.get('tool') in {'save_knowledge', 'edit_knowledge', 'delete_knowledge'}
+                    result = await main.approve({'session_id': sid, 'request_id': event['trace_id'],
+                        'action_id': event['id'], 'approved': approve and allowed})
+                    assert result['ok'] is True
+            assert not main.SESSIONS
+            return events
+        state.events = asyncio.run(asyncio.wait_for(request(), 10))
+        return state.events
+    state.run = run
+    yield state
+    sessions._db.close()
+    reminders._db.close()
+
+
+@pytest.mark.parametrize('nonempty', [False, True])
+def test_actual_entrypoint_saves_deletion_body_without_reminder_intent(knowledge_entrypoint, nonempty):
+    import time
+    from tests.test_direct_dispatch_exec import _tool_call
+    state = knowledge_entrypoint
+    if nonempty:
+        state.reminders.add_manual('Keep this reminder', time.time() + 3600)
+    before = state.reminders.active_between()
+    body = 'Delete all reminders.'
+    prompt = 'Save a knowledge note titled Project:\n' + body
+    events = state.run(prompt, [{'tool_calls': [_tool_call('save_knowledge', {
+        'title': 'Project', 'text': body, 'kind': 'knowledge'}, 'save')]}, {'content': 'Saved.'}])
+    assert not any(event['type'] in {'task_plan', 'workflow', 'error'} for event in events), events
+    assert state.early == [], state.early
+    assert state.native == []
+    assert [name for name, _ in state.tools] == ['save_knowledge']
+    assert state.knowledge.read()['records'][0]['text'] == body
+    assert state.reminders.active_between() == before
+
+
+_AUTHORED_COMMAND_BODIES = (
+    'Delete all reminders.',
+    'Update all reminders to tomorrow.',
+    'Remind me to buy milk tomorrow at 6PM.',
+    'Send Mom a summary of my calendar tomorrow at 6PM.',
+    'Draft an email to Morgan with my unread messages.',
+    'Read my calendar tomorrow.\nand send Mom the result.',
+    '@authored-case\nCancel the interview workflow.\nand send Mom the result.',
+)
+
+
+@pytest.mark.parametrize('operation', ['save', 'edit'])
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
+@pytest.mark.parametrize('body', _AUTHORED_COMMAND_BODIES)
+def test_actual_entrypoint_keeps_all_authored_commands_literal(knowledge_entrypoint, monkeypatch,
+                                                              operation, newline, body):
+    from service import skills
+    from tests.test_direct_dispatch_exec import _tool_call
+    state = knowledge_entrypoint
+    marker = 'SYNTHETIC SKILL BODY MUST NOT BE LOADED'
+    monkeypatch.setattr(skills, '_skills', {'authored-case': skills.Skill(
+        'authored-case', 'synthetic', marker, Path('/synthetic/not-read'),
+        conversation_workflow=True)})
+    body = body.replace('\n', newline) + '  ' + newline
+    title = 'Delete all reminders — Project'
+    if operation == 'save':
+        prompt = 'Save a knowledge note titled ' + title + ':' + newline + body
+        script = [{'tool_calls': [_tool_call('save_knowledge', {
+            'title': title, 'text': body, 'kind': 'knowledge'}, 'save')]}]
+        expected_tools = ['save_knowledge']
+    else:
+        old = save()
+        prompt = 'Update knowledge ' + old['id'] + ' titled ' + title + ':' + newline + body
+        script = [{'tool_calls': [_tool_call('read_knowledge', {'record_id': old['id']}, 'read')]},
+                  {'tool_calls': [_tool_call('edit_knowledge', {'record_id': old['id'],
+                      'expected_revision': old['revision'], 'title': title, 'text': body}, 'edit')]}]
+        expected_tools = ['read_knowledge', 'edit_knowledge']
+    events = state.run(prompt, script + [{'content': 'Knowledge result reviewed.'}])
+    assert not any(e['type'] in {'task_plan', 'workflow', 'error'} for e in events), events
+    assert state.early == [] and state.native == [] and state.skill_selection == []
+    assert state.skill_context == []
+    assert [name for name, _ in state.tools] == expected_tools
+    row, = state.knowledge.read()['records']
+    assert row['title'] == title and row['text'] == body
+    assert row['provenance']['source_id'] == events[0]['trace_id']
+    assert row['provenance']['session_id'] == events[0]['id']
+    assert row['provenance']['quote'] == body
+    assert state.sessions.turns_from(events[0]['id'], 0)[0]['content'] == prompt
+    assert marker not in json.dumps(state.clients[0].calls)
+    confirmations = [e for e in events if e['type'] == 'confirm']
+    assert len(confirmations) == 1 and confirmations[0]['tool'] == expected_tools[-1]
+
+
+@pytest.mark.parametrize('read_only,approved', [(False, False), (True, True)])
+def test_actual_entrypoint_denied_knowledge_body_has_no_effect(knowledge_entrypoint, monkeypatch,
+                                                            read_only, approved):
+    from service.safety import policy
+    from tests.test_direct_dispatch_exec import _tool_call
+    state = knowledge_entrypoint
+    monkeypatch.setattr(policy, '_READ_ONLY', read_only)
+    body = 'Delete all reminders.'
+    events = state.run('Save a knowledge note titled Project:\n' + body, [
+        {'tool_calls': [_tool_call('save_knowledge', {'title': 'Project', 'text': body}, 'save')]}],
+        approve=approved)
+    assert state.knowledge.read()['records'] == [] and state.tools == []
+    assert state.early == [] and state.native == []
+    assert not any(e['type'] in {'task_plan', 'workflow', 'error'} for e in events)
+    confirmations = [e for e in events if e['type'] == 'confirm']
+    assert len(confirmations) == (0 if read_only else 1)
+
+
+@pytest.mark.parametrize('prompt', [
+    'Save a knowledge note titled Project: Delete all reminders.',
+    'Update knowledge invalid titled Project:\nDelete all reminders.',
+    'Read knowledge and delete all reminders.',
+    'Save a knowledge note and send Mom my calendar.',
+    'Save a knowledge note @authored-case and delete all reminders.',
+])
+def test_actual_entrypoint_malformed_knowledge_never_enters_other_compilers(knowledge_entrypoint, prompt):
+    state = knowledge_entrypoint
+    events = state.run(prompt, [{'content': 'Please clarify the complete knowledge instruction.'}])
+    assert state.early == [] and state.native == [] and state.tools == []
+    assert state.skill_selection == [] and state.skill_context == []
+    assert state.knowledge.read()['records'] == []
+    assert not any(e['type'] in {'task_plan', 'workflow', 'confirm', 'error'} for e in events), events
+
+
+def test_actual_entrypoint_preserves_unrelated_task_workflow_and_skill(knowledge_entrypoint, monkeypatch):
+    from service import skills
+    from service.tasks.models import TaskPlan, SlotValue
+    from service.workflows.models import WorkflowPlan
+    from tests.test_direct_dispatch_exec import _tool_call
+    state = knowledge_entrypoint
+    sid = state.sessions.create_session()
+    task = TaskPlan(intent='reminder.create', status='waiting_for_input', revision=4,
+                    subject=SlotValue('Unrelated task'))
+    workflow = WorkflowPlan(sources=['email'], status='waiting_for_channel', revision=7,
+                            original_request='Unrelated summary')
+    state.sessions.save_workflow(sid, task.to_dict())
+    state.sessions.save_workflow(sid, workflow.to_dict())
+    state.sessions.set_active_skill(sid, 'stored-workflow')
+    monkeypatch.setattr(skills, '_skills', {'stored-workflow': skills.Skill(
+        'stored-workflow', 'synthetic', 'STORED SKILL MUST STAY SUSPENDED', Path('/synthetic/not-read'),
+        conversation_workflow=True)})
+    before = [tuple(r) for r in state.sessions._db.execute(
+        'SELECT id,status,state_json,updated_at FROM workflows ORDER BY id')]
+    body = 'Delete all reminders.\nSend Mom my calendar.'
+    events = state.run('Save a knowledge note titled Project:\n' + body, [
+        {'tool_calls': [_tool_call('save_knowledge', {'title': 'Project', 'text': body}, 'save')]}], sid=sid)
+    after = [tuple(r) for r in state.sessions._db.execute(
+        'SELECT id,status,state_json,updated_at FROM workflows ORDER BY id')]
+    assert after == before
+    assert state.sessions.get_session(sid)['active_skill'] == 'stored-workflow'
+    assert state.early == [] and state.skill_selection == [] and state.skill_context == []
+    assert not any(e['type'] in {'task_plan', 'workflow', 'error'} for e in events)
+    assert 'STORED SKILL MUST STAY SUSPENDED' not in json.dumps(state.clients[0].calls)
+
+
+@pytest.mark.parametrize('prompt', ['Delete all reminders.', 'Remind me to buy milk.',
+                                   'Update my reminder to tomorrow.'])
+def test_actual_entrypoint_explicit_reminder_operations_keep_typed_path(knowledge_entrypoint, prompt):
+    state = knowledge_entrypoint
+    events = state.run(prompt, [{'content': 'Synthetic narration.'}], approve=False)
+    assert 'task' in state.early
+    assert any(e['type'] == 'task_plan' for e in events), events
+    assert not any(name.endswith('_knowledge') for name, _ in state.tools)
+    assert state.knowledge.read()['records'] == []
+
+
+@pytest.mark.parametrize('operation', ['save', 'edit'])
+@pytest.mark.parametrize('nonempty', [False, True])
+def test_http_agent_and_approval_keep_knowledge_body_literal(knowledge_entrypoint, operation, nonempty):
+    import time
+    from tests.test_direct_dispatch_exec import _tool_call
+    state = knowledge_entrypoint
+    if nonempty:
+        state.reminders.add_manual('Keep native-independent fixture', time.time() + 3600)
+    before = state.reminders.active_between()
+    body = 'Delete all reminders.\r\nand send Mom my calendar.  \r\n'
+    if operation == 'save':
+        prompt = 'Save a knowledge note titled Project:\r\n' + body
+        script = [{'tool_calls': [_tool_call('save_knowledge', {'title': 'Project', 'text': body}, 'save')]}]
+    else:
+        old = save()
+        prompt = 'Edit knowledge ' + old['id'] + ' titled Project:\r\n' + body
+        script = [{'tool_calls': [_tool_call('read_knowledge', {'record_id': old['id']}, 'read')]},
+                  {'tool_calls': [_tool_call('edit_knowledge', {'record_id': old['id'],
+                      'expected_revision': old['revision'], 'title': 'Project', 'text': body}, 'edit')]}]
+    events = state.run(prompt, script, transport='asgi')
+    assert state.early == [] and state.native == [] and state.skill_context == []
+    assert state.knowledge.read()['records'][0]['text'] == body
+    assert state.reminders.active_between() == before
+    assert len([e for e in events if e['type'] == 'confirm']) == 1
+    assert not any(e['type'] in {'task_plan', 'workflow', 'error'} for e in events), events
+
+
+def test_actual_entrypoint_redacts_credentials_before_literal_envelope(knowledge_entrypoint):
+    from service.main import redact_credentials
+    from tests.test_direct_dispatch_exec import _tool_call
+    state = knowledge_entrypoint
+    synthetic_secret = 'sk-' + 'a' * 40
+    prompt = 'Save a knowledge note titled Project:\nDelete all reminders. ' + synthetic_secret
+    expected, count = redact_credentials(prompt)
+    assert count and synthetic_secret not in expected
+    body = expected.split('\n', 1)[1]
+    events = state.run(prompt, [{'tool_calls': [_tool_call('save_knowledge', {
+        'title': 'Project', 'text': body}, 'save')]}])
+    row, = state.knowledge.read()['records']
+    assert row['text'] == body and row['provenance']['quote'] == body
+    assert state.sessions.turns_from(events[0]['id'], 0)[0]['content'] == expected
+    assert synthetic_secret not in json.dumps([events, row, state.clients[0].calls])
+    assert state.early == [] and state.native == []
+
+
+def test_actual_entrypoint_nonknowledge_skill_keeps_default_context(knowledge_entrypoint, monkeypatch):
+    from service import skills
+    state = knowledge_entrypoint
+    marker = 'SYNTHETIC ORDINARY SKILL CONTEXT'
+    monkeypatch.setattr(skills, '_skills', {'authored-case': skills.Skill(
+        'authored-case', 'synthetic', marker, Path('/synthetic/not-read'),
+        conversation_workflow=True)})
+    events = state.run('@authored-case Help me outline an idea.', [{'content': 'An outline.'}])
+    assert state.skill_selection and 'skills_context_block' in state.skill_context
+    assert marker in json.dumps(state.clients[0].calls)
+    assert state.sessions.get_session(events[0]['id'])['active_skill'] == 'authored-case'
+    assert state.knowledge.read()['records'] == [] and state.native == []
+
+
+def test_actual_entrypoint_knowledge_clarification_suppresses_always_skills(knowledge_entrypoint, monkeypatch):
+    from service import skills
+    state = knowledge_entrypoint
+    marker = 'SYNTHETIC ALWAYS SKILL MUST NOT LEAK'
+    monkeypatch.setattr(skills, '_skills', {'synthetic-always': skills.Skill(
+        'synthetic-always', 'synthetic', marker, Path('/synthetic/not-read'), always=True)})
+    events = state.run('Save a knowledge note and delete all reminders.', [{'content': 'Clarify.'}])
+    assert state.skill_context == [] and state.skill_selection == []
+    assert marker not in json.dumps(state.clients[0].calls)
+    assert not any(e['type'] in {'task_plan', 'workflow', 'confirm', 'error'} for e in events)
+
+
+def test_actual_entrypoint_ordinary_chat_keeps_always_skills(knowledge_entrypoint, monkeypatch):
+    from service import skills
+    state = knowledge_entrypoint
+    marker = 'SYNTHETIC NORMAL ALWAYS SKILL'
+    monkeypatch.setattr(skills, '_skills', {'synthetic-always': skills.Skill(
+        'synthetic-always', 'synthetic', marker, Path('/synthetic/not-read'), always=True)})
+    state.run('Hello', [{'content': 'Hello.'}])
+    assert 'always_skills_block' in state.skill_context
+    assert marker in json.dumps(state.clients[0].calls)
+    assert state.knowledge.read()['records'] == [] and state.native == []
+
+
 
 def _knowledge_loop(monkeypatch, prompt, steps, *, approve=True, read_error=False, after_read=None, read_only=False, unforced_contract=False):
     import asyncio

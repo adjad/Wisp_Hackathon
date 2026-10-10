@@ -525,6 +525,30 @@ async def get_past_events(days: int = 30, query: str | None = None,
             + "\n".join(lines))
 
 
+def _reminder_due_time(when_iso: str) -> tuple[float, str]:
+    """Resolve one reminder instant before either native or local effects.
+
+    Naive values name Mac-local wall times and must identify exactly one
+    instant. An explicit ISO offset already identifies an instant; the native
+    reminder bridge receives its epoch, not Calendar-style local components.
+    """
+    from math import isfinite
+    from service.tasks.temporal import unambiguous_local_time
+
+    when = datetime.fromisoformat(when_iso)
+    if when.tzinfo is None and not unambiguous_local_time(when):
+        raise ValueError("invalid or ambiguous local reminder time")
+    ts = when.timestamp()
+    if not isfinite(ts):
+        raise ValueError("non-finite reminder time")
+    if when.tzinfo is not None:
+        local = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+        label = local.strftime("%a %b %-d at %-I:%M %p %Z%z")
+    else:
+        label = when.strftime("%a %b %-d at %-I:%M %p")
+    return ts, label
+
+
 @register(
     "add_reminder",
     "Create a reminder in Wisp's local commitment store. Wisp will notify the "
@@ -547,10 +571,10 @@ async def get_past_events(days: int = 30, query: str | None = None,
 )
 async def add_reminder(title: str, when_iso: str, kind: str = "reminder") -> str:
     try:
-        when = datetime.fromisoformat(when_iso)
-    except ValueError:
-        return f"(bad when_iso {when_iso!r} — use e.g. 2026-07-13T16:00)"
-    ts = when.timestamp()
+        ts, when_str = _reminder_due_time(when_iso)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return (f"(bad when_iso {when_iso!r} — use a valid, unambiguous local ISO "
+                "time, e.g. 2026-07-13T16:00, or an explicit UTC offset; nothing was added.)")
     if ts < time.time() - 60:
         return f"({when_iso} is in the past — not added)"
     clean_title = title.strip()
@@ -560,7 +584,6 @@ async def add_reminder(title: str, when_iso: str, kind: str = "reminder") -> str
         return "(error: unsupported reminder kind; nothing was added.)"
     from service.assistant.outbox import request as app_request
     from service.assistant.hub import hub
-    when_str = when.strftime("%a %b %-d at %-I:%M %p")
     payload = {"title": clean_title, "due_ts": ts, "commitment_kind": kind}
     if not hub.has_subscribers:
         # Nothing is sent now, but an earlier attempt at this exact reminder

@@ -325,6 +325,41 @@ def _format_forward_agenda(items: list[dict], *, now: float, window_label: str,
             + native_note + review_note + "\n\n" + "\n\n".join(blocks))
 
 
+def _match_schedule_query(rows: list[dict], query: str) -> list[dict]:
+    """Bounded assessment synonyms; ordinary event queries retain literal matching.
+
+    Never choose the first of several assessments. Return all candidates with
+    their original identity/time so the caller can clarify the intended event.
+    """
+    from difflib import SequenceMatcher
+    normalize = lambda value: re.sub(r"[\W_]+", "", value.casefold())
+    words = re.findall(r"[a-z]+", query.casefold())
+    types = {"test", "exam", "examination", "assessment", "midterm", "final", "quiz"}
+    requested = types & set(words)
+    if not requested:
+        return [row for row in rows if normalize(query) in normalize(str(row.get("title") or ""))]
+    ignored = {"when", "what", "time", "day", "is", "are", "my", "the", "next", "upcoming", "a", "an", "of", "for"}
+    subjects = [w for w in words if w not in types | ignored]
+    specific = requested & {"midterm", "final", "quiz"}
+    allowed = specific or (types if "assessment" in requested else types - {"quiz"})
+    results = []
+    for row in rows:
+        title = str(row.get("title") or "")
+        tokens = re.findall(r"[a-z]+", title.casefold())
+        if not allowed & set(tokens):
+            continue
+        # A study session or review is not the assessment itself.
+        if {"practice", "prep", "preparation", "review", "study"} & set(tokens) and not set(subjects) & {"practice", "prep", "preparation", "review", "study"}:
+            continue
+        def matches(subject):
+            return subject in tokens or (len(subject) >= 4 and any(
+                len(token) >= 4 and SequenceMatcher(None, subject, token).ratio() >= .84
+                for token in tokens if token not in types))
+        if all(matches(subject) for subject in subjects):
+            results.append(row)
+    return results
+
+
 @register(
     "get_upcoming",
     "Read the user's upcoming schedule — calendar events, meetings, Canvas "
@@ -339,7 +374,7 @@ def _format_forward_agenda(items: list[dict], *, now: float, window_label: str,
                   "description": "how many days ahead to look (default 7, max 60)"},
          "period": {"type": "string", "description": "Exact calendar range, e.g. tomorrow, this week, this month. Overrides days."},
          "calendar_only": {"type": "boolean", "description": "Only actual calendar events, not preparation reminders."},
-         "query": {"type": "string", "description": "Filter titles within the requested range."},
+         "query": {"type": "string", "description": "Filter titles within the requested range; bounded subject typos and test/exam synonyms are supported. Multiple matches remain distinct; ask which instead of selecting one."},
          "account": {"type": "string",
                      "description": "only include this linked calendar account (only useful when more than one is linked)"},
          "include_holidays": {"type": "boolean",
@@ -404,8 +439,7 @@ async def get_upcoming(days: int = 7, account: str | None = None,
         items = [row for row in items if row.get("source") == "calendar"
                  or "calendar" in (row.get("duplicate_sources") or [])]
     if query:
-        normalize = lambda value: re.sub(r"[\W_]+", "", value.casefold())
-        items = [row for row in items if normalize(query) in normalize(str(row.get("title") or ""))]
+        items = _match_schedule_query(items, query)
     items = _without_holiday_calendars(items, include_holidays=bool(include_holidays))
     unavailable = [s for s in readiness["sources"] if s["state"] == "unavailable"]
     unavailable_ids = {s["id"] for s in unavailable}

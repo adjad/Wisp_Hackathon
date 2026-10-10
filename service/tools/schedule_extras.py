@@ -150,7 +150,7 @@ async def complete_reminder(title: str, expected_id: str = "") -> str:
             "days": {"type": "integer",
                      "description": "How many days ahead to consider. Default 3."},
             "period": {"type": "string", "description":
-                       "One exact local day: today, tomorrow, or YYYY-MM-DD. "
+                       "Exact local range: today, tomorrow, this week, next week, this month, next month, or YYYY-MM-DD. "
                        "Overrides days; returns duration-specific candidate slots."},
             "minutes": {"type": "integer",
                         "description": "Minimum length of gap to report, in minutes. Default 30."},
@@ -261,13 +261,17 @@ async def _find_free_time_for_day(days: int = 3, minutes: int = 30,
     if period:
         import re
         from service.tools.timeranges import resolve_span, BadPeriod
-        if not re.fullmatch(r"today|tomorrow|\d{4}-\d{2}-\d{2}", period.strip(), re.I):
-            return "(error: period must be today, tomorrow, or YYYY-MM-DD.)"
+        if not re.fullmatch(r"today|tomorrow|(?:this|next)\s+(?:week|month)|\d{4}-\d{2}-\d{2}", period.strip(), re.I):
+            return "(error: period must be today, tomorrow, this/next week, this/next month, or YYYY-MM-DD.)"
         try:
-            begin, _, _ = resolve_span(period, now=now)
+            begin, finish, _ = resolve_span(period, now=now)
         except BadPeriod as exc:
             return f"(error: {exc})"
-        target_days = [dt.datetime.fromtimestamp(begin).date()]
+        first = max(dt.datetime.fromtimestamp(begin).date(), today)
+        stop = dt.datetime.fromtimestamp(finish).date()
+        target_days = [first + dt.timedelta(days=offset) for offset in range((stop - first).days)]
+        if not target_days:
+            return "(error: the requested availability range is in the past.)"
     else:
         target_days = [today + dt.timedelta(days=offset) for offset in range(days)]
 
@@ -334,7 +338,8 @@ async def _find_free_time_for_day(days: int = 3, minutes: int = 30,
             out.append(f"  {label}: {spans}")
 
     if not out:
-        scope = target_days[0].strftime("%A, %Y-%m-%d") if period else f"the next {days} day(s)"
+        scope = (target_days[0].strftime("%A, %Y-%m-%d") if len(target_days) == 1
+                 else f"{target_days[0].isoformat()} through {target_days[-1].isoformat()}") if period else f"the next {days} day(s)"
         return (f"No matches: No gaps of {minutes}+ minutes in {scope} "
                 f"between {start_h}:00 and {end_h}:00.")
     note = ("\n(Items without a stored end time are assumed to run an hour.)"

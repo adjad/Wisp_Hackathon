@@ -6960,6 +6960,20 @@ async def route(text: str, *,
     if is_prohibition(text) and any(rx.search(text) for _, rx in _DIRECT_DEVICE_PATTERNS):
         return await _deliberate_decision(
             text, request, "the request prohibits a device action rather than asking for it")
+    from service.workflows.workflow20 import personal_read
+    if (read := personal_read(text)) is not None:
+        private_request = replace(request, provenance=_WebProvenance.PRIVATE,
+                                  current=False, query=None, public_reference=False,
+                                  inherited=False, clarification=None)
+        if read.direct_calls:
+            decision = _verified_private_read(list(read.direct_calls),
+                "complete scoped unread read", text)
+        else:
+            decision = _mk_scoped(list(read.tools), "personal source read", multi=len(read.sources) > 1)
+            decision.required_tool_groups = read.groups
+            decision.tool_argument_bindings.update(read.bindings)
+            decision.forbidden_tools |= frozenset({"web_search", "web_fetch", "http_request"})
+        return _finalize(decision, text, web_request=private_request)
     # Resolve local temporal possessives before the central boundary. This is
     # classification only; no shortcut may execute until completeness is known.
     if request.allowed and not request.explicit and not request.inherited and (

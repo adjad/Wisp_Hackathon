@@ -258,24 +258,29 @@ def _agenda_day_label(when: datetime, today: date) -> str:
 
 
 def _agenda_item(item: dict, *, display_day_start: float | None = None) -> str:
-    when = datetime.fromtimestamp(float(item["when_ts"]))
+    when = datetime.fromtimestamp(float(item["when_ts"]), tz=timezone.utc).astimezone()
     started_before_day = (display_day_start is not None
                           and float(item["when_ts"]) < display_day_start
                           and float(item.get("end_ts") or 0) > display_day_start)
     clock = ("All day" if item.get("all_day") else
-             f"Started {when.strftime('%a %-I:%M %p')}" if started_before_day else
-             when.strftime("%-I:%M %p"))
+             f"Started {when.strftime('%a %-I:%M %p %Z%z')}" if started_before_day else
+             when.strftime("%-I:%M %p %Z%z"))
     location = str(item.get("location") or "").strip()
     suffix = f" @ {location}" if location else ""
     if _is_wisp_only(item):
         suffix += " [Wisp-only; Apple status unverified]"
-    continued = " (continued into today)" if started_before_day else ""
+    continued = ""
+    if started_before_day:
+        display_date = datetime.fromtimestamp(display_day_start).date()
+        label = "today" if display_date == datetime.fromtimestamp(time.time()).date() else display_date.isoformat()
+        continued = f" (continued into {label})"
     return f"- {clock} — {item.get('title') or 'Untitled'}{suffix}{continued}"
 
 
 def _format_forward_agenda(items: list[dict], *, now: float, window_label: str,
                            apple_reminders_checked: bool = True,
-                           display_day_start: float | None = None) -> str:
+                           display_day_start: float | None = None,
+                           title: str | None = None) -> str:
     """Render an agenda for a schedule question, not a storage/debug dump."""
     today = datetime.fromtimestamp(now).date()
     days: dict[date, dict[str, list[dict]]] = {}
@@ -318,7 +323,7 @@ def _format_forward_agenda(items: list[dict], *, now: float, window_label: str,
     has_native = any("reminders" in _schedule_sources(item) for item in items)
     native_note = (" Apple Reminders deletion status is not independently verified."
                    if has_native else "")
-    title = "Schedule" if display_day_start is not None else "Upcoming"
+    title = title or ("Schedule" if display_day_start is not None else "Upcoming")
     return (f"{title} — {window_label} ({len(items)} item(s))\n"
             f"Calendar events: {calendar_count}; Wisp/Apple reminders: {reminder_count}. "
             "[Calendar event] and [Reminder] are shown in separate sections."
@@ -333,7 +338,9 @@ def _match_schedule_query(rows: list[dict], query: str) -> list[dict]:
     """
     from difflib import SequenceMatcher
     normalize = lambda value: re.sub(r"[\W_]+", "", value.casefold())
-    words = re.findall(r"[a-z]+", query.casefold())
+    ordinals = {"one":"1","two":"2","three":"3","four":"4","five":"5","six":"6","seven":"7","eight":"8","nine":"9","ten":"10","eleven":"11","twelve":"12"}
+    tokenize = lambda text: [ordinals.get(w,w) for w in re.findall(r"[a-z]+|[0-9]+",text.casefold())]
+    words = tokenize(query)
     types = {"test", "exam", "examination", "assessment", "midterm", "final", "quiz"}
     requested = types & set(words)
     if not requested:
@@ -345,7 +352,7 @@ def _match_schedule_query(rows: list[dict], query: str) -> list[dict]:
     results = []
     for row in rows:
         title = str(row.get("title") or "")
-        tokens = re.findall(r"[a-z]+", title.casefold())
+        tokens = tokenize(title)
         if not allowed & set(tokens):
             continue
         # A study session or review is not the assessment itself.
@@ -420,18 +427,14 @@ async def get_upcoming(days: int = 7, account: str | None = None,
         # from this moment, not a historical month-to-date dump. Preserve the
         # period's end/boundary semantics while removing elapsed entries.
         forward_start = max(start, now)
-        if today_period:
-            # A Today view is a day-overlap query: all-day and already-started
-            # Calendar events still belong to today. Other sources remain
-            # forward-only, matching the existing reminder semantics.
-            calendar_rows = assistant_store.calendar_events_overlapping(start, end)
-            rows = [row for row in assistant_store.active_between(forward_start, end)
-                    if row.get("source") != "calendar"
-                    and forward_start <= float(row.get("when_ts") or 0) < end]
-            rows = calendar_rows + rows
-        else:
-            rows = [row for row in assistant_store.active_between(forward_start, end)
-                    if forward_start <= float(row.get("when_ts") or 0) < end]
+        # Calendar appointments can begin before a requested range and still
+        # occupy it. Today includes the entire day; other explicit periods
+        # retain ongoing and future appointments without elapsed history.
+        calendar_rows = assistant_store.calendar_events_overlapping(
+            start if today_period else forward_start, end)
+        rows = [row for row in assistant_store.active_between(forward_start, end)
+                if forward_start <= float(row.get("when_ts") or 0) < end]
+        rows = calendar_rows + rows
     else:
         rows = assistant_store.upcoming(now=now, days=days)
     items = _filter_account(rows, account)
@@ -459,7 +462,7 @@ async def get_upcoming(days: int = 7, account: str | None = None,
     items = _collapse_schedule_rows(
         [item for item in items
          if float(item.get("when_ts") or 0) >= now
-         or (today_period and item.get("source") == "calendar")])
+         or (period and item.get("source") == "calendar")])
     if not items:
         if notice or reminder_note:
             return (notice + "No scheduled items were found in the sources that could be checked."
@@ -468,7 +471,8 @@ async def get_upcoming(days: int = 7, account: str | None = None,
     return notice + _format_forward_agenda(
         items, now=now, window_label=window_label,
         apple_reminders_checked="reminders" not in withheld,
-        display_day_start=today_start if today_period else None) + reminder_note
+        title="Schedule" if today_period else "Upcoming",
+        display_day_start=max(start, today_start) if period else None) + reminder_note
 
 
 @register(

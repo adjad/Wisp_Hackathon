@@ -131,8 +131,11 @@ class FakeHub:
 
 
 @pytest.fixture
-def store(tmp_path):
+def store(tmp_path, monkeypatch):
     from service.assistant.store import AssistantStore
+    # Runtime and durable expiry must share the synthetic clock. Otherwise
+    # these fixed-date events expire against the CI host's real wall time.
+    monkeypatch.setattr("service.assistant.store.time.time", lambda: NOW)
     return AssistantStore(tmp_path / "assistant.db")
 
 

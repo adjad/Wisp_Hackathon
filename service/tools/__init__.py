@@ -12,6 +12,7 @@ import service.tools.recent_tools  # noqa: F401  (registers the cross-source rec
 import service.tools.browser_history_tools  # noqa: F401  (registers the browser history search tool)
 import service.tools.web_tools  # noqa: F401    (registers the web_fetch tool)
 import service.tools.memory_tools  # noqa: F401   (registers remember/recall/forget)
+import service.tools.knowledge_tools  # noqa: F401  (explicit saved snapshots/style/followup evidence)
 import service.tools.action_tools  # noqa: F401   (registers send_email/send_message/http_request)
 import service.tools.tool_authoring  # noqa: F401 (registers draft_tool/create_tool)
 # --- Capability Atlas, Phase 1 (T1) ---

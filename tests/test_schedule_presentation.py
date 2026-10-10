@@ -239,8 +239,8 @@ def test_month_range_keeps_future_month_items_and_separates_sources(monkeypatch)
 
     assert "September event" in result and "September reminder" in result
     assert "October event" not in result
-    assert "Calendar events\n  - 9:00 AM — September event @ Campus" in result
-    assert "Reminders\n  - 5:00 PM — September reminder" in result
+    assert ("Calendar events\n  - " + datetime.fromtimestamp(rows[0]['when_ts']).astimezone().strftime('%-I:%M %p %Z%z') + " — September event @ Campus") in result
+    assert ("Reminders\n  - " + datetime.fromtimestamp(rows[1]['when_ts']).astimezone().strftime('%-I:%M %p %Z%z') + " — September reminder") in result
 
 
 def test_fresh_empty_calendar_is_a_genuine_empty_state(monkeypatch):

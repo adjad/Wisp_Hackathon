@@ -192,3 +192,176 @@ def test_unread_options_are_registered_for_model_selection():
         properties = REGISTRY[name].parameters["properties"]
         assert properties["unread"]["type"] == "boolean"
         assert properties["conversation"]["type"] == "string"
+
+
+@pytest.fixture
+def chat_summary(monkeypatch):
+    """Actual registry/summary code with deterministic topic selection only."""
+    import socket
+    import subprocess
+    from service import debug_capture
+    from service.tools.registry import run_tool
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Chat coverage tests must not access network/native effects")
+
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(socket.socket, "connect_ex", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    calls, diagnostics, inference = [], [], []
+
+    class Client:
+        async def chat(self, _model, request, **_kwargs):
+            inference.append(request)
+            candidates = json.loads(request[-1]["content"])
+            topics = {key: values[:1] for key, values in candidates.items()}
+            return {"choices": [{"finish_reason": "stop", "message": {
+                "content": json.dumps(topics)}}]}
+
+    monkeypatch.setattr(M, "_c", lambda: Client())
+    monkeypatch.setattr(debug_capture, "record", lambda *args, **kw: diagnostics.append((args, kw)))
+    original = M._summarize
+
+    async def summarize(rows, label):
+        calls.append((list(rows), label))
+        return await original(rows, label)
+
+    monkeypatch.setattr(M, "_summarize", summarize)
+
+    def dispatch(**args):
+        assert REGISTRY["summarize_messages"].func is M.summarize_messages
+        return run(run_tool(REGISTRY["summarize_messages"], args))
+
+    return dispatch, calls, diagnostics, inference
+
+
+def chat_rows(n, *, chat=1, context="Trisha Jain", day=12):
+    return [f"V2 | {stamp(day) + i} | R | chat:{chat} | {context} | "
+            f"Trisha Jain: Review project document {i} by Tuesday."
+            for i in range(n)]
+
+
+@pytest.mark.parametrize("total,args,shown", [(31, {}, 30), (301, {"count": 999}, 300),
+                                             (3, {"count": 1}, 1)])
+def test_named_chat_registry_discloses_display_limit_before_digest_cap(
+        monkeypatch, chat_summary, total, args, shown):
+    from service.tools import message_digest
+    dispatch, calls, _diagnostics, _inference = chat_summary
+    monkeypatch.setattr(M, "_lines", "\n".join(reversed(chat_rows(total))))
+    monkeypatch.setattr(message_digest, "MAX_OUTPUT_CHARS", 240)
+    result = dispatch(conversation="Trisha Jain", **args)
+    assert f"{total} cached messages matched" in result
+    assert f"{total} eligible after" in result
+    assert f"{shown} included in the digest input" in result
+    assert f"{total - shown} older eligible messages omitted" in result
+    assert result.startswith("Summary input coverage:")
+    assert "not every included message" in result
+    assert len(calls[0][0]) == shown
+    assert [r[0] for r in calls[0][0]] == [stamp() + i for i in range(total - shown, total)]
+    assert "cache freshness and complete chat history are unverified" in result
+
+
+def test_named_chat_helper_default_stays_one_hundred(monkeypatch, chat_summary):
+    _dispatch, calls, _diagnostics, _inference = chat_summary
+    monkeypatch.setattr(M, "_lines", "\n".join(chat_rows(101)))
+    result = run(M.summarize_messages_for_conversation("Trisha Jain"))
+    assert len(calls[0][0]) == 100
+    assert "1 older eligible messages omitted" in result
+
+
+@pytest.mark.parametrize("scope", [{"day": "2026-10-12"},
+    {"period": "2026-10-12", "day": "2026-10-11"}])
+def test_named_chat_coverage_counts_only_selected_identity_and_date(monkeypatch, chat_summary, scope):
+    dispatch, calls, _diagnostics, _inference = chat_summary
+    monkeypatch.setattr(M, "_lines", "\n".join(chat_rows(3) + chat_rows(5, day=11)
+                                             + chat_rows(7, chat=2, context="Other chat")))
+    result = dispatch(conversation="Trisha Jain", count=2, **scope)
+    assert "3 cached messages matched" in result and "3 eligible after" in result
+    assert "2 included" in result and "1 older eligible messages omitted" in result
+    assert [r[0] for r in calls[0][0]] == [stamp() + 1, stamp() + 2]
+    assert all(r[1] == "Trisha Jain" for r in calls[0][0])
+
+
+def test_named_chat_counts_existing_filters_and_preserves_eligible_chronology(monkeypatch, chat_summary):
+    dispatch, calls, _diagnostics, _inference = chat_summary
+    monkeypatch.setattr(M, "_lines", "\n".join([
+        row("Trisha Jain: Bring the projector to Room 204.", hour=8),
+        row("Trisha Jain: Correction: Room 305, by 1 PM Tuesday.", hour=9),
+        row("Trisha Jain: Correction: Room 305, by 1 PM Tuesday.", hour=10),
+        row("Trisha Jain: Your verification code is 123456.", hour=11),
+    ]))
+    result = dispatch(conversation="Trisha Jain")
+    assert "4 cached messages matched" in result and "2 eligible after" in result
+    assert "2 included" in result and "2 messages excluded by summary filters" in result
+    assert [r[2] for r in calls[0][0]] == [
+        "Trisha Jain: Bring the projector to Room 204.",
+        "Trisha Jain: Correction: Room 305, by 1 PM Tuesday."]
+    assert "123456" not in result
+
+
+def test_named_chat_all_filtered_differs_from_missing_identity(monkeypatch, chat_summary):
+    dispatch, calls, _diagnostics, inference = chat_summary
+    monkeypatch.setattr(M, "_lines", row("Bank: Your verification code is 123456.", context="Bank"))
+    result = dispatch(conversation="Bank")
+    assert "1 cached messages matched" in result and "0 eligible after" in result
+    assert "all excluded by the existing summary filters" in result
+    assert "does not establish that the chat or its history is empty" in result
+    missing = dispatch(conversation="Zebedee")
+    assert "No conversation matched" in missing and "Summary input coverage" not in missing
+    assert not calls and not inference
+    assert "123456" not in result + missing
+
+
+def test_named_chat_empty_date_scope_is_not_missing_chat(monkeypatch, chat_summary):
+    dispatch, calls, _diagnostics, inference = chat_summary
+    result = dispatch(conversation="Trisha Jain", day="2026-10-11")
+    assert "0 cached messages matched" in result
+    assert "No cached messages matched this chat/date scope" in result
+    assert "No conversation matched" not in result
+    assert "older or unsynced messages may be missing" in result
+    assert not calls and not inference
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_named_chat_discloses_legacy_or_partial_native_history(monkeypatch, chat_summary, partial):
+    dispatch, _calls, _diagnostics, _inference = chat_summary
+    if partial:
+        coverage = {"version": 1, "kind": "coverage", "attempted": 4, "emitted": 0,
+                    "skipped": 4, "truncated": 0, "limit": 2000, "byte_limit": 4000000,
+                    "window_days": 365, "row_limit": 20000, "reached_row_limit": False}
+        monkeypatch.setattr(M, "_lines", "V3 | " + json.dumps(coverage) + "\n" + M._lines)
+    result = dispatch(conversation="Trisha Jain")
+    assert ("Messages scan coverage is partial" if partial else
+            "Native scan coverage is unknown for this legacy feed") in result
+    assert "Only the available bounded cache was searched" in result
+    assert "complete chat history are unverified" in result
+
+
+def test_named_chat_preserves_privacy_in_digest_input_diagnostics_and_fake_inference(monkeypatch, chat_summary):
+    dispatch, calls, diagnostics, inference = chat_summary
+    monkeypatch.setattr(M, "_lines", row(
+        "Trisha Jain: Review the project report by Tuesday. Your verification code is 123456."))
+    result = dispatch(conversation="Trisha Jain")
+    assert "1 eligible after" in result and "1 included" in result
+    assert "123456" not in result + repr(calls) + repr(diagnostics) + repr(inference)
+    assert "review the original request with a stated deadline" in calls[0][0][0][2]
+    assert "private details omitted" in calls[0][0][0][2]
+
+
+def test_named_chat_ambiguity_never_reads_one_candidate(monkeypatch, chat_summary):
+    dispatch, calls, _diagnostics, inference = chat_summary
+    monkeypatch.setattr(M, "_lines", "\n".join([
+        row("Alex: First private text.", chat=7, context="Alex"),
+        row("Alex: Second private text.", chat=8, context="Alex")]))
+    result = dispatch(conversation="Alex")
+    assert "More than one conversation" in result
+    assert "private text" not in result and not calls and not inference
+
+
+def test_named_chat_legacy_missing_identity_still_requires_refresh(monkeypatch, chat_summary):
+    dispatch, calls, _diagnostics, inference = chat_summary
+    monkeypatch.setattr(M, "_lines", f"{stamp()} | Trisha Jain | Trisha Jain: Private legacy content.")
+    result = dispatch(conversation="Trisha Jain")
+    assert "refreshing conversation identities" in result
+    assert "Private legacy content" not in result
+    assert "Summary input coverage" not in result and not calls and not inference

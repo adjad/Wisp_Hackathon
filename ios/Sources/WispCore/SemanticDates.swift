@@ -16,6 +16,30 @@ public enum SemanticDates {
         calendar.firstWeekday = 2; calendar.minimumDaysInFirstWeek = 4
         return calendar
     }
+    /// Bounded grammar rejects conflicting/unsupported ranges before source reads.
+    public static func clarification(_ question: String) -> String? {
+        let text = SemanticText.normalized(question), words = Set(SemanticText.words(text))
+        let isoCount = question.matches(of: /\b\d{4}-\d{2}-\d{2}\b/).count
+        let weekdays = words.intersection(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])
+        if isoCount > 1 || weekdays.count > 1 { return "Please use one date, this week, next week or this month. Custom date ranges are not supported yet." }
+        if isoCount == 1 { return nil } // One explicit ISO date overrides relative words.
+        let dayGroups = [["today"], ["tomorrow", "tmrow", "tmrw", "tommorow", "tomorow"], ["yesterday"]]
+        let relativeDays = dayGroups.filter { !$0.allSatisfy { !words.contains($0) } }.count
+        func phrase(_ value: String) -> Bool { (" " + text + " ").contains(" " + value + " ") }
+        let scopes = ["this week", "next week", "this month", "next month"].filter(phrase)
+        if relativeDays > 1 || scopes.count > 1 || (relativeDays > 0 && !scopes.isEmpty) ||
+            (!weekdays.isEmpty && (relativeDays > 0 || !scopes.isEmpty || ["next", "last", "this"].contains(where: words.contains))) {
+            return "Please choose one full day or one week/month scope. Conflicting or modified weekday expressions need clarification."
+        }
+        if phrase("last week") || phrase("last month") || phrase("next year") || phrase("last year") || words.contains("weekend") ||
+            question.range(of: #"\bin\s+\d+\s+(days?|weeks?|months?)\b"#, options: [.regularExpression, .caseInsensitive]) != nil {
+            return "Please use an ISO date, today, tomorrow, yesterday, this/next week or this/next month."
+        }
+        if question.range(of: #"\b(on|in|for)\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b|\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d"#, options: [.regularExpression, .caseInsensitive]) != nil {
+            return "Please enter the date as YYYY-MM-DD."
+        }
+        return nil
+    }
     public static func range(question: String, clock: Date, timezone: TimeZone, defaultToday: Bool = false) -> DateInterval? {
         let text = SemanticText.normalized(question)
         let calendar = calendar(timezone)
@@ -60,7 +84,11 @@ public enum SemanticText {
         text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
             .replacingOccurrences(of: "[’']", with: "", options: .regularExpression)
             .replacingOccurrences(of: "[^a-z0-9@.+]+", with: " ", options: .regularExpression)
-            .split(separator: " ").joined(separator: " ")
+            .split(separator: " ").map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".")) }.filter { !$0.isEmpty }.joined(separator: " ")
+    }
+    public static func identity(_ text: String) -> String {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
     public static func words(_ text: String) -> [String] { normalized(text).split(separator: " ").map(String.init) }
     public static func distance(_ left: String, _ right: String) -> Int {

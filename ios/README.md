@@ -37,12 +37,15 @@ Ambiguous contacts/threads/events ask for details. Unread state must be explicit
 Shopping lists use structured open/checked metadata, deduplicate names and disclose
 quantity conflicts. Date filters use source timezone, half-open overlap and DST;
 today/tomorrow/yesterday, weekdays, this/next week/month and one ISO date are
-supported. Custom date ranges clarify rather than silently narrowing. Priority
+supported. Modified weekdays and conflicting/custom ranges clarify rather than
+silently narrowing. Unknown dates are excluded from date-scoped queries. Priority
 views select explicit requests and due dates without estimating effort.
 
 Plain-text paste/import has no inferred sender, dates or unread state. Structured
 JSON carries explicit metadata; see [import-example.json](docs/import-example.json).
-Both replace the current workspace, stay in memory and are capped at 64 KiB.
+Explicit source mentions restrict reads; mixed/excluded accounts and ambiguous
+source restrictions clarify before reading. Follow-ups must restate source/account
+scope when identity reuse could broaden it. Both imports replace the current workspace, stay in memory and are capped at 64 KiB.
 There is no account sync, persistence or share extension. Source text is data and
 cannot invoke an action. Reset discards imported records.
 
@@ -84,10 +87,12 @@ canonical source-field claims under `metrics.source_claims`, with zero effects,
 approvals and inference. The old foundation adapter remains for plumbing tests.
 
 Shared v1 grading requires arbitrary oracle fact aliases that are absent from
-production records. They are not fabricated. `facts` remains empty pending an
-independent evaluator bridge. Status counts, route agreement and the separate
+production records. They are not fabricated. `facts` remains empty in runtime output. The Mac-owned
+independent evaluator can map strictly equivalent whole JSON values and exact
+provenance from canonical claims, after validating them against actual records. Status counts, route agreement and the separate
 source-value/provenance audit are **not semantic benchmark passes**. The shared
-grader's completion result must remain visible, including failures. No model
+grader's completion result must remain visible, including failures. Its strict
+structured assertions do not establish arbitrary free-form answer quality. No model
 accuracy, latency or physical-device performance has been measured.
 
 ## Optional local model boundary

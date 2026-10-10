@@ -8,16 +8,14 @@ public struct SemanticEngine: Sendable {
             return SemanticResult(status: .clarify, answer: "Which source, person, topic or event should I look up?", clarificationFields: ["target"])
         }
         let family = plan.family
+        if let message = plan.clarificationMessage {
+            return SemanticResult(family: family, status: .clarify, answer: message, clarificationFields: plan.clarificationFields)
+        }
+        if let message = SemanticDates.clarification(plan.question) {
+            return SemanticResult(family: family, status: .clarify, answer: message, clarificationFields: ["date_range"])
+        }
         if plan.question.range(of: #"\b\d{4}-\d{2}-\d{2}\b"#, options: .regularExpression) != nil && plan.range == nil {
             return SemanticResult(family: family, status: .clarify, answer: "Please provide a valid calendar date.", clarificationFields: ["date"])
-        }
-        let isoCount = plan.question.matches(of: /\b\d{4}-\d{2}-\d{2}\b/).count
-        let weekdayCount = Set(SemanticText.words(plan.question)).intersection(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]).count
-        if isoCount > 1 || weekdayCount > 1 {
-            return SemanticResult(family: family, status: .clarify, answer: "Please use one date, this week, next week or this month. Custom date ranges are not supported yet.", clarificationFields: ["date_range"])
-        }
-        if plan.question.range(of: #"\b(on|in|for)\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b|\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d"#, options: [.regularExpression, .caseInsensitive]) != nil {
-            return SemanticResult(family: family, status: .clarify, answer: "Please enter the date as YYYY-MM-DD.", clarificationFields: ["date"])
         }
         if [.create,.communication,.availability,.meeting].contains(family) { return preview(plan, workspace: workspace) }
         if [.trip,.unsubscribe,.files,.pending].contains(family) {
@@ -41,7 +39,7 @@ public struct SemanticEngine: Sendable {
             }
         }
         if result.reads.isEmpty { result.status = .unsupported; return result }
-        if [.contact,.thread,.unread].contains(family) {
+        if [.contact,.thread,.unread,.overview,.priorities].contains(family) {
             let selection = selectIdentity(records, plan: plan, turns: turns)
             if !selection.ambiguities.isEmpty {
                 result.status = .clarify; result.answer = "Which \(selection.field) do you mean: \(selection.ambiguities.joined(separator: ", "))?"
@@ -51,6 +49,13 @@ public struct SemanticEngine: Sendable {
                 result.status = .clarify; result.answer = "Which contact do you mean?"; result.clarificationFields = ["contact"]; return result
             }
             if let selected = selection.selected { records = selected }
+            else if [.overview, .priorities, .unread].contains(family) {
+                let generic = Set(["summarize", "summary", "overview", "recap", "read", "unread", "show", "give", "me", "my", "what", "which", "is", "are", "the", "a", "an", "of", "from", "in", "on", "at", "for", "and", "only", "please", "i", "all", "email", "emails", "mail", "inbox", "messages", "texts", "message", "calendar", "notes", "reminders", "memory", "knowledge", "work", "personal", "school", "priority", "priorities", "action", "item", "items", "needs", "need", "attention", "focus", "today", "tomorrow", "yesterday", "this", "next", "week", "month", "without", "skip", "no", "should", "to", "do", "tackle", "catch", "up", "not", "have", "havent", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])
+                let unresolved = SemanticText.words(plan.question).filter { !generic.contains($0) && !$0.allSatisfy(\.isNumber) }
+                if !unresolved.isEmpty {
+                    result.status = .clarify; result.answer = "Please identify the contact, thread or topic and source explicitly. The requested filter could not be resolved."; result.clarificationFields = ["target"]; return result
+                }
+            }
             else if family == .thread {
                 result.status = .clarify; result.answer = "Which thread or group should I summarize?"; result.clarificationFields = ["thread"]; return result
             }
@@ -65,17 +70,17 @@ public struct SemanticEngine: Sendable {
         if family == .groceries { return groceries(records, plan: plan, result: result, incomplete: incomplete) }
         if family == .weather { return weather(records, plan: plan, result: result, workspace: workspace, incomplete: incomplete) }
         if let range = plan.range {
-            if records.contains(where: { $0.source == .calendar && $0.date("start") == nil }) {
-                result.limitations.append("Some calendar records lack valid start dates; excluded from the date filter."); incomplete = true
+            if records.contains(where: { record in
+                if record.source == .calendar { return record.date("start") == nil }
+                if record.source == .reminders { return record.date("due") == nil }
+                return record.timestamp == nil
+            }) {
+                result.limitations.append("Some records lack valid timestamps or required calendar/reminder dates; excluded from the date filter."); incomplete = true
             }
             records = records.filter { record in
                 if record.source == .calendar { return SemanticDates.overlaps(record, range) }
-                if record.source == .reminders, let due = record.date("due") { return due >= range.start && due < range.end }
-                if let date = record.timestamp { return date >= range.start && date < range.end }
-                return true // Unknown import dates remain explicitly unfiltered.
-            }
-            if records.contains(where: { $0.source != .calendar && $0.timestamp == nil && $0.date("due") == nil }) {
-                result.limitations.append("Some records lack timestamps; their dates could not be filtered."); incomplete = true
+                if record.source == .reminders { return record.date("due").map { $0 >= range.start && $0 < range.end } ?? false }
+                return record.timestamp.map { $0 >= range.start && $0 < range.end } ?? false
             }
         }
         if family == .priorities {
@@ -124,7 +129,7 @@ public struct SemanticEngine: Sendable {
     }
     private func selectIdentity(_ records: [SemanticRecord], plan: SemanticPlan, turns: [String]) -> IdentitySelection {
         let question = plan.question
-        let groupMode = plan.family == .thread || ["group", "chat", "family", "conversation"].contains { SemanticText.normalized(question).contains($0) }
+        let groupMode = [.thread,.unread,.overview,.priorities].contains(plan.family) || ["group", "chat", "family", "conversation"].contains { SemanticText.normalized(question).contains($0) }
         if groupMode {
             let groups = Dictionary(grouping: records, by: { "\($0.source.rawValue)/\($0.string("account"))/\($0.threadID)" })
             var matched: [(String, [SemanticRecord])] = []
@@ -146,7 +151,7 @@ public struct SemanticEngine: Sendable {
             return display.contains("@") ? [display, display.components(separatedBy: "@")[0].replacingOccurrences(of: ".", with: " ")] : [display, sender]
         }
         func candidates(_ text: String) -> [String] {
-            let query = SemanticText.words(text)
+            let query = SemanticText.words(text).filter { !["work", "personal", "school", "email", "emails", "mail", "inbox", "messages", "calendar", "notes", "reminders", "unread", "today", "tomorrow", "yesterday", "this", "week", "month"].contains($0) }
             return identities.filter { sender in candidateNames(sender).contains { name in
                 SemanticText.words(name).contains { word in word.count >= 3 && query.contains { SemanticText.matches($0, word) } }
             } }.sorted()
@@ -233,8 +238,10 @@ public struct SemanticEngine: Sendable {
             guard let items = record.fields["items"]?.array else { continue }
             let open = items.filter { $0.object?["completed"]?.bool == false }
             for item in open {
-                guard let fields = item.object, let name = fields["name"]?.string else { continue }
-                let key = SemanticText.normalized(name)
+                guard let fields = item.object, let name = fields["name"]?.string, !SemanticText.identity(name).isEmpty else {
+                    unknown = true; result.limitations.append("\(record.title): an open item lacks a valid name; excluded."); continue
+                }
+                let key = SemanticText.identity(name)
                 let quantity = fields["quantity"]?.string ?? ""
                 if !quantity.isEmpty { quantities[key, default: []].insert(quantity) }
                 let label = name + (quantity.isEmpty ? "" : " (\(quantity))")
@@ -266,6 +273,17 @@ public struct SemanticEngine: Sendable {
         guard SemanticText.normalized(record.string("requested_city")) == SemanticText.normalized(record.string("resolved_city")) else {
             result.status = .notCompleted; result.answer = ""; result.limitations.append("Weather provider resolved a different city; forecast excluded."); return result
         }
+        let stop = Set(["weather", "forecast", "rain", "raining", "temperature", "high", "low", "will", "it", "in", "for", "the", "a", "an", "be", "is", "whats", "what", "how", "does", "do", "please", "show", "me", "like", "today", "tomorrow", "yesterday", "this", "next", "week", "month", "on", "at", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "and", "of", "get", "give"])
+        let queryWords = SemanticText.words(plan.question)
+        let knownLocation = Set(["requested_city", "resolved_city", "region", "region_code", "resolved_region", "country", "country_code", "resolved_country"].flatMap { SemanticText.words(record.string($0)) })
+        let qualifier = queryWords.filter { !stop.contains($0) && !$0.allSatisfy(\.isNumber) }
+        guard !qualifier.isEmpty, qualifier.allSatisfy(knownLocation.contains) else {
+            result.status = .clarify; result.answer = "Please confirm the exact city, region and country. The requested location qualifiers could not be verified."; result.clarificationFields = ["location"]; return result
+        }
+        if let requestedCountry = record.fields["requested_country"]?.string, let resolvedCountry = record.fields["resolved_country"]?.string,
+           SemanticText.normalized(requestedCountry) != SemanticText.normalized(resolvedCountry) {
+            result.status = .notCompleted; result.answer = ""; result.limitations.append("Weather provider resolved a different country; forecast excluded."); return result
+        }
         if let requestedRegion = record.fields["requested_region"]?.string, let resolvedRegion = record.fields["resolved_region"]?.string,
            SemanticText.normalized(requestedRegion) != SemanticText.normalized(resolvedRegion) {
             result.status = .notCompleted; result.answer = ""; result.limitations.append("Weather provider resolved a different region; forecast excluded."); return result
@@ -285,15 +303,26 @@ public struct SemanticEngine: Sendable {
         }
         // Region comparison requires provider-supplied canonical metadata; no guessed state-name aliases.
         let canonicalRegion = record.fields["resolved_region"]?.string ?? record.fields["region_code"]?.string
-        if let forecastRegion = fields["state"]?.string {
-            guard let canonicalRegion, SemanticText.normalized(forecastRegion) == SemanticText.normalized(canonicalRegion) else {
-                result.status = .notCompleted; result.answer = ""; result.limitations.append("Forecast region could not be verified against canonical location metadata; excluded."); return result
+        guard let forecastRegion = fields["state"]?.string, let canonicalRegion, !canonicalRegion.isEmpty,
+              SemanticText.normalized(forecastRegion) == SemanticText.normalized(canonicalRegion) else {
+            result.status = .notCompleted; result.answer = ""; result.limitations.append("Forecast region could not be verified against canonical location metadata; excluded."); return result
+        }
+        let country = record.fields["resolved_country"]?.string ?? record.fields["country"]?.string
+        let countryRequested = ["country", "country_code", "resolved_country"].flatMap { SemanticText.words(record.string($0)) }.contains { queryWords.contains($0) }
+        if fields["country"] != nil || countryRequested {
+            guard let forecastCountry = fields["country"]?.string, let country,
+                  SemanticText.normalized(forecastCountry) == SemanticText.normalized(country) else {
+                result.status = .notCompleted; result.answer = ""; result.limitations.append("Forecast country could not be verified; excluded."); return result
             }
         }
         result.claims = [.init(record: record, path: "/forecast/\(index)", value: forecast[index])]
         let high = fields["high_f"]?.number.map { String(format: "%.0f", $0) } ?? "unknown"
         let low = fields["low_f"]?.number.map { String(format: "%.0f", $0) } ?? "unknown"
         result.answer = "\(record.string("resolved_city")), \(record.string("region")) — \(day): high \(high)°F, low \(low)°F [\(record.id)]."
+        if queryWords.contains("rain") || queryWords.contains("raining") {
+            if let chance = fields["rain_percent"]?.number, (0...100).contains(chance) { result.answer += " Rain chance: \(String(format: "%.0f", chance))%." }
+            else { result.status = .notCompleted; result.limitations.append("Rain probability is not available for the requested day.") }
+        }
         result.excerpts = [.init(record: record, label: record.string("resolved_city"), text: result.answer)]
         if incomplete { result.status = .notCompleted }
         return result

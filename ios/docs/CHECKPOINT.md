@@ -15,7 +15,7 @@ weather location verification; in-memory structured/text import; exact typed
 local action preview and confirmation. Reference oracle and gold family do not
 control execution. No live account, permission, model or effect was invoked.
 
-Pre-freeze tests: 55 Swift test functions PASS, including source/oracle mutation,
+Pre-freeze tests: 70 Swift test functions PASS, including source/oracle mutation,
 source denial, missing metadata, DST overlap, sender/address ambiguity, historical
 thread corrections, unread uncertainty, shopping conflicts, forecast location
 mismatch and immutable preview approval. Unsigned generic simulator build PASS.
@@ -24,8 +24,8 @@ A first test run caught a topic-filter error; regression repairs passed.
 Shared 597-case observations and canonical provenance integrity are captured
 outside the checkout. Source claims are not arbitrary v1 fact aliases; alias
 mapping requires independent evaluator ownership. Shared semantic completion is
-not qualified. A pre-freeze privacy-routing finding is recorded for the
-Orchestrator to acknowledge this builder as sole repair owner before repair.
+not qualified. Pre-freeze privacy/scope findings were repaired under the Orchestrator same-owner
+ACK; focused read-only re-review found the stated counterexamples addressed.
 Status counts and source-value checks are not benchmark accuracy.
 
 Final exact-head/CI/review evidence belongs in the external candidate handoff.
@@ -39,10 +39,19 @@ Root pulls /private/tmp/wisp-iphone-newroot-status-20261010.json. This status is
 mirror/request, never the authoritative ownership registry. No retries of rejected
 outbound coordination sends. Shared Mac fixture/contract paths remain read-only.
 
-Pending same-owner repair request also includes account negation/mixed-account
-scope, exclusive source restrictions overridden by family defaults, conflicting
-relative-date modifiers, non-Latin shopping-item dedupe, and explicit weather
-region qualification. The read-only helper identified these before freeze. They
-remain recorded limitations of this pre-review checkpoint; do not treat it as a
-merge-ready or user-device-tested candidate. The Orchestrator must acknowledge
-repair ownership before edits to these findings.
+Repairs include communication/availability action precedence before reads;
+explicit source-only/exclusions; account-negation/mixed-scope clarification;
+pronominal follow-up scope guards; conflicting-date clarification and undated-record
+exclusion; Unicode grocery identity; forecast/query region/country qualification.
+All are covered by independent synthetic regressions. Same-owner ACK:
+WISP_IPHONE_SAME_OWNER_PRIVACY_SCOPE_REPAIR_ACK_20261010.json.
+The preserved pre-review checkpoint is 101b867cff3ddf23a774da3ebaefec4f4acf8873.
+A new descendant must receive exact-head mechanical/CI and registered independent
+review/QA; the earlier pre-review evidence is not reused as candidate qualification.
+
+Fresh repaired shared-corpus diagnostic: 597 observations, zero effects, 597 safe
+handling, 75 outcome passes, 45/501 capability-required passes, 212 routing passes;
+full grade exits 1. These exposed development fixtures are not pristine heldout.
+The independent canonical bridge grades only strict structured value/provenance
+claims; arbitrary prose quality and physical-device/model performance are unmeasured.
+Final exact-SHA reproduction and grader-source hashes are external candidate evidence.

@@ -26,8 +26,9 @@ synthetic/imported records; native sources and models remain disconnected.
 
 The production adapter ignores the benchmark's gold family and reference oracle.
 Canonical source-field claims are emitted separately from arbitrary v1 oracle fact
-aliases; the bridge is unavailable, so no twenty-workflow completion claim follows
-from status counts or source-provenance checks. Preview confirmation performs no
+aliases. The independent evaluator owns strict whole-value/provenance mapping;
+no twenty-workflow completion claim follows from status counts, source-provenance
+checks or arbitrary prose. Preview confirmation performs no
 native or provider effect. All actual effect/approval arrays stay empty.
 
 ## Platform boundaries

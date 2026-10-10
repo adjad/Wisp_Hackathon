@@ -21,7 +21,7 @@ Workflow20Contract.swift; CLI main.swift; SemanticTests.swift; generated Xcode
 project; verify.py and audit_claims.py; README and docs. All under ios/**.
 No Mac service, shared fixture/contract, CI or integration paths changed.
 
-Validation: 55 pre-freeze Swift test functions passed; generic unsigned iOS simulator
+Validation: 70 pre-freeze Swift test functions passed; generic unsigned iOS simulator
 build passed for arm64/x86_64 with Xcode 27 / Swift 6.4. A topic-filter failure was
 repaired and covered. Source-value/provenance audit validates canonical claims
 without reference facts. Final exact-SHA logs/results and PR CI status must be
@@ -39,8 +39,9 @@ Known risks/incomplete: bounded English matching and literal topics, no synthesi
 thread final-state claim, custom-range clarification, conservative weather-region
 metadata, no native inbox/Notes/contacts/calendar integration, no sends/invitations,
 no durable queue/memory/files/traffic/provider actions, no AI/runtime measurements,
-no signed physical-device or UI tests. A discovered action/read privacy-routing
-finding is pending Orchestrator repair-owner ACK before repair/freeze. All action
+no signed physical-device or UI tests. The discovered action/read, source/account, history, temporal, Unicode and
+weather-qualification findings have been repaired under the same-owner ACK and
+received focused read-only re-review; formal exact-SHA acceptance remains pending. All action
 effects remain empty. See CAPABILITIES.md for twenty-family limits.
 
 Integration: only the designated integrator may merge after exact-head mechanical,
@@ -55,10 +56,17 @@ and a short fictional-data checklist. Notify the user at the reviewed test check
 and ask only for device model/iOS, test/question and observed error/result. A basic
 Personal Team install needs no live Wisp account or model. Do not collect credentials.
 
-Pending same-owner repair request also includes account negation/mixed-account
-scope, exclusive source restrictions overridden by family defaults, conflicting
-relative-date modifiers, non-Latin shopping-item dedupe, and explicit weather
-region qualification. The read-only helper identified these before freeze. They
-remain recorded limitations of this pre-review checkpoint; do not treat it as a
-merge-ready or user-device-tested candidate. The Orchestrator must acknowledge
-repair ownership before edits to these findings.
+Repair authority: WISP_IPHONE_SAME_OWNER_PRIVACY_SCOPE_REPAIR_ACK_20261010.json.
+Preserved checkpoint: 101b867cff3ddf23a774da3ebaefec4f4acf8873. The repaired
+candidate is a normal descendant on the same branch, with no force push. Exact
+candidate SHA, reports, remote binding and review requests are recorded outside
+source after commit. Earlier 597-case observations are pre-repair diagnostics,
+not qualification of the repaired implementation. The shared contract owner now
+owns strict canonical source-field mapping; runtime still receives no oracle data.
+
+Fresh repaired shared-corpus diagnostic: 597 observations, zero effects, 597 safe
+handling, 75 outcome passes, 45/501 capability-required passes, 212 routing passes;
+full grade exits 1. These exposed development fixtures are not pristine heldout.
+The independent canonical bridge grades only strict structured value/provenance
+claims; arbitrary prose quality and physical-device/model performance are unmeasured.
+Final exact-SHA reproduction and grader-source hashes are external candidate evidence.

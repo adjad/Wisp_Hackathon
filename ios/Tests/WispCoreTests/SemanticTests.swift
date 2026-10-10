@@ -60,7 +60,7 @@ private func event(_ id: String, _ title: String, _ start: String, end: String? 
 }
 @Test func missingMessageDatesDisclosedInsteadOfAssumedToday() {
     let result = ask("Summarize messages today", [rec(.messages, "a", ["body": .string("No timestamp")])])
-    #expect(result.status == .notCompleted); #expect(result.limitations.contains { $0.contains("lack timestamps") })
+    #expect(result.status == .notCompleted); #expect(result.limitations.contains { $0.contains("lack valid timestamps") }); #expect(result.claims.isEmpty); #expect(!result.answer.contains("No timestamp"))
 }
 @Test func senderMatchExcludesMentionsAndOutgoing() {
     let result = ask("What did Lena say in email?", [mail("a", "Lena Ortiz", "Bring a jacket"), mail("b", "Ravi Malik", "Lena said bring boots"), mail("c", "Lena Ortiz", "My outgoing", extra: ["is_from_me": .bool(true)])])
@@ -204,4 +204,124 @@ private func weatherRecord(_ forecast: JSONValue, extra: [String: JSONValue] = [
 @Test func pendingCancellationIsUnsupportedWithNoPreview() {
     let result = ask("Cancel pending sends", [rec(.queue, "a", ["body": .string("Queued message")])])
     #expect(result.status == .unsupported); #expect(result.previews.isEmpty); #expect(result.claims.isEmpty)
+}
+
+@Test func actionAvailabilityRequestsCannotDiscloseCalendarTitles() {
+    let records = [event("private-meeting", "Confidential health visit", "2026-03-10T10:00:00-07:00")]
+    for question in ["Schedule Nara a 7 PM text with Wednesday availability", "Reply to Nara about when I am free", "Queue an email for Nara tomorrow", "Text Nara my availability"] {
+        let result = ask(question, records)
+        #expect(result.status == .clarify); #expect(result.reads.isEmpty); #expect(result.claims.isEmpty)
+        #expect(!result.answer.contains("Confidential")); #expect(result.previews.isEmpty)
+    }
+}
+@Test func accountNegationAndMixedAccountsClarifyBeforeReading() {
+    let records = [mail("w", "Nora", "Private work content", extra: ["account": .string("work")]), mail("p", "Nora", "Private personal content", extra: ["account": .string("personal")])]
+    for question in ["Summarize personal email, not work email", "Summarize work and personal email", "Summarize email without work", "Summarize no personal email"] {
+        let result = ask(question, records)
+        #expect(result.status == .clarify); #expect(result.clarificationFields == ["account"])
+        #expect(result.reads.isEmpty); #expect(result.claims.isEmpty); #expect(!result.answer.contains("Private"))
+    }
+}
+@Test func explicitSourceOnlyOverridesFamilyDefaults() {
+    let records = [mail("mail", "Nora", "Please review the draft"), event("private", "Private calendar item", "2026-03-08T10:00:00-07:00"), rec(.notes, "note", ["body": .string("Priority: finish report"), "account": .string("work")])]
+    let daily = ask("Daily briefing from email only", records)
+    #expect(daily.reads == [.email]); #expect(daily.answer.contains("draft")); #expect(!daily.answer.contains("calendar item"))
+    let priority = ask("Work priorities from notes only", records)
+    #expect(priority.reads == [.notes]); #expect(priority.answer.contains("finish report")); #expect(!priority.answer.contains("draft"))
+    let knowledge = ask("Knowledge summary from notes only", records)
+    #expect(knowledge.reads == [.notes]); #expect(!knowledge.reads.contains(.email)); #expect(!knowledge.reads.contains(.calendar))
+}
+@Test func ambiguousSourceRestrictionsNeverRestoreBroadDefaults() {
+    let records = [mail("mail", "Nora", "Private mail"), event("cal", "Private calendar", "2026-03-08T10:00:00-07:00")]
+    for question in ["Daily briefing only", "Calendar from email only", "Summarize email not calendar", "Summarize contacts only"] {
+        let result = ask(question, records)
+        #expect(result.status == .clarify); #expect(result.reads.isEmpty); #expect(result.claims.isEmpty)
+    }
+}
+@Test func conflictingAndModifiedDatesClarifyBeforeReads() {
+    let records = [event("cal", "Private calendar", "2026-03-09T10:00:00-07:00")]
+    for question in ["Calendar today and tomorrow", "Calendar Friday next week", "Calendar last Monday", "Calendar next Friday", "Calendar last week", "Calendar in 3 days", "Calendar this week and next month"] {
+        let result = ask(question, records)
+        #expect(result.status == .clarify); #expect(result.reads.isEmpty); #expect(result.claims.isEmpty); #expect(!result.answer.contains("Private"))
+    }
+}
+@Test func unicodeShoppingNamesRemainDistinct() {
+    let items: [JSONValue] = [.object(["name": .string("米"), "completed": .bool(false)]), .object(["name": .string("牛乳"), "completed": .bool(false)]), .object(["name": .string("米"), "completed": .bool(false)])]
+    let result = ask("Groceries from notes", [rec(.notes, "unicode-list", ["title": .string("Shopping list"), "items": .array(items)])])
+    #expect(result.status == .answered); #expect(result.answer.split(separator: "\n").count == 2)
+    #expect(result.answer.contains("米")); #expect(result.answer.contains("牛乳"))
+}
+@Test func weatherQueryQualifiersMustMatchVerifiedProviderLocation() {
+    let record = weatherRecord(forecast("Harbor Bay", "S1"), extra: ["region_code": .string("S1"), "country": .string("Country One")])
+    for question in ["Weather Harbor Bay State Two today", "Weather Harbor Bay Country Two today"] {
+        let result = ask(question, [record])
+        #expect(result.status == .clarify); #expect(result.claims.isEmpty); #expect(!result.answer.contains("54"))
+    }
+    let missingCountry = ask("Weather Harbor Bay Country One today", [record])
+    #expect(missingCountry.status == .notCompleted); #expect(missingCountry.claims.isEmpty)
+}
+@Test func weatherRequestedCountryMismatchAndMissingRainStayIncomplete() {
+    let record = weatherRecord(forecast("Harbor Bay", "S1"), extra: ["region_code": .string("S1"), "requested_country": .string("Country One"), "resolved_country": .string("Country Two")])
+    #expect(ask("Weather Harbor Bay today", [record]).status == .notCompleted)
+    let rain = ask("Will it rain in Harbor Bay today?", [weatherRecord(forecast("Harbor Bay", "S1"), extra: ["region_code": .string("S1")])])
+    #expect(rain.status == .notCompleted); #expect(rain.limitations.contains { $0.contains("Rain probability") })
+}
+
+@Test func negatedReadCommandsDoNotFallBackToOtherSources() {
+    let records = [mail("mail", "Nora", "Private email"), event("cal", "Private event", "2026-03-08T10:00:00-07:00")]
+    for question in ["Do not summarize email", "Dont summarize email", "Never read calendar", "Summarize email, avoid work account"] {
+        let result = ask(question, records)
+        #expect(result.status == .clarify); #expect(result.reads.isEmpty); #expect(result.claims.isEmpty)
+    }
+}
+
+@Test func sourceExclusionVerbsNeverSelectProhibitedSource() {
+    let records = [mail("mail", "Nora", "Mail"), rec(.messages, "msg", ["body": .string("Private message")]), event("cal", "Private calendar", "2026-03-08T10:00:00-07:00")]
+    for question in ["Daily briefing avoid messages", "Summarize email omit calendar", "Daily briefing without calendars", "Daily briefing not from messages"] {
+        let result = ask(question, records)
+        if question.contains("messages") { #expect(!result.reads.contains(.messages)); #expect(!result.answer.contains("Private message")) }
+        if question.contains("calendar") { #expect(!result.reads.contains(.calendar)); #expect(!result.answer.contains("Private calendar")) }
+    }
+}
+@Test func pronounCannotExpandEarlierSourceOrAccountScope() {
+    let records = [mail("work", "Nora Vale", "Work only", extra: ["account": .string("work")]), mail("personal", "Nora Vale", "Private personal", extra: ["account": .string("personal")]), rec(.messages, "msg", ["sender": .string("Nora Vale"), "body": .string("Private message")])]
+    for followup in ["What did she say?", "What did she say in email?"] {
+        let result = SemanticEngine().respond(turns: ["What did Nora say in work email?", followup], in: space(records))
+        #expect(result.status == .clarify); #expect(result.reads.isEmpty); #expect(result.claims.isEmpty); #expect(!result.answer.contains("Private"))
+    }
+    let explicit = SemanticEngine().respond(turns: ["What did Nora say in work email?", "What did she say in work email?"], in: space(records))
+    #expect(explicit.answer.contains("Work only")); #expect(!explicit.answer.contains("Private")); #expect(explicit.reads == [.email])
+}
+@Test func politeCommunicationWordingCannotFallThroughToSourceReads() {
+    let records = [event("cal", "Private event title", "2026-03-09T10:00:00-07:00"), mail("mail", "Nora", "Private mail")]
+    for question in ["Can you text Nora my calendar tomorrow?", "Please message Nora my schedule", "Could you email Nora my calendar tomorrow?", "Message Nora tomorrow", "Email Nora my schedule"] {
+        let result = ask(question, records)
+        #expect(result.status == .clarify); #expect(result.reads.isEmpty); #expect(result.claims.isEmpty); #expect(!result.answer.contains("Private"))
+    }
+}
+
+@Test func sentencePunctuationPreservesIntentAndExclusionScopes() {
+    let records = [mail("mail", "Nora", "Private mail"), rec(.messages, "msg", ["body": .string("Private text")]), event("cal", "Calendar item", "2026-03-08T10:00:00-07:00")]
+    let result = ask("Daily briefing without email or texts.", records)
+    #expect(!result.reads.contains(.email)); #expect(!result.reads.contains(.messages)); #expect(result.claims.isEmpty)
+    #expect(SemanticText.words("chat. nora@example.invalid.") == ["chat", "nora@example.invalid"])
+}
+@Test func namedPersonAndGroupConstrainOverviewPriorityAndUnread() {
+    let records = [mail("nora", "Nora Vale", "Please review the poster", extra: ["unread": .bool(true)]), mail("other", "Ishan Rao", "Private unrelated", extra: ["unread": .bool(true)]), rec(.messages, "group", ["sender": .string("Vera"), "conversation": .string("Orchard crew"), "thread_id": .string("orchard"), "body": .string("Meeting at west gate"), "unread": .bool(true), "timestamp": .string("2026-03-08T09:00:00-07:00")]), rec(.messages, "family", ["sender": .string("Omar"), "conversation": .string("Family group"), "thread_id": .string("family"), "body": .string("Private family plan"), "unread": .bool(true), "timestamp": .string("2026-03-08T09:00:00-07:00")])]
+    for question in ["Summarize Nora email", "Which action item in Nora email needs my attention?", "Recap Nora email."] {
+        let result = ask(question, records)
+        #expect(result.answer.contains("poster")); #expect(!result.answer.contains("unrelated")); #expect(!result.answer.contains("family plan"))
+    }
+    let unread = ask("Only unread Orchard crew messages today.", records)
+    #expect(unread.answer.contains("west gate")); #expect(!unread.answer.contains("family plan"))
+    let mixed = ask("Summarize Orchard crew without mixing in the Family group.", records)
+    #expect(mixed.status == .clarify); #expect(mixed.claims.isEmpty); #expect(!mixed.answer.contains("family plan"))
+}
+
+@Test func unresolvedNamedFilterCannotBecomeBroadSummary() {
+    let records = [mail("one", "Nora Vale", "Unrelated private content", extra: ["unread": .bool(true)])]
+    for question in ["Summarize Ishan email", "Unread Orchard crew email", "Which action item in Ishan email needs my attention?"] {
+        let result = ask(question, records)
+        #expect(result.status == .clarify); #expect(result.claims.isEmpty); #expect(!result.answer.contains("Unrelated"))
+    }
 }

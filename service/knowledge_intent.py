@@ -4,13 +4,75 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-from service.utterance_shape import is_mention, is_prohibition, mask_quoted
+from service.utterance_shape import is_mention, is_prohibition, quoted_spans
 
 
 @dataclass(frozen=True)
 class KnowledgeEnvelope:
     tools: tuple[str, ...]
     bindings: dict[str, dict]
+
+
+_CATEGORY = r'''(?:knowledge|style|follow-up)(?=$|[\s:"”'`]|[.!?,](?:\s|$))'''
+_CATEGORY_LABEL = r'''["“'`]?''' + _CATEGORY
+_ATTEMPT = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:can|could|would)\s+you\s+(?:please\s+)?)?"
+    r"(?P<verb>save|store|remember|import|read|show|list|update|edit|replace|delete|remove|forget)"
+    r"\s+(?P<rest>[\s\S]*)", re.I)
+
+
+def _addressed_attempt(text: str) -> bool:
+    """Recognize bounded invalid instructions for clarification, never execution.
+
+    A quoted whole subject is data; an immediate quoted destination label is an
+    unsupported label. Source descriptors need not be executable source enums.
+    A pre-destination title field is ordinary source data, not an import cue.
+    """
+    command = _ATTEMPT.match(text)
+    if not command:
+        return False
+    rest = command['rest']
+    if re.match(r"(?:(?:my|saved|a|an|the)\s+){0,3}" + _CATEGORY_LABEL, rest, re.I):
+        return True
+    if command['verb'].lower() not in {'save', 'store', 'remember', 'import'}:
+        return False
+    if re.match(r"to\b", rest, re.I):
+        return False
+    spans = quoted_spans(rest)
+    def unquoted(offset: int) -> bool:
+        return not any(start <= offset < end for start, end in spans)
+
+    # Recognize only destinations in the structural header. A standalone title
+    # marker closes it, except at an unambiguous opaque source/container ID slot.
+    # In particular, neither mail-titled-1 nor <titled@example> is a delimiter.
+    tokens = list(re.finditer(r"\S+", rest))
+    words = [m.group().lower() for m in tokens]
+    source = 1 if words and words[0] == 'my' else 0
+    data_slots = {source}
+    container = None
+    if len(words) > source + 2 and words[source + 2] == 'in':
+        data_slots.add(source + 1)
+        container = source + 2
+    elif (len(words) > source + 2 and words[source + 1] == 'in'
+          and words[source + 2].rstrip(':') != 'titled'):
+        # Missing source ID. Preserve SOURCE + opaque ID "in" + titled TITLE
+        # as the existing ordinary-source title shape instead.
+        container = source + 1
+    if container is not None and unquoted(tokens[container].start()):
+        data_slots.update((container + 1, container + 2))
+    boundary = len(rest)
+    for index, token in enumerate(tokens):
+        if (index not in data_slots and token.group().lower().rstrip(':') == 'titled'
+                and unquoted(token.start())):
+            boundary = token.start()
+            break
+    for body in re.finditer(r":\r?\n", rest):
+        if unquoted(body.start()):
+            boundary = min(boundary, body.start())
+            break
+    destination = r"\bas\s+(?:(?:a|an|the)\s+)?" + _CATEGORY_LABEL
+    return any(m.start() < boundary and unquoted(m.start())
+               for m in re.finditer(destination, rest, re.I))
 
 
 def knowledge_envelope(text: str) -> KnowledgeEnvelope | None:
@@ -21,7 +83,8 @@ def knowledge_envelope(text: str) -> KnowledgeEnvelope | None:
     No tool, source, configuration, model or persisted state is accessed here.
     """
     surface = r"(?:knowledge(?:\s+notes?)?|style\s+examples?|follow-up\s+candidates?)"
-    if not re.search(r"\b" + surface + r"\b", text, re.I):
+    attempt = _addressed_attempt(text)
+    if not attempt and not re.search(r"\b" + surface + r"\b", text, re.I):
         return None
     why = is_prohibition(text) or is_mention(text)
     value = text.strip()
@@ -70,17 +133,6 @@ def knowledge_envelope(text: str) -> KnowledgeEnvelope | None:
     else:
         # Only claim explicitly addressed incomplete instructions or utterance
         # shapes. Other knowledge questions retain ordinary interpretation.
-        addressed = re.match(prefix + r"(?:save|store|remember|read|show|list|"
-            r"update|edit|replace|delete|remove|forget)\s+(?:my\s+)?(?:saved\s+)?(?:a\s+)?"
-            + surface + r"\b", value, re.I)
-        # Invalid imports still address knowledge. Recognize their destination
-        # separately from the exact import grammar and source/container checks.
-        # Quoted text and authored title/body fields cannot establish that cue.
-        header = re.split(r"\btitled\b", mask_quoted(value), maxsplit=1, flags=re.I)[0]
-        import_addressed = (
-            re.match(prefix + r"(?:save|store|remember)\s+(?:email|messages)\b", header, re.I)
-            and re.search(r"\bas\s+(?:a\s+)?" + surface + r"\b", header, re.I)
-        )
-        if not why and not (addressed or imported or import_addressed):
+        if not why and not (attempt or imported):
             return None
     return KnowledgeEnvelope(tuple(tools), bindings)

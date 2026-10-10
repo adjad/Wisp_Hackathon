@@ -156,6 +156,43 @@ the focused cross-suite passes 14 files including that suite. These are
 development results.
 Fresh committed-head full checks, CI, audit and distinct QA remain necessary.
 
+Frozen `dc07e1c2406ef33d5cbdcdacbe0d6b5235a23648` passed all 198 offline
+gates (27,394 reported passes, zero failures, 155 skips, one unparsed legacy
+count). Distinct isolated QA passed 311 checks. Independent audit still returned
+**BLOCK** for residual `W20KNOWLEDGEENTRY02`: unsupported source wording, polite
+direct requests and `titled` inside opaque IDs escaped the incomplete-request
+recognizer. Eight actual HTTP cases reproduced the four residual variants over
+empty and populated Reminder stores with unrelated pending state.
+
+The next repair has one bounded clarification-only recognizer before the full
+category check. It accepts optional Please and Can/Could/Would-you wrappers,
+direct knowledge/style/follow-up category attempts, or Save/Store/Remember/Import
+headers with an explicit unquoted `as` category destination. Unsupported source
+descriptors, partial kind labels and immediately quoted kind labels clarify;
+they acquire no tools or import authority. Accepted executable grammar and
+bindings remain unchanged. Header roles distinguish source/container data from
+title fields, including opaque IDs equal to `titled` or `in`. A quoted whole
+subject cannot establish the destination, nor can text after a pre-destination
+title or body delimiter. Filename punctuation does not become a category label.
+
+The ambiguity policy preserves ordinary source-title requests such as
+`Save email source-1 titled as a knowledge note` and
+`Save email titled as a knowledge note` on their existing route (`None`). The
+second form could also mean an incomplete import with ID `titled`; without a
+structural `in account/chat` field it remains outside this bounded knowledge
+attempt grammar. This is not a guarantee for arbitrary natural language or an
+isolation fix for all ordinary Mail title/body requests.
+
+Development tests pass 565 cases, retaining all prior 179 cases unchanged and
+adding 386 cases, including 47 actual in-process HTTP cases. These cover pending
+state preservation, zero other-source reads, hostile model calls, ordinary
+source/title/filename controls and six valid immutable synthetic imports with
+opaque source/account/chat IDs. A helper found three additional malformed field
+variants before freeze; six failing HTTP cases were preserved and repaired.
+Intermediate event-name assertion mistakes and a malformed pytest selector are
+also retained. These results do not qualify the next committed head; fresh full
+checks, required CI, independent audit and distinct QA remain required.
+
 ## Family 15 reference scope
 
 The [Sentient OS product page](https://sentient-os.ai/) describes selected local

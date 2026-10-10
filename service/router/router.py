@@ -7041,28 +7041,43 @@ def _knowledge_request(text: str) -> RouteDecision | None:
 
 
 def _priority_read(text: str) -> RouteDecision | None:
-    match = re.fullmatch(
-        r"\s*(?:please\s+)?what\s+(?:should\s+I\s+(?:work\s+on|focus\s+on|do|prioriti[sz]e|tackle)|"
-        r"do\s+I\s+need\s+to\s+do)"
-        r"(?:\s+(?P<period>now|today|tomorrow|(?:this|next)\s+(?:week|month)))?[.!?\s]*",
-        text, re.I)
-    if not match:
+    from service.workflows.workflow20 import priority_read
+    read = priority_read(text)
+    if read is None:
         return None
-    period = (match["period"] or "today").casefold()
-    if period == "now":
-        period = "today"
-    tools = ["daily_brief", "search_notes"]
+    tools = list(read.tools)
     decision = _mk_scoped(tools, "source-grounded personal priorities",
-                          multi=True, after=frozenset(tools))
-    decision.required_tool_groups = tuple(frozenset({tool}) for tool in tools)
-    decision.tool_argument_bindings = {"daily_brief": {
-        "period": period, "include_overdue": True, "include_undated": True,
-        "include_weather": False}, "search_notes": {"query": ""}}
+                          multi=True, after=frozenset(tools), light=False)
+    decision.required_tool_groups = read.groups
+    decision.tool_argument_bindings = read.bindings
+    decision.direct_calls = [(tool, read.bindings[tool]) for tool in tools]
     decision.resolved_request = (text + "\n\nUse the current source results to suggest priorities. "
+        "Use collect_task_evidence once before narration. Its window describes task due dates and Calendar occurrences, "
+        "not communication receipt dates. Preserve every excluded source. "
         "Use the requested upcoming window and separately labelled overdue and undated reminders. "
         "Notes are background evidence, not proof of current task status. "
-        "Distinguish actual tasks/deadlines from Calendar appointments and other people's requests. "
-        "Preserve source/date/ownership and missing-data limitations; never invent urgency or claim a task was scheduled.")
+        "Ground each suggestion in an exact source quote/ID, keep outgoing promises, other people's requests and cancellations distinct, "
+        "and qualify ownership/deadlines when unknown. Only real original timestamps can anchor relative dates. "
+        "Preserve missing-data/omission limitations; never invent urgency or claim a task was scheduled.")
+    return decision
+
+
+def _grocery_read(text: str) -> RouteDecision | None:
+    from service.workflows.workflow20 import grocery_read
+    read = grocery_read(text)
+    if read is None:
+        return None
+    tools = list(read.tools)
+    decision = _mk_scoped(tools, "source-grounded shopping evidence", multi=len(tools) > 1,
+                          after=frozenset(tools), light=False, expect=False)
+    decision.required_tool_groups = read.groups
+    decision.tool_argument_bindings = read.bindings
+    decision.direct_calls = [(tool, read.bindings[tool]) for tool in tools]
+    decision.resolved_request = (text + "\n\nRead each selected shopping source before narration. "
+        "Preserve exact list labels separately from item queries, quantities, units, variants and source references. "
+        "Literal checked plaintext is distinct from native incomplete reminders and unmarked unknown-state lines. "
+        "Identify conflicts across lists/sources; do not silently add quantities, infer completion from absence, or treat stale notes as current. "
+        "Do not mark items, edit lists, buy anything or create reminders. Explain missing, stale and omitted evidence.")
     return decision
 
 
@@ -7211,6 +7226,10 @@ async def route(text: str, *,
             public_reference=False, inherited=False, clarification=None))
     if (priority := _priority_read(text)) is not None:
         return _finalize(priority, text, web_request=replace(
+            request, provenance=_WebProvenance.PRIVATE, current=False, query=None,
+            public_reference=False, inherited=False, clarification=None))
+    if (shopping := _grocery_read(text)) is not None:
+        return _finalize(shopping, mask_quoted(text), web_request=replace(
             request, provenance=_WebProvenance.PRIVATE, current=False, query=None,
             public_reference=False, inherited=False, clarification=None))
     if (review := _scheduled_send_review(text)) is not None:

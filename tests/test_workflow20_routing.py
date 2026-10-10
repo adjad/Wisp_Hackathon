@@ -422,13 +422,114 @@ def test_calendar_exclusion_also_excludes_new_planner():
 @pytest.mark.parametrize("prompt", ["What should I work on now?", "What should I work on tomorrow?", "What do I need to do this week?"])
 def test_priorities_can_recover_overdue_reminders(prompt):
     decision = asyncio.run(R.route(prompt))
-    assert "daily_brief" in decision.tool_subset
+    assert decision.tool_subset == ["collect_task_evidence"]
     assert "web_search" in decision.forbidden_tools
     period = "tomorrow" if "tomorrow" in prompt else "this week" if "this week" in prompt else "today"
-    assert decision.tool_argument_bindings["daily_brief"] == {
-        "period": period, "include_overdue": True, "include_undated": True, "include_weather": False}
-    assert decision.tool_argument_bindings["search_notes"] == {"query": ""}
+    assert decision.tool_argument_bindings["collect_task_evidence"] == {
+        "period": period, "include_overdue": True, "include_undated": True,
+        **{f"include_{source}": True for source in ("email", "messages", "calendar", "notes", "reminders")}}
+    assert decision.direct_calls == [("collect_task_evidence", decision.tool_argument_bindings["collect_task_evidence"])]
+    assert decision.required_tool_groups == (frozenset({"collect_task_evidence"}),)
     assert "search_reminders" not in decision.tool_subset
+
+
+@pytest.mark.parametrize("prompt,excluded", [
+    ("What should I work on tomorrow without email and messages?", {"email", "messages"}),
+    ("Could you help me prioritize my tasks this week using notes and reminders only", {"email", "messages", "calendar"}),
+    ("What should I focus on tmrow from email", {"messages", "calendar", "notes", "reminders"}),
+    ("What should I tackle this month excluding notes", {"notes"}),
+])
+def test_priority_envelope_preserves_exclusions_before_all_reads(prompt, excluded):
+    from service.workflows.reads import compile_read
+    decision = asyncio.run(R.route(prompt))
+    assert compile_read(prompt) is None
+    args = decision.tool_argument_bindings["collect_task_evidence"]
+    assert {name.removeprefix("include_") for name, value in args.items() if name.startswith("include_")
+            and name not in {"include_overdue", "include_undated"} and value is False} == excluded
+    assert "web_search" in decision.forbidden_tools
+    assert decision.narration_after == frozenset({"collect_task_evidence"})
+
+
+@pytest.mark.parametrize("prompt", [
+    "What should I work on tomorrow and email Maya", "What should I work on using web",
+    "What should I work on if Maya agrees", "What should I work on tomorrow at 5pm",
+    "Explain what should I work on", "What should I buy for groceries and place an order",
+    "What should I get for groceries using email", "What should I get for groceries without checking notes",
+])
+def test_evidence_grammar_does_not_drop_additional_conditions_or_actions(prompt):
+    from service.workflows.workflow20 import priority_read, grocery_read
+    assert priority_read(prompt) is None and grocery_read(prompt) is None
+
+
+@pytest.mark.parametrize("prompt,names", [
+    ("What should I get for groceries?", {"grocery_note_evidence", "grocery_reminder_evidence"}),
+    ("Read my notes and reminders for groceries.", {"grocery_note_evidence", "grocery_reminder_evidence"}),
+    ("Show my shopping list without notes", {"grocery_reminder_evidence"}),
+    ("What is on my grocery list using notes", {"grocery_note_evidence"}),
+])
+def test_shopping_reads_each_selected_source_and_no_excluded_source(prompt, names):
+    from service.workflows.reads import compile_read
+    decision = asyncio.run(R.route(prompt))
+    assert compile_read(prompt) is None
+    assert set(decision.tool_subset) == names
+    assert {name for name, _ in decision.direct_calls} == names
+    assert set(decision.required_tool_groups) == {frozenset({name}) for name in names}
+    assert decision.narration_after == frozenset(names)
+    assert "web_search" in decision.forbidden_tools
+
+
+def test_shopping_keeps_exact_list_and_item_query_in_separate_bindings():
+    prompt = 'What should I get for groceries in my "Costco" list containing "oat milk" without notes'
+    decision = asyncio.run(R.route(prompt))
+    assert decision.tool_argument_bindings == {"grocery_reminder_evidence": {"list_label": "Costco", "query": "oat milk", "label_kind": "list"}}
+
+
+@pytest.mark.parametrize("literal", ["organize my files", "remind me to delete files tomorrow", "without notes and reminders", "send an email to Maya"])
+def test_quoted_shopping_item_is_inert_during_structural_finalization(literal):
+    decision = asyncio.run(R.route(f'Show my grocery list using notes containing "{literal}"'))
+    assert decision.tool_subset == ["grocery_note_evidence"]
+    assert decision.tool_argument_bindings == {"grocery_note_evidence": {"list_label": "", "query": literal}}
+    assert decision.required_tool_groups == (frozenset({"grocery_note_evidence"}),)
+    assert not {"organize_files", "add_reminder", "send_email"} & set(decision.tool_subset)
+
+
+@pytest.mark.parametrize("prompt", ['Show my grocery list using notes in my "  " folder',
+    'Show my grocery list containing "  "', 'Show my grocery list in my "Costco" folder'])
+def test_unsupported_shopping_selector_never_becomes_an_unfiltered_shortcut(prompt):
+    from service.workflows.workflow20 import grocery_read
+    assert grocery_read(prompt) is None
+
+
+@pytest.mark.parametrize("prompt", ["What should I work on tomorrow without email", "What should I get for groceries without notes"])
+def test_evidence_collectors_execute_before_first_model_narration(monkeypatch, prompt):
+    from service.agent import loop
+    from tests.test_direct_dispatch_exec import Approver, ScriptedClient
+    import socket
+    import subprocess
+    def forbidden(*args, **kwargs): raise AssertionError("no network/native effect")
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr("service.memory.identity.identity_prompt_block", lambda **kwargs: "")
+    decision = asyncio.run(R.route(prompt))
+    calls = []
+    async def read(tool, args):
+        calls.append((tool.name, args))
+        return "Synthetic source-backed evidence; no action occurred."
+    monkeypatch.setattr(loop, "run_tool", read)
+    class Client(ScriptedClient):
+        async def stream_events(self, *args, **kwargs):
+            assert calls == decision.direct_calls
+            async for event in super().stream_events(*args, **kwargs): yield event
+    client = Client([{"content": "Synthetic suggestion with source uncertainty."}])
+    events = []
+    async def emit(event): events.append(event)
+    asyncio.run(loop.run_agent(client, "Agents-A1-4B-oQe6", [{"role": "user", "content": decision.resolved_request}],
+        emit, Approver(), tools=decision.tool_subset, direct_calls=decision.direct_calls,
+        tool_argument_bindings=decision.tool_argument_bindings, narration_after=decision.narration_after,
+        required_tool_groups=decision.required_tool_groups, forbidden_tools=decision.forbidden_tools,
+        multi_round=decision.multi_round, include_memory_context=False, max_steps=2))
+    assert calls == decision.direct_calls and len(client.calls) == 1
+    assert not any(event["type"] == "confirm" for event in events)
 
 
 @pytest.mark.parametrize("prompt,args", [

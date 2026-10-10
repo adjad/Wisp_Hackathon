@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
+import hashlib
+import threading
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -26,6 +30,9 @@ def row(mid="one", *, subject="Venue", body="Bring the projector to Room 204.",
 
 @pytest.fixture(autouse=True)
 def synthetic_mail(monkeypatch):
+    monkeypatch.setattr(mail, "_raw_mail_snapshot", None)
+    monkeypatch.setattr(mail, "_raw_snapshot_generation", 0)
+    monkeypatch.setattr(mail.cache_store, "save", Mock())
     monkeypatch.setattr(mail, "_headers", "")
     monkeypatch.setattr(mail, "_history", "")
     monkeypatch.setattr(mail, "_raw_emails", "")
@@ -50,6 +57,207 @@ def seed(monkeypatch, *rows, headers=None, history=None):
 def summary_dispatch(**params):
     assert REGISTRY["summarize_emails"].func is mail.summarize_emails
     return asyncio.run(run_tool(REGISTRY["summarize_emails"], params))
+
+
+def publish_raw(*rows, coverage=None):
+    raw = email_raw(list(rows))
+    mail.cache_raw_emails(raw, coverage if coverage is not None else {
+        "accounts": ["Work"], "failed_accounts": [], "complete": True})
+    return raw
+
+
+def test_atomic_raw_snapshot_binds_immutable_content_identity_coverage_and_version():
+    coverage = {"accounts": ["Work"], "failed_accounts": [], "complete": True}
+    raw = publish_raw(row(), coverage=coverage)
+    snapshot = mail.raw_email_snapshot()
+    assert snapshot is not None and snapshot.generation == 1
+    assert snapshot.accounts == ("Work",) and snapshot.failed_accounts == ()
+    assert snapshot.complete and snapshot.decode_complete and snapshot.identity_complete
+    assert snapshot.raw_digest == hashlib.sha256(raw.encode()).hexdigest()
+    assert snapshot.rows[0]["account_id"] == "account.work"
+    assert snapshot.rows[0]["message_id"] == "<one@example.com>"
+    assert snapshot.rows[0]["body"] == "Bring the projector to Room 204."
+    coverage["accounts"].append("Injected")
+    coverage["failed_accounts"].append("Work")
+    assert snapshot.accounts == ("Work",) and snapshot.failed_accounts == ()
+    with pytest.raises(FrozenInstanceError):
+        snapshot.complete = False
+    with pytest.raises(TypeError):
+        snapshot.rows[0]["body"] = "tampered"
+    assert mail.raw_email_snapshot(expected_generation=1) is snapshot
+    assert mail.raw_email_snapshot(expected_generation=2) is None
+
+
+def test_legacy_or_restored_globals_cannot_fabricate_snapshot(monkeypatch):
+    seed(monkeypatch, row())
+    assert mail.raw_reference_metadata()["complete"]
+    assert mail._parse_raw()
+    assert mail.raw_email_snapshot() is None
+
+
+@pytest.mark.parametrize("coverage", [
+    {}, {"accounts": ["Work"], "failed_accounts": []},
+    {"accounts": ["Work"], "failed_accounts": [], "complete": False},
+    {"accounts": ["Other"], "failed_accounts": [], "complete": True},
+    {"accounts": ["Work"], "failed_accounts": ["Work"], "complete": True},
+    {"accounts": "Work", "failed_accounts": [], "complete": True},
+    {"accounts": ["Work"], "failed_accounts": "", "complete": True},
+    {"accounts": ["Work"], "failed_accounts": [], "complete": True, "decode_complete": False},
+])
+def test_ineligible_raw_coverage_never_becomes_complete_snapshot(coverage):
+    publish_raw(row(), coverage=coverage)
+    assert mail.raw_email_snapshot() is None
+
+
+@pytest.mark.parametrize("rows", [
+    [row(account_id=None)], [row(message_id="")],
+    [row(), row(body="conflicting copy")],
+    [row(), row("two", account="Personal")],
+    [row(), row("two", account_id="another.native.account")],
+])
+def test_incomplete_or_conflicting_account_message_identities_fail_closed(rows):
+    publish_raw(*rows)
+    assert mail.raw_email_snapshot() is None
+
+
+def test_same_message_id_in_two_exact_accounts_preserves_both_identities():
+    publish_raw(row(), row(account="Personal", account_id="native.personal", body="Personal body"),
+                coverage={"accounts": ["Work", "Personal"], "failed_accounts": [], "complete": True})
+    snapshot = mail.raw_email_snapshot()
+    assert snapshot is not None
+    assert [(entry["account_id"], entry["message_id"], entry["body"]) for entry in snapshot.rows] == [
+        ("account.work", "<one@example.com>", "Bring the projector to Room 204."),
+        ("native.personal", "<one@example.com>", "Personal body")]
+
+
+def test_explicit_successful_empty_scan_is_distinct_from_missing_snapshot():
+    assert mail.raw_email_snapshot() is None
+    publish_raw(coverage={"accounts": [], "failed_accounts": [], "complete": True})
+    snapshot = mail.raw_email_snapshot()
+    assert snapshot is not None and snapshot.complete
+    assert snapshot.rows == () and snapshot.accounts == ()
+
+
+def test_malformed_body_record_invalidates_entire_snapshot():
+    raw = email_raw([row()]) + "malformed" + mail._RAW_RS
+    mail.cache_raw_emails(raw, {"accounts": ["Work"], "failed_accounts": [], "complete": True})
+    assert mail._parse_raw()  # Legacy display remains available.
+    assert mail.raw_email_snapshot() is None
+
+
+@pytest.mark.parametrize("elapsed", [1201, -1])
+def test_atomic_snapshot_rejects_stale_and_future_publications(monkeypatch, elapsed):
+    monkeypatch.setattr(mail.time, "time", lambda: 10000)
+    publish_raw(row())
+    monkeypatch.setattr(mail.time, "time", lambda: 10000 + elapsed)
+    assert mail.raw_email_snapshot() is None
+
+
+@pytest.mark.parametrize("available", [False, None])
+def test_snapshot_requires_current_mail_read_permission_evidence(monkeypatch, available):
+    publish_raw(row())
+    monkeypatch.setattr(mail, "_email_available", available)
+    assert mail.raw_email_snapshot() is None
+
+
+def test_failed_refresh_keeps_display_bytes_but_invalidates_complete_generation():
+    raw = publish_raw(row())
+    first = mail.raw_email_snapshot()
+    mail.cache_raw_emails("", {"accounts": [], "failed_accounts": ["Work"], "complete": False})
+    assert mail._raw_emails == raw and mail._parse_raw()[0]["body"] == first.rows[0]["body"]
+    assert mail.raw_email_snapshot() is None
+    assert mail._raw_mail_snapshot.generation == first.generation + 1
+    assert first.complete and first.rows[0]["account_id"] == "account.work"
+
+
+def test_writer_parse_interleaving_exposes_only_prior_coherent_or_ineligible_generation(monkeypatch):
+    publish_raw(row(body="old complete body"))
+    old = mail.raw_email_snapshot()
+    entered, release = threading.Event(), threading.Event()
+    parser = mail._parse_raw_text
+
+    def paused_parser(raw):
+        entered.set()
+        assert release.wait(5), "synthetic writer was not released"
+        return parser(raw)
+
+    monkeypatch.setattr(mail, "_parse_raw_text", paused_parser)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        writer = pool.submit(publish_raw, row(body="new partial body"),
+                             coverage={"accounts": ["Work"], "failed_accounts": [], "complete": False})
+        try:
+            assert entered.wait(5)
+            assert mail.raw_email_snapshot() is old
+            assert old.rows[0]["body"] == "old complete body"
+        finally:
+            release.set()
+        writer.result(timeout=5)
+    assert mail._parse_raw()[0]["body"] == "new partial body"
+    assert mail.raw_email_snapshot() is None
+    assert old.rows[0]["body"] == "old complete body" and old.complete
+
+
+def test_reverse_writer_preparation_order_never_pairs_content_and_coverage(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    parser = mail._parse_raw_text
+
+    def paused_parser(raw):
+        if "slow complete" in raw:
+            entered.set()
+            assert release.wait(5)
+        return parser(raw)
+
+    monkeypatch.setattr(mail, "_parse_raw_text", paused_parser)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        slow = pool.submit(publish_raw, row(body="slow complete"))
+        try:
+            assert entered.wait(5)
+            publish_raw(row("partial", body="fast partial"),
+                        coverage={"accounts": ["Work"], "failed_accounts": [], "complete": False})
+            assert mail.raw_email_snapshot() is None
+        finally:
+            release.set()
+        slow.result(timeout=5)
+    snapshot = mail.raw_email_snapshot()
+    assert snapshot.generation == 2 and snapshot.complete
+    assert snapshot.rows[0]["body"] == "slow complete"
+    assert snapshot.rows[0]["message_id"] == "<one@example.com>"
+
+
+def test_writer_owns_coverage_input_before_body_parse_interleaving(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    parser = mail._parse_raw_text
+    coverage = {"accounts": ["Work"], "failed_accounts": [], "complete": True}
+    def paused_parser(raw):
+        entered.set()
+        assert release.wait(5)
+        return parser(raw)
+    monkeypatch.setattr(mail, "_parse_raw_text", paused_parser)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        writer = pool.submit(publish_raw, row(), coverage=coverage)
+        try:
+            assert entered.wait(5)
+            coverage["accounts"].clear()
+            coverage["failed_accounts"].append("Work")
+            coverage["complete"] = False
+        finally:
+            release.set()
+        writer.result(timeout=5)
+    snapshot = mail.raw_email_snapshot()
+    assert snapshot is not None and snapshot.complete
+    assert snapshot.accounts == ("Work",) and snapshot.failed_accounts == ()
+
+
+def test_persistence_observer_sees_one_fully_published_snapshot(monkeypatch):
+    observed = []
+    def save(key, raw):
+        snapshot = mail.raw_email_snapshot()
+        observed.append((key, raw, snapshot))
+        assert snapshot.raw_digest == hashlib.sha256(raw.encode()).hexdigest()
+        assert snapshot.rows[0]["body"] == mail._parse_raw()[0]["body"]
+    monkeypatch.setattr(mail.cache_store, "save", save)
+    publish_raw(row())
+    assert len(observed) == 1 and observed[0][2].generation == 1
 
 
 @pytest.mark.parametrize("scope", ["day", "period"])

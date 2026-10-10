@@ -39,8 +39,13 @@ only the first account.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import hashlib
 import re
+import threading
 import time
+from types import MappingProxyType
+from typing import Mapping
 from datetime import datetime, timedelta
 from email.utils import parseaddr
 from functools import wraps
@@ -108,6 +113,11 @@ _raw_emails_at: float = 0.0
 # Reference resolution requires a live, successful scan, unlike display-only
 # caches restored from disk. Empty-but-successful is distinct from cold.
 _raw_reference_scan: dict = {}
+# Reference consumers must read this single publication, never independently
+# combine the compatibility body globals with coverage from another refresh.
+_raw_snapshot_lock = threading.RLock()
+_raw_snapshot_generation = 0
+_raw_mail_snapshot: RawEmailSnapshot | None = None
 # Raw bodies carry real PII (addresses, order numbers, party plans) — purge
 # after a week rather than let it sit in process memory indefinitely.
 # MailReader.swift re-syncs raw content every 15 minutes, so in practice this
@@ -351,19 +361,106 @@ def sender_stats() -> dict[str, dict]:
 _RAW_TTL_SECONDS = 7 * 24 * 3600
 
 
+@dataclass(frozen=True)
+class RawEmailSnapshot:
+    """One live body/identity/coverage generation; all nested values immutable.
+
+    This contains mailbox evidence, not authenticated RFC unsubscribe headers
+    or historical open events. Use raw_email_snapshot(), which fails closed,
+    rather than accessing the internal publication directly.
+    """
+    generation: int
+    synced_at: float
+    rows: tuple[Mapping[str, object], ...]
+    accounts: tuple[str, ...]
+    failed_accounts: tuple[str, ...]
+    complete: bool
+    decode_complete: bool
+    identity_complete: bool
+    failure_reason: str
+    raw_digest: str
+
+
+def _raw_snapshot_candidate(raw: str, coverage: dict | None, stamp: float) -> RawEmailSnapshot:
+    rows = _parse_raw_text(raw)
+    record_count = sum(bool(record.strip()) for record in raw.split(_RAW_RS))
+    scan = coverage if isinstance(coverage, dict) else {}
+    accounts_value, failures_value = scan.get("accounts"), scan.get("failed_accounts")
+    valid_accounts = (isinstance(accounts_value, (list, tuple))
+                      and all(isinstance(value, str) and value.strip() for value in accounts_value))
+    valid_failures = (isinstance(failures_value, (list, tuple))
+                      and all(isinstance(value, str) and value.strip() for value in failures_value))
+    accounts = tuple(accounts_value) if valid_accounts else ()
+    failures = tuple(failures_value) if valid_failures else ()
+    decode_complete = record_count == len(rows) and scan.get("decode_complete", True) is True
+    identities, labels = {}, {}
+    identity_complete = valid_accounts and valid_failures
+    for row in rows:
+        account_id, message_id = row["account_id"], row["message_id"]
+        if not account_id or not message_id or row["account"] not in accounts:
+            identity_complete = False
+        key = (account_id, message_id)
+        if key in identities and identities[key] != row:
+            identity_complete = False
+        if account_id in labels and labels[account_id] != row["account"]:
+            identity_complete = False
+        identities[key], labels[account_id] = row, row["account"]
+    # One display label naming several native accounts cannot demonstrate
+    # per-account coverage with today's label-only coverage envelope.
+    if len(set(labels.values())) != len(labels):
+        identity_complete = False
+    complete = (scan.get("complete") is True and valid_accounts and valid_failures
+                and not failures and decode_complete and identity_complete)
+    return RawEmailSnapshot(0, stamp, tuple(MappingProxyType(dict(row)) for row in rows),
+                            accounts, failures, complete, decode_complete, identity_complete,
+                            str(scan.get("failure_reason") or ""),
+                            hashlib.sha256(raw.encode("utf-8")).hexdigest())
+
+
+def raw_email_snapshot(*, expected_generation: int | None = None) -> RawEmailSnapshot | None:
+    """Read once for coherent provenance, or None for ineligible evidence.
+
+    Coverage describes the native recent body scan, not all mailbox history.
+    Restored/legacy globals alone never create a publication. Callers must use
+    this snapshot's rows and generation together, not reread _parse_raw() or
+    raw_reference_metadata(). Holding an older returned object cannot mutate it.
+    """
+    with _raw_snapshot_lock:
+        snapshot = _raw_mail_snapshot
+        if (snapshot is None or _email_available is not True or not snapshot.complete
+                or not 0 <= time.time() - snapshot.synced_at <= 20 * 60
+                or (expected_generation is not None and expected_generation != snapshot.generation)):
+            return None
+        return snapshot
+
+
 def cache_raw_emails(raw: str, coverage: dict | None = None) -> None:
     global _raw_emails, _raw_emails_at, _raw_reference_scan
-    if coverage and coverage.get("failed_accounts") and not coverage.get("accounts"):
-        _raw_reference_scan = {**coverage, "synced_at": time.time(), "complete": False}
-        return  # failed scan is not evidence that old display data disappeared
-    _raw_emails = raw or ""
-    _raw_emails_at = time.time()
-    # A skipped record may be another match. A successful native scan cannot
-    # establish uniqueness when its wire representation was not fully decoded.
-    record_count = sum(bool(record.strip()) for record in _raw_emails.split(_RAW_RS))
-    _raw_reference_scan = {**(coverage or {}), "synced_at": _raw_emails_at,
-                           "decode_complete": record_count == len(_parse_raw())}
-    cache_store.save("email_raw", _raw_emails)
+    global _raw_mail_snapshot, _raw_snapshot_generation
+    raw = raw or ""
+    stamp = time.time()
+    scan = dict(coverage or {})
+    for key in ("accounts", "failed_accounts"):
+        if isinstance(scan.get(key), (list, tuple)):
+            scan[key] = list(scan[key])  # Own the mutable caller envelope before parsing.
+    # Prepare from arguments only. A concurrent writer cannot change which
+    # bytes these account/message/coverage checks describe.
+    candidate = _raw_snapshot_candidate(raw, scan, stamp)
+    with _raw_snapshot_lock:
+        _raw_snapshot_generation += 1
+        snapshot = RawEmailSnapshot(_raw_snapshot_generation, candidate.synced_at,
+            candidate.rows, candidate.accounts, candidate.failed_accounts, candidate.complete,
+            candidate.decode_complete, candidate.identity_complete, candidate.failure_reason,
+            candidate.raw_digest)
+        if scan.get("failed_accounts") and not scan.get("accounts"):
+            _raw_reference_scan = {**scan, "synced_at": stamp, "complete": False}
+            _raw_mail_snapshot = snapshot
+            return  # Preserve old display bytes, never their complete provenance.
+        _raw_emails, _raw_emails_at = raw, stamp
+        _raw_reference_scan = {**scan, "synced_at": stamp,
+                               "decode_complete": candidate.decode_complete}
+        _raw_mail_snapshot = snapshot  # Atomic body + identity + coverage publication.
+        cache_store.save("email_raw", raw)
 
 
 def raw_reference_metadata() -> dict:
@@ -396,13 +493,19 @@ def _purge_raw_if_expired() -> None:
     """Drop the raw cache once it's more than a week old (see _RAW_TTL_SECONDS).
     Checked lazily on read rather than via a background task: same effect, no
     extra scheduler needed."""
-    global _raw_emails, _raw_emails_at
-    if _raw_emails_at and (time.time() - _raw_emails_at) > _RAW_TTL_SECONDS:
-        _raw_emails = ""
-        _raw_emails_at = 0.0
+    global _raw_emails, _raw_emails_at, _raw_mail_snapshot
+    with _raw_snapshot_lock:
+        if _raw_emails_at and (time.time() - _raw_emails_at) > _RAW_TTL_SECONDS:
+            _raw_emails = ""
+            _raw_emails_at = 0.0
+            _raw_mail_snapshot = None
 
 
 def _parse_raw() -> list[dict]:
+    return _parse_raw_text(_raw_emails)
+
+
+def _parse_raw_text(raw: str) -> list[dict]:
     """Each raw record -> {ts, account, sender, to, subject, message_id, body}.
     Skips anything that doesn't parse (e.g. a message AppleScript couldn't
     read).
@@ -417,7 +520,7 @@ def _parse_raw() -> list[dict]:
     and can't be replied to/archived until they're re-synced.
     """
     out: list[dict] = []
-    for record in _raw_emails.split(_RAW_RS):
+    for record in raw.split(_RAW_RS):
         record = record.strip()
         if not record:
             continue

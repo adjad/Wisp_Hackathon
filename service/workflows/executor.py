@@ -15,7 +15,7 @@ from service.tasks.models import TaskExecution
 from service.tools.registry import (
     DisplayOnlyToolResult, get_tool, run_tool, classify_tool_outcome, _validate_args,
 )
-from service.workflows.compiler import SOURCE_TO_TOOL, compile_decision
+from service.workflows.compiler import compile_decision, source_call
 from service.workflows.present import compose
 
 
@@ -171,7 +171,7 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
     if test_mode:
         # Do not read Contacts, inboxes or networks, or open real draft windows.
         for source in plan.sources:
-            await invoke(SOURCE_TO_TOOL[source], plan.source_args.get(source, {}))
+            await invoke(*source_call(plan,source))
         return finish("planned", "Dry run only — no data was read and nothing was sent. "
                       "Delivery needs successful source reads and recipient validation.")
 
@@ -190,8 +190,8 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
         if not owns_revision():
             return finish("failed", "Nothing sent: this delivery request was changed "
                           "or cancelled before its private source could be read.")
-        name = SOURCE_TO_TOOL[source]
-        status, raw = await invoke(name, plan.source_args.get(source, {}))
+        name,args = source_call(plan,source)
+        status, raw = await invoke(name,args)
         if status != "succeeded" or not usable_source(name, raw):
             return finish("failed", f"Nothing sent: the required {source} lookup "
                           f"did not produce a complete verified result.\n{raw}")

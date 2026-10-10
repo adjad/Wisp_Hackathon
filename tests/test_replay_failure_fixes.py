@@ -481,7 +481,10 @@ def test_calendar_tool_filters_month_boundary_and_source_kind(monkeypatch):
     ]
     for row in rows:
         row["kind"] = "event" if row["source"] == "calendar" else "reminder"
-    monkeypatch.setattr(assistant_tools, "assistant_store", SimpleNamespace(active_between=lambda *a: rows))
+    monkeypatch.setattr(assistant_tools, "assistant_store", SimpleNamespace(
+        active_between=lambda *a: rows,
+        calendar_events_overlapping=lambda start, end: [row for row in rows
+            if row["source"] == "calendar" and start <= row["when_ts"] < end]))
     monkeypatch.setattr(assistant_tools.time, "time", lambda: NOW.timestamp())
     monkeypatch.setattr(sync_status, "ensure_sources", AsyncMock(return_value={"sources": []}))
     real_resolve = timeranges.resolve_span

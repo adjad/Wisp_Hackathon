@@ -186,6 +186,8 @@ _TOOL_EFFECTS = {
     "clear_past_reminders": "deleted", "clear_reminders": "deleted",
     "toggle_setting": "changed", "write_file": "written", "move_path": "moved",
     "delete_path": "deleted", "trash_file": "deleted", "organize_files": "moved",
+    "commit_private_meeting": "created",
+    "save_knowledge": "created", "edit_knowledge": "updated", "delete_knowledge": "deleted",
 }
 
 
@@ -243,6 +245,9 @@ def classify_tool_outcome(tool_name: str, result: str, *, planned: bool = False,
         "reply_to_email": "reply sent", "forward_email": "forwarded to ",
         "schedule_send": "scheduled:", "draft_email": "draft opened in mail",
         "draft_message": "message draft prepared in wisp",
+        "commit_private_meeting": "private calendar block created: ",
+        "save_knowledge": "saved knowledge: ", "edit_knowledge": "updated knowledge: ",
+        "delete_knowledge": "deleted knowledge: ",
     }
     if tool_name in receipts and not low.startswith(receipts[tool_name]):
         return ToolOutcome("failed", text, effect)

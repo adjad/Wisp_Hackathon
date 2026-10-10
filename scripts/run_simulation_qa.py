@@ -301,6 +301,27 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_user_reported_regressions_20260903_noon.py",
     "tests/test_user_reported_regressions_20260908.py",
     "tests/test_user_facing_summary_thinking.py",
+    # Reviewed synthetic Workflow20 fixtures: temporary state, fake providers,
+    # and guarded owned Python children; no live inference or personal sources.
+    "tests/test_workflow20_availability.py",
+    "tests/test_workflow20_calendar.py",
+    "tests/test_workflow20_compiler.py",
+    "tests/test_workflow20_daily.py",
+    "tests/test_workflow20_email_threads.py",
+    "tests/test_workflow20_files.py",
+    "tests/test_workflow20_knowledge.py",
+    "tests/test_workflow20_meeting.py",
+    "tests/test_workflow20_meeting_approval.py",
+    "tests/test_workflow20_messages.py",
+    "tests/test_workflow20_model_pilot.py",
+    "tests/test_workflow20_pending_actions.py",
+    "tests/test_workflow20_routing.py",
+    "tests/test_workflow20_schedule_time.py",
+    "tests/test_workflow20_snapshot.py",
+    "tests/test_workflow20_travel.py",
+    "tests/test_workflow20_unsubscribe.py",
+    "tests/test_workflow20_weather.py",
+    "tests/workflow20/test_contract.py",
 }
 # Integrated runtime contracts are mandatory; missing files fail selection.
 MINI_RUNTIME_INTEGRATION_TESTS = {

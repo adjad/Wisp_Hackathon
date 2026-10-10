@@ -1414,6 +1414,38 @@ class AssistantStore:
         with self._lock:
             return self.undated_view(), self.undated_reminders(query)
 
+    def raw_reminder_list_snapshot(self, *, list_label: str = "", query: str = "",
+                                   limit: int = 500) -> dict:
+        """Native incomplete rows and receipts in one read transaction, without collapse.
+
+        Context is only a list label: this carrier supplies no stable list or
+        account identity. Distinct native IDs with equal titles remain distinct.
+        """
+        if (not isinstance(list_label, str) or not isinstance(query, str)
+                or type(limit) is not int or not 1 <= limit <= 500):
+            raise ValueError("invalid Reminder list filters or bounds")
+        with self.transaction(write=False) as db:
+            receipt_row = db.execute("SELECT payload FROM today_source_sync WHERE source='reminders'").fetchone()
+            receipt = json.loads(receipt_row["payload"]) if receipt_row else {}
+            dated_total = db.execute("SELECT COUNT(*) FROM commitments WHERE source='reminders' AND status='active'").fetchone()[0]
+            dated = [dict(row) for row in db.execute(
+                "SELECT id,source_id,title,context,when_ts,status FROM commitments "
+                "WHERE source='reminders' AND status='active' ORDER BY when_ts,source_id LIMIT 5000").fetchall()]
+            undated = self.undated_reminders()
+            view = self.undated_view()
+        label, needle = list_label.strip().casefold(), query.strip().casefold()
+        def matches(row):
+            return ((not label or str(row.get("context") or "").strip().casefold() == label)
+                    and (not needle or needle in row["title"].casefold()))
+        rows = [{**row, "due_state": "dated"} for row in dated if matches(row)]
+        rows += [{**row, "due_state": "undated", "when_ts": None, "status": "active"}
+                 for row in undated if matches(row)]
+        return {"receipt": receipt, "undated_view": view, "dated_cached": dated_total,
+                "dated_inspected": len(dated), "scan_omitted": dated_total - len(dated),
+                "undated_cached": len(undated), "matching": len(rows), "shown": min(limit, len(rows)),
+                "omitted": max(0, len(rows) - limit), "records": rows[:limit],
+                "list_label": list_label, "stable_list_id": None, "account_id": None}
+
     def undated_view(self) -> dict:
         """How trustworthy the stored undated list is, read as one coherent unit.
 

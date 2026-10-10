@@ -12,12 +12,12 @@ Wisp_Hackathon repository; original Wisp main remains unchanged.
 | 02 Daily summary | Bounded composite daily_brief with source exclusions, current receipts, today Calendar and separate overdue/upcoming/undated reminders; shared daily/date-first briefing grammar and Calendar-only brief | Full summary content/coverage and local-model qualification |
 | 03 Time ranges | Exact calendar ranges, noun-position cal/weekend questions resolve to Saturday–Sunday ISO ranges; week/month availability and ongoing/overnight overlap regressions | Full end-to-end final answer grading and real-source validation |
 | 04 CA weather | 20 city names, aliases/four typo repairs, provider city/state/country validation; 175 focused offline tests | Real provider/network behavior; arbitrary misspellings remain unsupported |
-| 05 Priorities | Bounded priorities route uses the requested daily_brief window plus separate overdue/undated tasks and Notes evidence | Structured task ownership/due-date extraction, ranking and source-backed final answer |
+| 05 Priorities | Dedicated bounded collector reads selected Calendar/Reminders rows and receipts together, plus immutable Mail bodies, normalized Messages and coherent Notes publications. Task windows do not filter communication receipt dates. Exact source exclusions, IDs, omissions and uncertainty precede narration | Model-assisted ownership/deadline/ranking and source-backed final answer qualification; bounded cache coverage cannot prove absence |
 | 06 Contact said | Strict query/conversation misses; retrospective email/text questions stay reads; relationship questions remain private without saved contact metadata | All contact/time/topic/sender phrase binding and final answer verification |
 | 07 Thread/group recap | Cached chronological email bodies, account ambiguity, bounded-history disclosures and explicit named chat/date bindings | Real full-thread linkage/history retrieval; sender-wide filtering and summary reasoning qualification |
-| 08 Groceries | Existing Notes/Reminders reads with distinct sources | Checked items, quantities, list conflicts/deduplication in final synthesis |
+| 08 Groceries | Separate bounded Notes/Reminders evidence tools preserve native IDs, exact list versus item filters, note versus folder selection, literal checkbox states, freshness and omissions; quoted selectors remain data | Native list/account identity and rich Notes checkbox state unavailable; quantity conflicts and final synthesis need model qualification |
 | 09 Event time | Bounded named event questions preserve Calendar-only title and explicit period; fuzzy subject/assessment and numeric quiz identity controls | Ambiguity/updated event final answers across variations |
-| 10 Reminder/event create | Existing native bridge/confirmation/persistence | Synthetic approved completion matrix; recurrence/calendar selection unsupported |
+| 10 Reminder/event create | Existing native bridge/confirmation/persistence; returned helper rejects naive local DST gaps/folds before effects and preserves explicit-offset instants | Synthetic approved completion matrix; recurrence/calendar selection unsupported |
 | 11 SFO arrival | Bounded traffic/current-location provider contract; private arrival boundary preserves unresolved/compound requests for clarification; exact SFO/address/ISO/buffer bindings offer only checked travel read | Actual native provider integration; default provider unavailable, interface alone is not completion |
 | 12 Draft/send/schedule | Existing grounded workflows and durable approval-bound effects; recipient-before-channel drafts; source/dispatch dates separated; ambiguous/nonexistent DST clocks reject before queue/Contacts | Cross-source composition qualification, revised recipient approval tests; scheduled threaded replies unsupported |
 | 13 Unsubscribe | Truthful sender/account-bound unverified candidate preparation; no false success | Actual verified unsubscribe provider and historical-open evidence unavailable |
@@ -25,7 +25,7 @@ Wisp_Hackathon repository; original Wisp main remains unchanged.
 | 15 Personal knowledge/followups | Explicit knowledge routes precede Notes; bounded saved notes, style examples and inert follow-up candidates; exact cached source IDs and editable revisions; actual synthetic loop checks enforce prior reads, duplicate-effect guards and existing policy | Broad source indexing, automatic preparation and context/style-guided draft qualification remain incomplete; Mail imports now require one immutable eligible cache generation; cross-source draft qualification remains pending |
 | 16 Meeting | Checked private proposals use real event ends, exact duration and coherent fresh snapshots; bearer token remains host-only behind a turn-local one-use inert model reference; interactive approval precedes refreshed conflict/reference checks and strict native receipt | Actual native creation qualification and attendee invitation provider; generic meetings cannot silently become private blocks or invitations |
 | 17 Fuzzy test time | Bounded subject typo/test-exam synonyms; quiz/midterm/final distinctions; multiple identities retained | Natural request binding and end-to-end ambiguity/answer tests |
-| 18 Unread catchup | Actual unread Messages filtering; unknown-state/partial coverage; unread+date email intersection; shared basic direct reads | All qualified scope bindings and complete grounded catchup grading |
+| 18 Unread catchup | Actual unread Messages filtering; returned helpers disclose scoped unknown Mail read states even with no known unread rows and keep Messages matched/included/omitted coverage outside capped digests | All qualified scope bindings and complete grounded catchup grading |
 | 19 Availability message | Production delivery selects checked fresh/coherent find_free_time through a shared source contract; complete personally owned expression preserves periods/dayparts/integer-hour limits; stale/unknown-end/unsupported scope/denied preview blocks delivery | Empty availability still fails closed because the string result lacks a host-owned completion receipt. Half-hour bounds, multiple ranges and arbitrary conditions clarify. Local-model/native end-to-end qualification pending |
 | 20 Pending actions | Bounded recorded-status history, exact-ID full-body inspection, atomic cancel/claim and truthful result classification; history-aware routing | End-to-end status answers and scheduler/native lost-receipt behavior; app acceptance cannot establish recipient delivery |
 
@@ -210,3 +210,39 @@ not positive routing evidence. Authentication and watchdog clocks must remain
 real in a future model harness; the route diagnostic's frozen clock is not
 an inference guard. Missing unsubscribe/invitation/traffic capabilities must
 remain unsupported in synthetic model runs rather than receive fake success.
+
+## NEXT parallel development checkpoint
+
+The prior candidate `8f29033709694a8f1f6216f306c0bf3db3ef71bf` passed all
+198 isolated gates (27,780 reported passes, zero failures, 155 skips; one legacy
+count unparsed), both required CI jobs, independent audit `PASS_WITH_NOTES` and
+distinct isolated synthetic QA. The sole integrator merged PR3 as
+`5b04a7f4c60a6d6ee4fb6562b0618205a65fdf0a`, with the exact audited tree.
+These receipts qualify that frozen candidate's stated scope only.
+
+Separate NEXT work adds the priority and grocery collectors above. Before
+consolidation, development checks passed 300 focused and 1,068 broader cases.
+Agents reviewed the new source boundaries and found two repaired issues: quoted
+shopping labels could activate unrelated finalization obligations, and filtered
+query matches were counted as inspected native rows. Regression cases preserve
+quoted data isolation and distinguish scan caps, query matches and omissions.
+Metadata overflow now returns a bounded error after whole records are exhausted.
+Initial fixture failures and the reproduced routing failures remain in external
+development logs. After the final count and selector validation repairs, 566
+focused/source-sync/Notes regressions passed; these remain development evidence.
+
+Returned helper checkpoints are Mail `c879e114d01dd48a7e886aac4159448c077ea746`
+(106 focused passes), Messages `f8f4a3352528202ca066fb207bc397458df926b4`
+(1,472 combined passes, including its predecessor), and Reminder
+`a11d43d9ad805da3e4d4c89948a242af98ab7781` (87 passes, one opt-in Ling skip).
+Their initial failures and repairs are retained. These are isolated development
+results; consolidation requires a new frozen head, full checks, required CI,
+independent audit and distinct QA.
+
+Priority native completeness remains unknown because the existing receipt
+carrier lacks a complete inventory attestation. Global scan limits precede
+selectors and explicitly disclose uninspected rows. Mail direction and Messages
+publication freshness may be unknown; a Notes modification time cannot date
+individual sentences. No real model, native data, device, performance or all-20
+qualification has run. iPhone has separate source ownership and unsigned
+simulator evidence; this Mac checkpoint does not qualify an iPhone deployment.

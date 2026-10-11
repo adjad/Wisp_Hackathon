@@ -421,3 +421,21 @@ def test_low_confidence_patterns_stay_out_of_the_profile_card(tmp_path):
     strong = Pattern(id="s", kind="habit", subject="fitness", statement="You work out", confidence=0.8)
     card = profile_mod.profile_card([weak, strong], [], T0, TZ)
     assert "You work out" in card and "Sam" not in card
+
+
+def test_profile_leads_with_personal_habits_and_people_before_meetings(eng):
+    """The card should make the user feel known: the gym and Dev come before a
+    recurring "Team lunch", which comes after cancel habits, day shape and Wisp use."""
+    persona = generate_persona(T0)
+    eng.observe(persona.observations + persona.upcoming)
+    eng.mine(T0)
+    card = eng.profile_card(T0, max_bytes=4000)
+    gym, dev, lunch = card.index("work out"), card.index("Dev Malik"), card.index("Team lunch")
+    assert gym < dev < lunch
+    assert card.index("back-to-back") < lunch
+    statements = [p["statement"] for p in eng.describe()["patterns"]]
+    first = lambda word: next(i for i, s in enumerate(statements) if word in s)   # noqa: E731
+    assert first("work out") < first("Dev Malik") < first("Team lunch")
+    # At the default cap the personal lines still lead.
+    about = eng.profile_card(T0).split("\n")[1:3]
+    assert "work out" in about[0] and "Dev Malik" in about[1]

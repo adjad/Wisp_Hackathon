@@ -3,7 +3,9 @@
 The card is small by contract (default 700 UTF-8 bytes) because it rides along
 with every request. It is code-composed: pattern statements and prediction
 lines only, so nothing in it is a model's paraphrase of the user. Ranking
-favours what the user confirmed, then confidence, and takes the best pattern of
+favours what the user confirmed, then leads with what makes the user feel
+known (personal habits, the people, what they cancel or protect) before the
+day's shape, Wisp usage and recurring meetings, and takes the best pattern of
 each kind first so one busy calendar of recurring meetings cannot crowd out the
 gym, the people and the cancel habits.
 """
@@ -37,6 +39,22 @@ def _group(p: Pattern) -> str:
     return p.kind
 
 
+# Personal-life habit categories: what the user does for themselves, not what
+# their calendar of meetings repeats.
+_PERSONAL_CATEGORIES = ("fitness", "health", "personal")
+# Lower tier first: personal habits, contact rhythms, cancel/move propensity,
+# habit protection, day shape, Wisp usage, then recurring meetings/other habits.
+_TIER = {"contact_rhythm": 1, "cancel_propensity": 2, "habit_protection": 3, "day_shape": 4,
+         "wisp_usage": 5}
+
+
+def _tier(p: Pattern) -> int:
+    if p.kind == "habit":
+        return 0 if (p.stats.get("key_type") == "category"
+                     and p.stats.get("key") in _PERSONAL_CATEGORIES) else 6
+    return _TIER.get(p.kind, 7)
+
+
 def _score(p: Pattern) -> float:
     w = _KIND_WEIGHT.get(p.kind, 0.5)
     if _group(p) in ("habit:calendar", "habit:notes"):
@@ -45,11 +63,12 @@ def _score(p: Pattern) -> float:
 
 
 def rank_patterns(patterns: list[Pattern]) -> list[Pattern]:
-    """Confirmed first; then the best of each kind; then everything else by score.
-    Rejected and low-confidence (unconfirmed) patterns are left out."""
+    """Confirmed first; then the best of each kind; then everything else, each
+    pass in tier order (_tier) and by score within a tier. Rejected and
+    low-confidence (unconfirmed) patterns are left out."""
     usable = [p for p in patterns if p.status != "rejected"
               and (p.status == "confirmed" or p.confidence >= MIN_CONFIDENCE)]
-    ordered = sorted(usable, key=lambda p: (p.status != "confirmed", -_score(p), p.id))
+    ordered = sorted(usable, key=lambda p: (p.status != "confirmed", _tier(p), -_score(p), p.id))
     first, rest, groups = [], [], set()
     for p in ordered:
         if p.status == "confirmed" or _group(p) not in groups:

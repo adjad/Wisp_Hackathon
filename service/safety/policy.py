@@ -559,6 +559,9 @@ def decide(category: str, args: dict, tool: str | None = None) -> Decision:
     given ("always allow this") — see service/safety/grants.py. Optional so
     older call sites keep working; without it, only the category rules apply.
     """
+    from service.inference.remote_policy import remote_only_profile, remote_demo_tool_allowed
+    if remote_only_profile() is not None and not remote_demo_tool_allowed(tool):
+        return Decision(Tier.DENY, "This action is unavailable in the four-read remote-only demo")
     # The floor runs before everything, including full_access and grants.
     # `disable_safety_floor` only ever meant "let full_access mean literally
     # everything" — outside full_access these checks have always been

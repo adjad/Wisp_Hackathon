@@ -512,7 +512,13 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
         "to": recipients, "cc": _split_recipients(cc),
         "subject": subject or "", "body": body or "",
     })
-    if not res.get("ok"):
+    if res.get("ok") is not True or ("status" in res and res["status"] != "succeeded"):
+        if not (res.get("ok") is False and res.get("status") == "not_attempted"
+                and res.get("dispatch_started") is False):
+            from service.tools.registry import _OutboundUnknownResult
+            return _OutboundUnknownResult(
+                "Email outcome unknown — sending was not confirmed. Check Mail before trying again; do not retry automatically.",
+                operation="send_email", action_id=res.get("action_id") or "")
         return f"(the email was NOT sent: {res.get('error') or 'unknown error'})"
     return f"Email sent to {', '.join(recipients)}."
 
@@ -806,11 +812,19 @@ async def reply_to_email(message_id: str, body: str, reply_all: bool = False,
         "message_id": message_id, "body": body, "reply_all": bool(reply_all),
         "account": account, "expected_reply": expected,
     })
-    if res.get("ok") is not True:
-        return (f"(the reply was not confirmed as sent: {res.get('error') or 'unknown error'}. "
-                "Check Mail before trying again; do not retry automatically.)")
+    if res.get("ok") is not True or ("status" in res and res["status"] != "succeeded"):
+        if (res.get("ok") is False and res.get("status") == "not_attempted"
+                and res.get("dispatch_started") is False):
+            return f"(reply NOT sent: {res.get('error') or 'publication did not start'})"
+        from service.tools.registry import _OutboundUnknownResult
+        return _OutboundUnknownResult(
+            "Reply outcome unknown — sending was not confirmed. Check Mail before trying again; do not retry automatically.",
+            operation="reply_to_email", action_id=res.get("action_id") or "")
     if res.get("accepted") is not True or not envelope_matches(res.get("reply"), expected):
-        return "(reply outcome unknown — the bridge did not confirm the approved reply. Check Mail before trying again; do not retry automatically.)"
+        from service.tools.registry import _OutboundUnknownResult
+        return _OutboundUnknownResult(
+            "Reply outcome unknown — the bridge did not confirm the approved reply. Check Mail before trying again; do not retry automatically.",
+            operation="reply_to_email", action_id=res.get("action_id") or "")
     return make_receipt(expected)
 
 
@@ -915,27 +929,26 @@ async def draft_email(to: str, subject: str, body: str, cc: str = "") -> str:
     category="messages_draft",
 )
 async def draft_message(to: str, text: str) -> str:
-    # No _own_address_guard here — same reasoning as draft_email above: this
-    # is the safe landing spot for an explicit self-send request, and a draft
-    # never sends on its own.
-    to = (to or "").strip()
-    if not to:
+    from service.tools.registry import _literal_message_recipient, _prepared_message_draft
+
+    # Preparation sends nothing. Only this successful host path mints a card.
+    if type(to) is not str or type(text) is not str:
+        return "(error: Draft recipient and body must be strings.)"
+    to = to.strip(" ")
+    if not to or any(ord(c) < 32 or ord(c) == 127 for c in to):
         return "(no recipient — ask the user who to text)"
     text = _degarble(text)
     if not text.strip():
         return "(nothing to draft — the message body is empty)"
-    display = to
-    if not (_EMAIL_RE.match(to) or re.fullmatch(r"[+()\-.\s\d]{7,}", to)):
+    literal = _literal_message_recipient(to)
+    if literal is None:
         handle, problem = _resolve_recipient(to)
         if problem:
             return problem
-        display = f"{to} ({handle})"
-        to = handle
-    # The structured card is emitted by the agent loop after this succeeds.
-    # Do not open Messages or type into its active conversation: the draft now
-    # remains inside Wisp until the user presses the card's Send button.
-    return (f"Message draft prepared in Wisp for {display} — nothing has been "
-            "sent. The user can edit or send it from the draft card.")
+        literal = _literal_message_recipient(handle)
+    if literal is None:
+        return "(error: Choose one supported literal phone number or email address.)"
+    return _prepared_message_draft(literal, text)
 
 
 @register(
@@ -1028,7 +1041,13 @@ async def forward_email(message_id: str, to: str, note: str = "") -> str:
     res = await app_request("forward_email", {
         "message_id": message_id, "to": resolved, "body": note,
     })
-    if not res.get("ok"):
+    if res.get("ok") is not True or ("status" in res and res["status"] != "succeeded"):
+        if not (res.get("ok") is False and res.get("status") == "not_attempted"
+                and res.get("dispatch_started") is False):
+            from service.tools.registry import _OutboundUnknownResult
+            return _OutboundUnknownResult(
+                "Forward outcome unknown — sending was not confirmed. Check Mail before trying again; do not retry automatically.",
+                operation="forward_email", action_id=res.get("action_id") or "")
         return f"(the forward was NOT sent: {res.get('error') or 'unknown error'})"
     return f"Forwarded to {', '.join(resolved)}."
 
@@ -1091,7 +1110,8 @@ async def send_message(to: str, text: str, confirmed_self_send: bool = False) ->
     to = (to or "").strip()
     if not to:
         return "(no recipient — ask the user who to text)"
-    text = _degarble(text)
+    if _unreviewed():
+        text = _degarble(text)
     if _unreviewed() and _looks_truncated(text):
         return ("(NOT sent — the draft looks cut off mid-sentence rather than "
                 "a complete message. Rewrite the complete text in "
@@ -1120,7 +1140,13 @@ async def send_message(to: str, text: str, confirmed_self_send: bool = False) ->
         return (f"(NOT sent — the message still has unfilled placeholders: "
                 f"{', '.join(holes[:4])}. Rewrite it with the real values.)")
     res = await app_request("send_message", {"to": to, "text": text})
-    if not res.get("ok"):
+    if res.get("ok") is not True or ("status" in res and res["status"] != "succeeded"):
+        if not (res.get("ok") is False and res.get("status") == "not_attempted"
+                and res.get("dispatch_started") is False):
+            from service.tools.registry import _OutboundUnknownResult
+            return _OutboundUnknownResult(
+                "Message outcome unknown — sending was not confirmed. Check Messages before trying again; do not retry automatically.",
+                operation="send_message", action_id=res.get("action_id") or "")
         return f"(the message was NOT sent: {res.get('error') or 'unknown error'})"
     return f"Message sent to {display}."
 

@@ -69,6 +69,9 @@ _name_handles: dict[str, list[str]] = {}
 
 
 def cache_contacts(mapping: dict) -> None:
+    from service.demo.founder import enabled
+    if enabled():
+        return
     global _contacts, _name_handles
     _contacts = {_norm_handle(k): v for k, v in (mapping or {}).items()
                  if k and v and _norm_handle(k)}
@@ -123,6 +126,9 @@ def clear_contacts() -> None:
 
 
 def apply_contacts_sync(body: dict) -> bool:
+    from service.demo.founder import enabled
+    if enabled():
+        return False
     global _contacts_revision, _contacts_applied_revision, _contacts_privacy_current
     revision = body.get("revision")
     if revision is not None and (type(revision) is not int or revision <= 0):
@@ -177,7 +183,8 @@ def resolve_contact(text: str, *, prefix_only: bool = False) -> str:
     label on a message line, so a phone number quoted inside the message BODY
     is left alone (rewriting body text would corrupt what was actually said).
     """
-    if not _contacts:
+    from service.demo.founder import enabled
+    if enabled() or not _contacts:
         return text
     if prefix_only:
         head, sep, rest = text.partition(":")
@@ -1884,14 +1891,32 @@ async def summarize_messages_for_conversation(conversation: str, *, day: str | N
             return f"(couldn't understand the date {day!r} — use 'today', 'yesterday', or YYYY-MM-DD)"
     else:
         start, end, span = float("-inf"), float("inf"), "recent messages"
-    selected = [(ts, context, text)
-                for ts, identity, context, text, _unread in records
-                if (identity, context) == (conversation_id, label) and start <= ts < end]
-    selected = filter_summary_message_rows(sorted(selected, key=lambda row: row[0]))
-    selected = selected[-max(1, min(count, 300)):]
+    matched = [(ts, context, text)
+               for ts, identity, context, text, _unread in records
+               if (identity, context) == (conversation_id, label) and start <= ts < end]
+    eligible = filter_summary_message_rows(sorted(matched, key=lambda row: row[0]))
+    selected = eligible[-max(1, min(count, 300)):]
+    omitted = len(eligible) - len(selected)
+    coverage = (f"Summary input coverage: {len(matched)} cached messages matched this chat/date scope; "
+                f"{len(eligible)} eligible after existing summary filters; "
+                f"{len(selected)} included in the digest input; "
+                f"{omitted} older eligible messages omitted by the count limit. "
+                f"{len(matched) - len(eligible)} messages excluded by summary filters.\n")
+    scan = structured_messages_snapshot()["coverage"]
+    if scan.get("reason") == "structured_feed_absent":
+        coverage += "Native scan coverage is unknown for this legacy feed. "
+    elif scan.get("status") != "complete":
+        coverage += "Messages scan coverage is partial. "
+    coverage += ("Only the available bounded cache was searched; cache freshness and complete "
+                 "chat history are unverified, and older or unsynced messages may be missing. "
+                 "The digest displays selected signals, not every included message.\n\n")
     if not selected:
-        return f"No substantive messages found in {label} for {span}."
-    return await _summarize(selected, f"{label} — {span}")
+        empty = ("Matching cached messages were all excluded by the existing summary filters."
+                 if matched else "No cached messages matched this chat/date scope.")
+        return (coverage + "No substantive messages were eligible for this summary. " + empty
+                + " This does not establish that the chat or its history is empty.")
+    # Keep coverage outside the digest's capped label and presentation budget.
+    return coverage + await _summarize(selected, f"{label} — {span}")
 
 
 def _matches(query: str, context: str, text: str) -> bool:
@@ -2142,6 +2167,9 @@ async def summarize_messages(day: str | None = None, count: int = 30,
     category="messages_read",
 )
 async def lookup_contact(name: str) -> str:
+    from service.demo.founder import enabled, contacts
+    if enabled():
+        return contacts(name, lookup=True)
     matches = find_contacts(name)
     if not matches:
         if not _name_handles:
@@ -2179,6 +2207,9 @@ async def lookup_contact(name: str) -> str:
     category="messages_read",
 )
 async def list_contacts(query: str = "") -> str:
+    from service.demo.founder import enabled, contacts
+    if enabled():
+        return contacts(query)
     names = contact_names()
     if not names:
         return ("(No contacts are synced yet — Wisp needs Contacts access, or "

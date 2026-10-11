@@ -958,6 +958,9 @@ def _agenda(now: float) -> dict:
     today_calendar = assistant_store.calendar_events_overlapping(day_start, day_end)
     items = _collapse_schedule_rows(
         today_calendar + assistant_store.upcoming(now=now, days=7))
+    from service.demo.founder import enabled, reminder_rows
+    if enabled():
+        items = [r for r in today_calendar if r.get("source") == "calendar"] + reminder_rows(now)
     today_items = []
     for item in items:
         when_ts = float(item["when_ts"])
@@ -1068,6 +1071,9 @@ def _schedule_section(now: float) -> str:
     elif any("reminders" in _kinds(item) for item in agenda["reminders"]):
         blocks.append("Apple Reminders deletion status is unverified; "
                       "Recently Deleted status cannot be confirmed here.")
+    from service.demo.founder import enabled, PROVENANCE
+    if enabled():
+        blocks.append(PROVENANCE)
     return "\n\n".join(blocks)
 
 

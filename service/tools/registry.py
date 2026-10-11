@@ -11,6 +11,117 @@ from typing import Any, Callable
 REGISTRY: dict[str, "Tool"] = {}
 
 
+class _OutboundUnknownResult(str):
+    """Ephemeral host uncertainty, never reconstructed from model/JSON text.
+
+    Only the four outbound wrappers mint this carrier after bridge dispatch or
+    a mismatched reply acknowledgment. Primitive metadata is immutable and
+    deliberately lost when a result is serialized, sliced, or coerced to str.
+    """
+    __slots__ = ("_operation", "_action_id")
+
+    def __new__(cls, text: str, *, operation: str, action_id: str):
+        if operation not in {"send_email", "send_message", "forward_email", "reply_to_email"}:
+            raise ValueError("Invalid outbound receipt operation")
+        if not isinstance(action_id, str) or not re.fullmatch(r"[A-Za-z0-9:_-]{0,128}", action_id):
+            raise ValueError("Invalid outbound action identity")
+        instance = super().__new__(cls, text)
+        object.__setattr__(instance, "_operation", operation)
+        object.__setattr__(instance, "_action_id", action_id)
+        return instance
+
+    @property
+    def operation(self):
+        return self._operation
+
+    @property
+    def action_id(self):
+        return self._action_id
+
+    def __setattr__(self, name, value):
+        raise AttributeError("Outbound uncertainty receipts are immutable")
+
+    def __delattr__(self, name):
+        raise AttributeError("Outbound uncertainty receipts are immutable")
+
+
+# In-process host provenance only: never reconstruct this authority from wire text.
+_DRAFT_ORIGIN = object()
+
+
+def _literal_message_recipient(value: Any) -> str | None:
+    """One whole phone/email handle; trim outer ASCII spaces, reject controls.
+
+    Phones retain the existing punctuation formats, with 7–15 ASCII digits.
+    Names, display-name addresses and recipient lists are not literal handles.
+    """
+    if type(value) is not str or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        return None
+    value = value.strip(" ")
+    if re.fullmatch(r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+", value):
+        local = value.split("@", 1)[0]
+        return value if not local.startswith(".") and not local.endswith(".") and ".." not in local else None
+    if (re.fullmatch(r"\+?[0-9(][0-9() .-]*[0-9)]", value)
+            and 7 <= len(re.sub(r"[^0-9]", "", value)) <= 15
+            and value.count("(") == value.count(")") <= 1
+            and ("(" not in value or value.index("(") < value.index(")"))):
+        return value
+    return None
+
+
+class _PreparedMessageDraft(str):
+    """Immutable host preparation receipt, not a send authorization/token."""
+    __slots__ = ("_draftorigin", "_resolved_to", "_prepared_text")
+
+    def __new__(cls, *, resolved_to: str, prepared_text: str, _origin=None):
+        if (_origin is not _DRAFT_ORIGIN or cls is not _PreparedMessageDraft
+                or type(resolved_to) is not str or not resolved_to
+                or _literal_message_recipient(resolved_to) != resolved_to
+                or type(prepared_text) is not str or not prepared_text.strip()):
+            raise ValueError("Invalid host draft preparation")
+        instance = super().__new__(cls, "Message draft prepared in Wisp — nothing has been sent. The user can edit or send it from the draft card.")
+        object.__setattr__(instance, "_draftorigin", _origin)
+        object.__setattr__(instance, "_resolved_to", resolved_to)
+        object.__setattr__(instance, "_prepared_text", prepared_text)
+        return instance
+
+    @property
+    def draftorigin(self):
+        return self._draftorigin
+
+    @property
+    def resolved_to(self):
+        return self._resolved_to
+
+    @property
+    def prepared_text(self):
+        return self._prepared_text
+
+    def __setattr__(self, name, value):
+        raise AttributeError("Prepared draft receipts are immutable")
+
+    def __delattr__(self, name):
+        raise AttributeError("Prepared draft receipts are immutable")
+
+
+def _prepared_message_draft(resolved_to: str, prepared_text: str) -> _PreparedMessageDraft:
+    return _PreparedMessageDraft(resolved_to=resolved_to, prepared_text=prepared_text,
+                                 _origin=_DRAFT_ORIGIN)
+
+
+def _valid_message_draft(result: Any, tool_name: str = "draft_message") -> bool:
+    if type(result) is not _PreparedMessageDraft or tool_name != "draft_message":
+        return False
+    try:
+        return (result.draftorigin is _DRAFT_ORIGIN
+                and type(result.resolved_to) is str
+                and bool(result.resolved_to)
+                and _literal_message_recipient(result.resolved_to) == result.resolved_to
+                and type(result.prepared_text) is str and bool(result.prepared_text.strip()))
+    except AttributeError:
+        return False
+
+
 class DisplayOnlyToolResult(str):
     """Escaped publisher text for deterministic UI presentation, never inference.
 
@@ -151,11 +262,13 @@ class Tool:
         return self.description if self.retrieval_description is None else self.retrieval_description
 
     def schema(self) -> dict:
+        from service.demo.founder import enabled, TOOL_DESCRIPTIONS
+        description = TOOL_DESCRIPTIONS.get(self.name, self.description) if enabled() else self.description
         return {
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
+                "description": description,
                 "parameters": self.parameters,
             },
         }
@@ -169,7 +282,7 @@ class ToolOutcome:
     loop a reliable distinction between success, denial/failure, and dry-run
     planning while individual tools migrate to richer native outcomes.
     """
-    status: str  # succeeded | no_match | needs_input | denied | failed | planned | unsupported
+    status: str  # succeeded | unknown | no_match | needs_input | denied | failed | planned | unsupported
     text: str
     effect: str = ""
     facts: dict[str, Any] = field(default_factory=dict)
@@ -200,6 +313,17 @@ def classify_tool_outcome(tool_name: str, result: str, *, planned: bool = False,
             "unsupported", text or UNAVAILABLE_TOOL_REASONS[tool_name], effect)
     if planned:
         return ToolOutcome("planned", text, effect)
+    if not denied and type(result) is _OutboundUnknownResult and result.operation == tool_name:
+        return ToolOutcome("unknown", text, effect, {"action_id": result.action_id})
+    if tool_name == "draft_message":
+        if denied:
+            return ToolOutcome("denied", text, effect)
+        if _valid_message_draft(result, tool_name):
+            return ToolOutcome("succeeded", text, effect)
+        low = text.strip().lower()
+        if "user denied this action" in low or low.startswith("blocked by safety"):
+            return ToolOutcome("denied", text, effect)
+        return ToolOutcome("failed", text, effect)
     low = text.strip().lower()
     if tool_name == "organize_files" and low.startswith("would move "):
         return ToolOutcome("preview", text, effect)
@@ -366,6 +490,9 @@ async def run_tool(tool: Tool, args: dict) -> str:
     the model can read and correct on its next step, the same way a wrong
     file path or an ambiguous title already does.
     """
+    from service.inference.remote_policy import remote_only_profile, remote_demo_tool_allowed
+    if remote_only_profile() is not None and not remote_demo_tool_allowed(tool.name):
+        return "This action is unavailable in the four-read remote-only demo; nothing was executed."
     if tool.unavailable_reason:
         return tool.unavailable_reason
     # Drop junk empty-name keys before dispatch. Small models emit `{"": ""}`
@@ -396,13 +523,19 @@ async def run_tool(tool: Tool, args: dict) -> str:
         # tool at a time, and nothing here touches oMLX.
         if inspect.iscoroutinefunction(tool.func):
             res = await tool.func(**args)
-            return res if isinstance(res, (DisplayOnlyToolResult, PublicSearchToolResult)) else str(res)
+            if (type(res) is _OutboundUnknownResult or _valid_message_draft(res, tool.name)
+                    or isinstance(res, (DisplayOnlyToolResult, PublicSearchToolResult))):
+                return res
+            return str(res)
         res = await asyncio.to_thread(tool.func, **args)
         # A sync function can still RETURN an awaitable (a plain `def` that
         # hands back a coroutine); to_thread only resolves the call itself.
         if inspect.isawaitable(res):
             res = await res
-        return res if isinstance(res, (DisplayOnlyToolResult, PublicSearchToolResult)) else str(res)
+        if (type(res) is _OutboundUnknownResult or _valid_message_draft(res, tool.name)
+                    or isinstance(res, (DisplayOnlyToolResult, PublicSearchToolResult))):
+            return res
+        return str(res)
     except TypeError as e:
         return (f"(error calling {tool.name}({args!r}): {e}. "
                 f"Expected arguments — {_arg_hint(tool)}. Call it again with corrected arguments.)")

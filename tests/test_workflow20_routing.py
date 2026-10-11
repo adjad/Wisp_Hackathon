@@ -422,13 +422,114 @@ def test_calendar_exclusion_also_excludes_new_planner():
 @pytest.mark.parametrize("prompt", ["What should I work on now?", "What should I work on tomorrow?", "What do I need to do this week?"])
 def test_priorities_can_recover_overdue_reminders(prompt):
     decision = asyncio.run(R.route(prompt))
-    assert "daily_brief" in decision.tool_subset
+    assert decision.tool_subset == ["collect_task_evidence"]
     assert "web_search" in decision.forbidden_tools
     period = "tomorrow" if "tomorrow" in prompt else "this week" if "this week" in prompt else "today"
-    assert decision.tool_argument_bindings["daily_brief"] == {
-        "period": period, "include_overdue": True, "include_undated": True, "include_weather": False}
-    assert decision.tool_argument_bindings["search_notes"] == {"query": ""}
+    assert decision.tool_argument_bindings["collect_task_evidence"] == {
+        "period": period, "include_overdue": True, "include_undated": True,
+        **{f"include_{source}": True for source in ("email", "messages", "calendar", "notes", "reminders")}}
+    assert decision.direct_calls == [("collect_task_evidence", decision.tool_argument_bindings["collect_task_evidence"])]
+    assert decision.required_tool_groups == (frozenset({"collect_task_evidence"}),)
     assert "search_reminders" not in decision.tool_subset
+
+
+@pytest.mark.parametrize("prompt,excluded", [
+    ("What should I work on tomorrow without email and messages?", {"email", "messages"}),
+    ("Could you help me prioritize my tasks this week using notes and reminders only", {"email", "messages", "calendar"}),
+    ("What should I focus on tmrow from email", {"messages", "calendar", "notes", "reminders"}),
+    ("What should I tackle this month excluding notes", {"notes"}),
+])
+def test_priority_envelope_preserves_exclusions_before_all_reads(prompt, excluded):
+    from service.workflows.reads import compile_read
+    decision = asyncio.run(R.route(prompt))
+    assert compile_read(prompt) is None
+    args = decision.tool_argument_bindings["collect_task_evidence"]
+    assert {name.removeprefix("include_") for name, value in args.items() if name.startswith("include_")
+            and name not in {"include_overdue", "include_undated"} and value is False} == excluded
+    assert "web_search" in decision.forbidden_tools
+    assert decision.narration_after == frozenset({"collect_task_evidence"})
+
+
+@pytest.mark.parametrize("prompt", [
+    "What should I work on tomorrow and email Maya", "What should I work on using web",
+    "What should I work on if Maya agrees", "What should I work on tomorrow at 5pm",
+    "Explain what should I work on", "What should I buy for groceries and place an order",
+    "What should I get for groceries using email", "What should I get for groceries without checking notes",
+])
+def test_evidence_grammar_does_not_drop_additional_conditions_or_actions(prompt):
+    from service.workflows.workflow20 import priority_read, grocery_read
+    assert priority_read(prompt) is None and grocery_read(prompt) is None
+
+
+@pytest.mark.parametrize("prompt,names", [
+    ("What should I get for groceries?", {"grocery_note_evidence", "grocery_reminder_evidence"}),
+    ("Read my notes and reminders for groceries.", {"grocery_note_evidence", "grocery_reminder_evidence"}),
+    ("Show my shopping list without notes", {"grocery_reminder_evidence"}),
+    ("What is on my grocery list using notes", {"grocery_note_evidence"}),
+])
+def test_shopping_reads_each_selected_source_and_no_excluded_source(prompt, names):
+    from service.workflows.reads import compile_read
+    decision = asyncio.run(R.route(prompt))
+    assert compile_read(prompt) is None
+    assert set(decision.tool_subset) == names
+    assert {name for name, _ in decision.direct_calls} == names
+    assert set(decision.required_tool_groups) == {frozenset({name}) for name in names}
+    assert decision.narration_after == frozenset(names)
+    assert "web_search" in decision.forbidden_tools
+
+
+def test_shopping_keeps_exact_list_and_item_query_in_separate_bindings():
+    prompt = 'What should I get for groceries in my "Costco" list containing "oat milk" without notes'
+    decision = asyncio.run(R.route(prompt))
+    assert decision.tool_argument_bindings == {"grocery_reminder_evidence": {"list_label": "Costco", "query": "oat milk", "label_kind": "list"}}
+
+
+@pytest.mark.parametrize("literal", ["organize my files", "remind me to delete files tomorrow", "without notes and reminders", "send an email to Maya"])
+def test_quoted_shopping_item_is_inert_during_structural_finalization(literal):
+    decision = asyncio.run(R.route(f'Show my grocery list using notes containing "{literal}"'))
+    assert decision.tool_subset == ["grocery_note_evidence"]
+    assert decision.tool_argument_bindings == {"grocery_note_evidence": {"list_label": "", "query": literal}}
+    assert decision.required_tool_groups == (frozenset({"grocery_note_evidence"}),)
+    assert not {"organize_files", "add_reminder", "send_email"} & set(decision.tool_subset)
+
+
+@pytest.mark.parametrize("prompt", ['Show my grocery list using notes in my "  " folder',
+    'Show my grocery list containing "  "', 'Show my grocery list in my "Costco" folder'])
+def test_unsupported_shopping_selector_never_becomes_an_unfiltered_shortcut(prompt):
+    from service.workflows.workflow20 import grocery_read
+    assert grocery_read(prompt) is None
+
+
+@pytest.mark.parametrize("prompt", ["What should I work on tomorrow without email", "What should I get for groceries without notes"])
+def test_evidence_collectors_execute_before_first_model_narration(monkeypatch, prompt):
+    from service.agent import loop
+    from tests.test_direct_dispatch_exec import Approver, ScriptedClient
+    import socket
+    import subprocess
+    def forbidden(*args, **kwargs): raise AssertionError("no network/native effect")
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr("service.memory.identity.identity_prompt_block", lambda **kwargs: "")
+    decision = asyncio.run(R.route(prompt))
+    calls = []
+    async def read(tool, args):
+        calls.append((tool.name, args))
+        return "Synthetic source-backed evidence; no action occurred."
+    monkeypatch.setattr(loop, "run_tool", read)
+    class Client(ScriptedClient):
+        async def stream_events(self, *args, **kwargs):
+            assert calls == decision.direct_calls
+            async for event in super().stream_events(*args, **kwargs): yield event
+    client = Client([{"content": "Synthetic suggestion with source uncertainty."}])
+    events = []
+    async def emit(event): events.append(event)
+    asyncio.run(loop.run_agent(client, "Agents-A1-4B-oQe6", [{"role": "user", "content": decision.resolved_request}],
+        emit, Approver(), tools=decision.tool_subset, direct_calls=decision.direct_calls,
+        tool_argument_bindings=decision.tool_argument_bindings, narration_after=decision.narration_after,
+        required_tool_groups=decision.required_tool_groups, forbidden_tools=decision.forbidden_tools,
+        multi_round=decision.multi_round, include_memory_context=False, max_steps=2))
+    assert calls == decision.direct_calls and len(client.calls) == 1
+    assert not any(event["type"] == "confirm" for event in events)
 
 
 @pytest.mark.parametrize("prompt,args", [
@@ -704,10 +805,12 @@ def test_calendar_as_verb_does_not_turn_reads_into_writes(prompt):
     "Cancel Maya agenda email", "Cancel Maya agenda email but leave Lee weekly email",
     "Please cancel the Mom summary text",
 ])
-def test_named_delivery_cancel_requires_queue_discovery_and_exact_selection(prompt):
+def test_named_delivery_cancel_requires_read_only_discovery_and_new_exact_selection(prompt):
     decision = asyncio.run(R.route(prompt))
     assert "list_scheduled_sends" in decision.tool_subset
-    assert "cancel_scheduled_send" in decision.tool_subset
+    assert "cancel_scheduled_send" not in decision.tool_subset
+    assert "cancel_scheduled_send" in decision.forbidden_tools
+    assert "unconditional single exact-ID" in decision.resolved_request
     assert decision.tool_argument_bindings["list_scheduled_sends"] == {"status": "pending"}
     assert not decision.direct_calls
     assert decision.resolved_request.startswith(prompt + "\n")
@@ -824,3 +927,556 @@ def test_public_weather_does_not_use_personal_data_voice():
     assert decision.direct_calls == [('get_weather', {'location':'Tokyo','period':''})]
     assert decision.tool_subset == ['get_weather']
     assert not decision.light_read
+
+
+@pytest.fixture
+def exact_cancel_queue(tmp_path, monkeypatch):
+    from service.assistant import outbound_queue as queues
+    from service.assistant.outbound_queue import OutboundQueue
+    from service.tools import action_tools
+    from service.safety import policy, grants
+    from service.agent import loop
+    import socket
+    import subprocess
+    queue = OutboundQueue(tmp_path / 'fictional-cancel.sqlite')
+    monkeypatch.setattr(queues, 'outbound_queue', queue)
+    def forbidden(*args, **kwargs): raise AssertionError('no native/network/model effects')
+    async def async_forbidden(*args, **kwargs): forbidden()
+    monkeypatch.setattr(socket.socket, 'connect', forbidden)
+    monkeypatch.setattr(socket.socket, 'connect_ex', forbidden)
+    monkeypatch.setattr(subprocess, 'Popen', forbidden)
+    monkeypatch.setattr(action_tools, 'app_request', async_forbidden)
+    from service.assistant import outbox
+    monkeypatch.setattr(outbox, 'request', async_forbidden)
+    monkeypatch.setattr(policy, '_FULL_ACCESS', False)
+    monkeypatch.setattr(policy, '_READ_ONLY', False)
+    monkeypatch.setattr(grants, 'check', lambda *args, **kwargs: None)
+    monkeypatch.setattr(loop, 'audit', lambda *args, **kwargs: None)
+    monkeypatch.setattr('service.memory.identity.identity_prompt_block', lambda **kwargs: '')
+    yield queue
+    queue._db.close()
+
+
+def _exact_cancel_loop(monkeypatch, queue, *, read_error=False, missing=False, read_only=False,
+                       claim_after_read=False, duplicate=False, suffix='', quoted_id=False, malformed_id=False):
+    from service.agent import loop
+    from service.safety import policy
+    from tests.test_direct_dispatch_exec import ScriptedClient, Approver, _tool_call
+    a = queue.add(channel='email', recipient='a@synthetic.invalid', body='Fixture A', when_ts=2000000000)
+    b = queue.add(channel='email', recipient='b@synthetic.invalid', body='Fixture B', when_ts=2000000000)
+    target = '000000000000' if missing else a
+    selector = target + '0' if malformed_id else target
+    prompt = f'Cancel pending email ' + (f'"{selector}"' if quoted_id else selector) + suffix
+    decision = asyncio.run(R.route(prompt))
+    monkeypatch.setattr(policy, '_READ_ONLY', read_only)
+    actual = loop.run_tool
+    calls = []
+    async def run(tool, args):
+        calls.append((tool.name, dict(args)))
+        if tool.name == 'list_scheduled_sends' and read_error:
+            return '(error: synthetic queue read unavailable)'
+        result = await actual(tool, args)
+        if tool.name == 'list_scheduled_sends' and claim_after_read:
+            assert queue.claim(a)
+        return result
+    monkeypatch.setattr(loop, 'run_tool', run)
+    script = [{'tool_calls': [_tool_call('list_scheduled_sends', {'id': b}, 'read')]},
+              {'tool_calls': [_tool_call('cancel_scheduled_send', {'id': b}, 'cancel')]}]
+    if duplicate:
+        script.append({'tool_calls': [_tool_call('cancel_scheduled_send', {'id': b}, 'duplicate')]})
+    script.append({'content': 'Synthetic result; actual state is asserted separately.'})
+    client, approver, events = ScriptedClient(script), Approver(), []
+    async def emit(event): events.append(event)
+    asyncio.run(loop.run_agent(client, 'Agents-A1-4B-oQe6', [{'role':'user','content':prompt}],
+        emit, approver, tools=decision.tool_subset, force_first_tool=decision.force_first_tool,
+        expect_tool_first=decision.expect_tool_first, required_tool_groups=decision.required_tool_groups,
+        tool_argument_bindings=decision.tool_argument_bindings, forbidden_tools=decision.forbidden_tools,
+        multi_round=decision.multi_round, include_memory_context=False, max_steps=8))
+    return a, b, target, calls, events
+
+
+def test_exact_cancel_actual_loop_cannot_switch_to_another_pending_id(monkeypatch, exact_cancel_queue):
+    queue = exact_cancel_queue
+    a, b, _, calls, events = _exact_cancel_loop(monkeypatch, queue, duplicate=True)
+    states = {key: queue.get(key)['status'] for key in (a, b)}
+    assert states == {a:'cancelled', b:'pending'}, (states, calls)
+    assert calls == [('list_scheduled_sends', {'id': a}), ('cancel_scheduled_send', {'id': a})]
+    assert any(event['type'] == 'tool_result' and event['result'].startswith('Cancelled [' + a) for event in events)
+
+
+@pytest.mark.parametrize('prompt', [
+    'Cancel pending email abcdef123456', 'Please stop my queued text ID abcdef123456.',
+    'Cancel the scheduled message with ID abcdef123456!', 'Stop queued delivery abcdef123456',
+])
+def test_exact_cancel_complete_clause_binds_same_literal_to_both_tools(prompt):
+    decision = asyncio.run(R.route(prompt))
+    assert decision.tool_argument_bindings['list_scheduled_sends'] == {'id':'abcdef123456'}
+    assert decision.tool_argument_bindings['cancel_scheduled_send'] == {'id':'abcdef123456'}
+    assert decision.required_tool_groups == (frozenset({'list_scheduled_sends'}),)
+    assert decision.force_first_tool == 'list_scheduled_sends' and not decision.direct_calls
+
+
+@pytest.mark.parametrize('prompt', [
+    'Cancel pending email abcdef123456 if Maya agrees',
+    'Cancel pending email abcdef123456 unless it is urgent',
+    'Cancel pending email abcdef123456 and abcdef123457',
+    'Cancel pending email abcdef123456 but keep abcdef123456',
+    'Cancel pending email abcdef123456 containing "if Maya agrees"',
+    'Cancel pending email abcdef123456 tomorrow',
+    'Cancel pending email abcdef123456 "if Maya agrees"',
+    'Cancel pending email abcdef1234567 if Maya agrees',
+    'Cancel pending email abcdef12345 unless it is urgent',
+    'Cancel pending email',
+    'Cancel pending ID abcdefabcde email',
+    'Cancel Maya email "if Maya agrees"',
+    'Cancel Maya email "abcdef1234567"',
+    'Cancel Maya email but keep it if Maya objects',
+])
+def test_exact_cancel_unconsumed_conditions_never_offer_cancellation(prompt):
+    decision = asyncio.run(R.route(prompt))
+    assert 'cancel_scheduled_send' not in decision.tool_subset
+    assert 'cancel_scheduled_send' in decision.forbidden_tools
+    assert 'cancel_scheduled_send' not in decision.tool_argument_bindings
+
+
+@pytest.mark.parametrize('mode', ['read_error','missing','read_only','claim_after_read'])
+def test_exact_cancel_actual_loop_negative_outcomes_never_touch_other_id(monkeypatch, exact_cancel_queue, mode):
+    queue = exact_cancel_queue
+    a, b, target, calls, events = _exact_cancel_loop(monkeypatch, queue, **{mode:True})
+    assert queue.get(b)['status'] == 'pending'
+    assert queue.get(a)['status'] == ('sending' if mode == 'claim_after_read' else 'pending')
+    assert not any(event['type']=='tool_result' and event['result'].startswith('Cancelled [') for event in events)
+    assert all(args['id'] == target for _, args in calls)
+    if mode in {'read_error','read_only'}:
+        assert all(name != 'cancel_scheduled_send' for name, _ in calls)
+
+
+@pytest.mark.parametrize('suffix', [' if Maya agrees', ' unless it is urgent', ' "if Maya agrees"'])
+def test_exact_cancel_actual_loop_conditional_request_cannot_mutate(monkeypatch, exact_cancel_queue, suffix):
+    queue = exact_cancel_queue
+    a, b, _, calls, events = _exact_cancel_loop(monkeypatch, queue, suffix=suffix)
+    assert queue.get(a)['status'] == queue.get(b)['status'] == 'pending'
+    assert all(name != 'cancel_scheduled_send' for name, _ in calls)
+    assert not any(event['type']=='tool_result' and event['result'].startswith('Cancelled [') for event in events)
+
+
+@pytest.mark.parametrize('suffix', ['', ' if Maya agrees'])
+def test_exact_cancel_quoted_id_never_grants_unbound_effect(monkeypatch, exact_cancel_queue, suffix):
+    queue = exact_cancel_queue
+    a, b, _, calls, _ = _exact_cancel_loop(monkeypatch, queue, quoted_id=True, suffix=suffix)
+    assert queue.get(a)['status'] == queue.get(b)['status'] == 'pending', calls
+    assert all(name != 'cancel_scheduled_send' for name, _ in calls)
+
+
+def test_exact_cancel_malformed_id_never_grants_unbound_effect(monkeypatch, exact_cancel_queue):
+    queue = exact_cancel_queue
+    a, b, _, calls, _ = _exact_cancel_loop(monkeypatch, queue, malformed_id=True, suffix=' if Maya agrees')
+    assert queue.get(a)['status'] == queue.get(b)['status'] == 'pending', calls
+    assert all(name != 'cancel_scheduled_send' for name, _ in calls)
+
+
+@pytest.mark.parametrize('prompt', ['Cancel Maya agenda email',
+    'Cancel Maya agenda email but leave Lee weekly email', 'Please cancel the Mom summary text'])
+def test_named_cancel_actual_loop_requires_new_user_exact_id(monkeypatch, exact_cancel_queue, prompt):
+    from service.agent import loop
+    from tests.test_direct_dispatch_exec import ScriptedClient, Approver, _tool_call
+    queue = exact_cancel_queue
+    a = queue.add(channel='email', recipient='maya@synthetic.invalid', display='Maya', subject='Agenda',
+                  body='Fictional Maya agenda', when_ts=2000000000)
+    b = queue.add(channel='email', recipient='lee@synthetic.invalid', display='Lee', subject='Weekly',
+                  body='Fictional Lee weekly', when_ts=2000000000)
+    calls = []
+    actual = loop.run_tool
+    async def run(tool, args):
+        calls.append((tool.name, dict(args)))
+        return await actual(tool, args)
+    monkeypatch.setattr(loop, 'run_tool', run)
+    async def turn(request, script):
+        decision = await R.route(request)
+        events = []
+        async def emit(event): events.append(event)
+        client, approver = ScriptedClient(script), Approver()
+        await loop.run_agent(client, 'Agents-A1-4B-oQe6', [{'role':'user','content':decision.resolved_request}],
+            emit, approver, tools=decision.tool_subset, force_first_tool=decision.force_first_tool,
+            expect_tool_first=decision.expect_tool_first, required_tool_groups=decision.required_tool_groups,
+            tool_argument_bindings=decision.tool_argument_bindings, forbidden_tools=decision.forbidden_tools,
+            multi_round=decision.multi_round, include_memory_context=False, allow_skill_context=False, max_steps=8)
+        return events, approver
+    events, approver = asyncio.run(turn(prompt, [
+        {'tool_calls':[_tool_call('list_scheduled_sends', {'status':'pending'}, 'read')]},
+        {'tool_calls':[_tool_call('cancel_scheduled_send', {'id':b}, 'hostile')]},
+        {'content':'Please choose the exact queue ID.'}]))
+    assert {key:queue.get(key)['status'] for key in (a,b)} == {a:'pending', b:'pending'}, calls
+    assert calls == [('list_scheduled_sends', {'status':'pending'})]
+    result = next(e['result'] for e in events if e['type']=='tool_result' and e['id']=='read')
+    assert a in result and b in result
+    assert approver.seen == []
+    # A separate, unconditional human request mints the exact target binding.
+    calls.clear()
+    asyncio.run(turn('Cancel scheduled message ' + a, [
+        {'tool_calls':[_tool_call('list_scheduled_sends', {'id':b}, 'read-selected')]},
+        {'tool_calls':[_tool_call('cancel_scheduled_send', {'id':b}, 'cancel-selected')]},
+        {'content':'Synthetic exact-target result.'}]))
+    assert calls == [('list_scheduled_sends', {'id':a}), ('cancel_scheduled_send', {'id':a})]
+    assert {key:queue.get(key)['status'] for key in (a,b)} == {a:'cancelled', b:'pending'}
+
+
+@pytest.mark.parametrize('response', ['yes', 'go ahead'])
+def test_named_cancel_discovery_acknowledgement_never_authorizes_cancellation(response):
+    d = asyncio.run(R.route(response, last_user='Cancel Maya agenda email',
+        last_assistant='Choose the exact queue ID before I can cancel it.', last_tools='list_scheduled_sends'))
+    assert 'cancel_scheduled_send' not in (d.tool_subset or ())
+    assert 'cancel_scheduled_send' in d.forbidden_tools
+
+
+# Real HTTP entry controls reuse disposable stores and blocked native/model sinks.
+from tests.test_workflow20_knowledge import knowledge_entrypoint, storage
+
+
+def _http_queue_pair(queue):
+    a = queue.add(channel='email', recipient='maya@synthetic.invalid', display='Maya',
+                  body='Fictional agenda', when_ts=2000000000)
+    b = queue.add(channel='email', recipient='lee@synthetic.invalid', display='Lee',
+                  body='Fictional weekly update', when_ts=2000000000)
+    return a, b
+
+
+def _http_queue_script(read_args, cancel_id=None, duplicate=False):
+    from tests.test_direct_dispatch_exec import _tool_call
+    script = [{'tool_calls':[_tool_call('list_scheduled_sends', read_args, 'read')]}]
+    if cancel_id:
+        script.append({'tool_calls':[_tool_call('cancel_scheduled_send', {'id':cancel_id}, 'cancel')]})
+    if duplicate:
+        script.append({'tool_calls':[_tool_call('cancel_scheduled_send', {'id':cancel_id}, 'duplicate')]})
+    return script + [{'content':'Synthetic queue evidence; choose an exact ID when needed.'}]
+
+
+@pytest.mark.parametrize('honest', [False, True])
+@pytest.mark.parametrize('duplicate', [False, True])
+def test_queue_actual_http_exact_id_reaches_checked_scope(knowledge_entrypoint, exact_cancel_queue, honest, duplicate):
+    state, queue = knowledge_entrypoint, exact_cancel_queue
+    a, b = _http_queue_pair(queue)
+    selected = a if honest else b
+    events = state.run('Cancel pending email ' + a, _http_queue_script({'id':selected}, selected, duplicate), transport='asgi')
+    assert queue.get(b)['status'] == 'pending'
+    if honest:
+        assert queue.get(a)['status'] == 'cancelled'
+    else:
+        assert queue.get(a)['status'] in {'pending', 'cancelled'}
+    assert state.tools == [('list_scheduled_sends', {'id':a}), ('cancel_scheduled_send', {'id':a})]
+    assert state.early == state.native == state.skill_selection == state.skill_context == []
+    assert not any(e['type'] in {'task_plan','workflow','confirm','error'} for e in events), events
+
+
+@pytest.mark.parametrize('template', [
+    'Cancel Maya agenda email', 'Cancel Maya agenda email but leave Lee weekly email',
+    'Cancel pending email "{a}"', 'Cancel pending email {a} if Maya agrees',
+    'Cancel pending email {a} and {b}', 'Cancel pending email {a}0',
+    'Show pending email {a}', 'Cancel pending email {a} unless Lee objects'])
+def test_queue_actual_http_unbound_targets_are_read_only(knowledge_entrypoint, exact_cancel_queue, template):
+    state, queue = knowledge_entrypoint, exact_cancel_queue
+    a, b = _http_queue_pair(queue)
+    prompt = template.format(a=a,b=b)
+    events = state.run(prompt, _http_queue_script({'status':'pending'}, b), transport='asgi')
+    assert {key:queue.get(key)['status'] for key in (a,b)} == {a:'pending',b:'pending'}, state.tools
+    assert [name for name,_ in state.tools] == ['list_scheduled_sends']
+    assert state.early == state.native == state.skill_selection == state.skill_context == []
+    assert not any(e['type'] in {'task_plan','workflow','confirm','error'} for e in events), events
+
+
+@pytest.mark.parametrize('failure', ['read', 'claim'])
+def test_queue_actual_http_read_failure_or_claim_blocks_cancel(knowledge_entrypoint, exact_cancel_queue, monkeypatch, failure):
+    state, queue = knowledge_entrypoint, exact_cancel_queue
+    from service.agent import loop
+    a, b = _http_queue_pair(queue)
+    actual = loop.run_tool
+    async def controlled(tool,args):
+        if tool.name == 'list_scheduled_sends' and failure == 'read':
+            state.tools.append((tool.name,dict(args)))
+            return '(error: fictional queue unavailable)'
+        result = await actual(tool,args)
+        if tool.name == 'list_scheduled_sends' and failure == 'claim':
+            assert queue.claim(a)
+        return result
+    monkeypatch.setattr(loop, 'run_tool', controlled)
+    events = state.run('Cancel pending email ' + a, _http_queue_script({'id':a},a), transport='asgi')
+    assert queue.get(a)['status'] == ('sending' if failure == 'claim' else 'pending')
+    assert queue.get(b)['status'] == 'pending'
+    if failure == 'read':
+        assert all(name != 'cancel_scheduled_send' for name,_ in state.tools)
+    assert state.early == state.native == []
+    assert not any(e['type'] in {'task_plan','workflow','confirm','error'} for e in events), events
+
+
+@pytest.mark.parametrize('named', [False, True])
+def test_queue_http_preserves_unrelated_pending_plans_and_skill(knowledge_entrypoint, exact_cancel_queue, monkeypatch, named):
+    from pathlib import Path
+    from service import skills
+    from service.tasks.models import TaskPlan, SlotValue
+    from service.workflows.models import WorkflowPlan
+    state, queue = knowledge_entrypoint, exact_cancel_queue
+    a,b = _http_queue_pair(queue)
+    sid = state.sessions.create_session()
+    state.sessions.save_workflow(sid, TaskPlan(intent='reminder.create', status='waiting_for_input',revision=4,
+        subject=SlotValue('Unrelated fictional task')).to_dict())
+    state.sessions.save_workflow(sid, WorkflowPlan(sources=['email'],status='waiting_for_channel',revision=7,
+        original_request='Unrelated fictional summary').to_dict())
+    state.sessions.set_active_skill(sid,'queue-fixture')
+    marker='SUSPENDED QUEUE SKILL MARKER'
+    monkeypatch.setattr(skills, '_skills', {'queue-fixture':skills.Skill('queue-fixture','synthetic',marker,
+        Path('/synthetic/not-read'),conversation_workflow=True)})
+    before=[tuple(row) for row in state.sessions._db.execute('SELECT id,status,state_json,updated_at FROM workflows ORDER BY id')]
+    prompt='Cancel Maya agenda email' if named else 'Cancel pending email ' + a
+    events=state.run(prompt,_http_queue_script({'status':'pending'} if named else {'id':a},b),sid=sid,transport='asgi')
+    assert before == [tuple(row) for row in state.sessions._db.execute('SELECT id,status,state_json,updated_at FROM workflows ORDER BY id')]
+    assert state.sessions.get_session(sid)['active_skill']=='queue-fixture'
+    import json
+    assert marker not in json.dumps(state.clients[0].calls)
+    assert state.early == state.native == state.skill_selection == state.skill_context == []
+    assert queue.get(b)['status']=='pending'
+    assert queue.get(a)['status']==('pending' if named else 'cancelled')
+    assert not any(e['type'] in {'task_plan','workflow','confirm','error'} for e in events), events
+
+
+@pytest.mark.parametrize('reply', ['yes','go ahead'])
+def test_queue_http_bare_acknowledgement_does_not_select_cancellation(knowledge_entrypoint, exact_cancel_queue, reply):
+    state,queue=knowledge_entrypoint,exact_cancel_queue
+    a,b=_http_queue_pair(queue)
+    events=state.run('Cancel Maya agenda email',_http_queue_script({'status':'pending'}),transport='asgi')
+    sid=events[0]['id']
+    state.tools.clear()
+    state.run(reply,_http_queue_script({'id':b},b),sid=sid,transport='asgi')
+    assert state.tools==[]
+    assert {key:queue.get(key)['status'] for key in (a,b)} == {a:'pending',b:'pending'}
+    assert state.native==[]
+
+
+def test_queue_http_view_only_keeps_every_pending_record(knowledge_entrypoint, exact_cancel_queue, monkeypatch):
+    from service.safety import policy
+    state, queue = knowledge_entrypoint, exact_cancel_queue
+    a,b = _http_queue_pair(queue)
+    monkeypatch.setattr(policy, '_READ_ONLY', True)
+    events=state.run('Cancel pending email ' + a,_http_queue_script({'id':a},a),transport='asgi')
+    assert {key:queue.get(key)['status'] for key in (a,b)} == {a:'pending',b:'pending'}
+    assert all(name != 'cancel_scheduled_send' for name,_ in state.tools)
+    assert state.early == state.native == []
+    assert not any(e['type'] in {'task_plan','workflow','confirm','error'} for e in events)
+
+
+@pytest.mark.parametrize('prompt', ['Remind me to buy milk tomorrow at 6PM',
+    'Draft an email to maya@synthetic.invalid saying Hello'])
+def test_queue_http_guard_preserves_genuine_mail_and_reminder_interpreters(knowledge_entrypoint, exact_cancel_queue, prompt):
+    state,queue=knowledge_entrypoint,exact_cancel_queue
+    a,b=_http_queue_pair(queue)
+    assert R._scheduled_send_review(prompt) is None
+    state.run(prompt,[{'content':'Synthetic ordinary task response.'}],approve=False,transport='asgi')
+    assert 'task' in state.early
+    assert all(name not in {'list_scheduled_sends','cancel_scheduled_send'} for name,_ in state.tools)
+    assert {key:queue.get(key)['status'] for key in (a,b)} == {a:'pending',b:'pending'}
+    assert state.native==[]
+
+
+@pytest.mark.parametrize('prompt', ["What's queued to send", 'What is queued to send?',
+    'Show me queued to send', 'List queued to send', 'Show what is queued to send',
+    'Which emails are queued to send?', 'Please check currently queued to send'])
+def test_canonical_queue_read_actual_http_cannot_mutate_or_narrow_scope(knowledge_entrypoint, exact_cancel_queue, prompt):
+    from tests.test_direct_dispatch_exec import _tool_call
+    state,queue=knowledge_entrypoint,exact_cancel_queue
+    a,b=_http_queue_pair(queue)
+    script=_http_queue_script({'status':'history','id':b,'count':1},b)
+    script.insert(-1,{'tool_calls':[_tool_call('schedule_send', {'channel':'email','to':'new@synthetic.invalid',
+        'text':'Unexpected fictional send','when':'tomorrow at 6PM'},'schedule')]})
+    events=state.run(prompt,script,transport='asgi')
+    assert state.tools==[('list_scheduled_sends', {'status':'pending','id':'','count':20})]
+    assert {key:queue.get(key)['status'] for key in (a,b)}=={a:'pending',b:'pending'}
+    assert {row["id"] for row in queue.review("pending",100)[0]} == {a,b}
+    result=next(e['result'] for e in events if e['type']=='tool_result' and e['id']=='read')
+    assert a in result and b in result
+    assert state.early==state.native==state.skill_selection==state.skill_context==[]
+    assert not any(e['type'] in {'task_plan','workflow','confirm','error'} for e in events)
+
+
+@pytest.mark.parametrize('suffix', [' and remind me to buy milk', ' if Maya agrees',
+    ' then send Lee a message', ' without emails', ' tomorrow only'])
+def test_canonical_queue_read_never_swallows_extra_constraints(suffix):
+    assert R._scheduled_send_review("What's queued to send"+suffix) is None
+
+
+@pytest.mark.parametrize('verb', ['Cancel', 'Stop'])
+@pytest.mark.parametrize('hostile', [False, True])
+def test_queued_send_literal_id_actual_http_targets_only_current_id(knowledge_entrypoint, exact_cancel_queue, verb, hostile):
+    state,queue=knowledge_entrypoint,exact_cancel_queue
+    a,b=_http_queue_pair(queue)
+    prompt=f'{verb} queued send {a}'
+    decision=asyncio.run(R.route(prompt))
+    assert decision.tool_argument_bindings.get('cancel_scheduled_send')=={'id':a}
+    events=state.run(prompt,_http_queue_script({'id':a},b if hostile else a),transport='asgi')
+    assert state.tools==[('list_scheduled_sends',{'id':a}),('cancel_scheduled_send',{'id':a})]
+    assert {key:queue.get(key)['status'] for key in (a,b)}=={a:'cancelled',b:'pending'}
+    assert state.early==state.native==[]
+    assert not any(e['type'] in {'task_plan','workflow','confirm','error'} for e in events)
+
+
+def _injected_queue_decision(target='abcdef123456', *, broad=False):
+    decision=R.RouteDecision('agent','synthetic',True,'rules','preserve reason',
+        route_source='preserve source',expect_tool_first=True,
+        tool_subset=None if broad else ['list_scheduled_sends','cancel_scheduled_send','get_battery_status'],
+        force_first_tool='list_scheduled_sends',multi_round=True,
+        required_tool_groups=(frozenset({'list_scheduled_sends'}),),
+        tool_argument_bindings={'list_scheduled_sends':{'id':target},'cancel_scheduled_send':{'id':target}},
+        resolved_request='Cancel pending email '+target)
+    return decision
+
+
+def test_public_route_body_signature_and_single_await_are_preserved():
+    import ast,hashlib,inspect,textwrap
+    implementation=ast.parse(textwrap.dedent(inspect.getsource(R._route_impl))).body[0]
+    wrapper=ast.parse(textwrap.dedent(inspect.getsource(R.route))).body[0]
+    body=ast.dump(ast.Module(body=implementation.body,type_ignores=[]),include_attributes=False)
+    signature=ast.dump(wrapper.args,include_attributes=False)
+    assert hashlib.sha256(body.encode()).hexdigest()=='ad6a2a796506ce3759c10bac1551617734b8d5247c1874ef05154f3be8a5a178'
+    assert hashlib.sha256(signature.encode()).hexdigest()=='edcb3e9f9d06ef15a39eb04dadef72be9995af5c66f86b8f0bb19290f1e00c02'
+    assert inspect.signature(R.route)==inspect.signature(R._route_impl)
+    assert len([n for n in ast.walk(wrapper) if isinstance(n,ast.Await)])==1
+
+
+@pytest.mark.parametrize('prompt', ["What's queued to send",'yes','go ahead','Cancel Maya agenda email',
+    'Cancel pending email "abcdef123456"','Cancel pending email abcdef123456 if Maya agrees',
+    'Cancel pending email abcdef123456 and show my notes','Cancel pending email abcdef123456 and 123456abcdef',
+    'Explain "Cancel pending email abcdef123456"','Cancel pending email abcdef1234560'])
+def test_public_queue_guard_never_authorizes_from_history_or_resolved_metadata(monkeypatch,prompt):
+    decision=_injected_queue_decision()
+    calls=[]
+    async def implementation(text,**kwargs):
+        calls.append((text,kwargs));return decision
+    monkeypatch.setattr(R,'_route_impl',implementation)
+    history={'last_user':'Cancel pending email abcdef123456','recent_users':['Cancel pending email abcdef123456'],
+        'last_assistant':'Cancel pending email abcdef123456','last_tools':'successful read abcdef123456'}
+    result=asyncio.run(R.route(prompt,**history))
+    assert result is decision
+    assert calls==[(prompt,history)]
+    assert 'cancel_scheduled_send' in result.forbidden_tools
+    assert 'cancel_scheduled_send' not in result.tool_subset
+    assert 'cancel_scheduled_send' not in result.tool_argument_bindings
+    assert result.resolved_request=='Cancel pending email abcdef123456'
+
+
+@pytest.mark.parametrize('damage', ['wrong_read','wrong_cancel','extra_read_arg','extra_cancel_arg',
+    'missing_read','missing_cancel','missing_group','mixed_group','missing_force','read_forbidden',
+    'read_not_offered','direct_cancel'])
+def test_public_queue_guard_requires_existing_same_target_and_successful_read_contract(monkeypatch,damage):
+    d=_injected_queue_decision()
+    if damage=='wrong_read':d.tool_argument_bindings['list_scheduled_sends']={'id':'123456abcdef'}
+    elif damage=='wrong_cancel':d.tool_argument_bindings['cancel_scheduled_send']={'id':'123456abcdef'}
+    elif damage=='extra_read_arg':d.tool_argument_bindings['list_scheduled_sends']['status']='all'
+    elif damage=='extra_cancel_arg':d.tool_argument_bindings['cancel_scheduled_send']['other']='value'
+    elif damage=='missing_read':d.tool_argument_bindings.pop('list_scheduled_sends')
+    elif damage=='missing_cancel':d.tool_argument_bindings.pop('cancel_scheduled_send')
+    elif damage=='missing_group':d.required_tool_groups=()
+    elif damage=='mixed_group':d.required_tool_groups=(frozenset({'list_scheduled_sends','get_battery_status'}),)
+    elif damage=='missing_force':d.force_first_tool=None
+    elif damage=='read_forbidden':d.forbidden_tools=frozenset({'list_scheduled_sends'})
+    elif damage=='read_not_offered':d.tool_subset=['cancel_scheduled_send']
+    elif damage=='direct_cancel':d.direct_calls=[('cancel_scheduled_send',{'id':'abcdef123456'})]
+    async def implementation(*args,**kwargs):return d
+    monkeypatch.setattr(R,'_route_impl',implementation)
+    result=asyncio.run(R.route('Cancel pending email abcdef123456'))
+    assert 'cancel_scheduled_send' in result.forbidden_tools
+    assert 'cancel_scheduled_send' not in result.tool_argument_bindings
+    assert all(name!='cancel_scheduled_send' for name,_ in result.direct_calls)
+
+
+@pytest.mark.parametrize('broad',[False,True])
+def test_public_queue_guard_removes_every_cancel_carrier_and_preserves_unrelated_metadata(monkeypatch,broad):
+    import copy
+    cancel='cancel_scheduled_send'; d=_injected_queue_decision(broad=broad)
+    d.force_first_tool=cancel
+    d.direct_calls=[(cancel,{'id':'abcdef123456'}),('get_battery_status',{})]
+    d.required_tool_groups=(frozenset({cancel}),frozenset({cancel,'get_battery_status'}),frozenset({'list_scheduled_sends'}))
+    d.forbidden_tools=frozenset({'run_shell'})
+    d.conditional_tools=(('list_scheduled_sends',cancel,'contains',('pending',)),
+        (cancel,'get_battery_status','contains',('pending',)),('get_battery_status','toggle_setting','percent_below',20))
+    d.narration_after=frozenset({cancel,'get_battery_status'})
+    d.strict_read_limits={cancel:1,'get_battery_status':2}
+    expected=copy.deepcopy(d)
+    expected.forbidden_tools|=frozenset({cancel})
+    if not broad:expected.tool_subset.remove(cancel)
+    expected.force_first_tool=None
+    expected.direct_calls=[('get_battery_status',{})]
+    expected.required_tool_groups=(frozenset(),frozenset({'get_battery_status'}),frozenset({'list_scheduled_sends'}))
+    expected.tool_argument_bindings.pop(cancel)
+    expected.conditional_tools=(('get_battery_status','toggle_setting','percent_below',20),)
+    expected.narration_after=frozenset({'get_battery_status'})
+    expected.strict_read_limits={'get_battery_status':2}
+    async def implementation(*args,**kwargs):return d
+    monkeypatch.setattr(R,'_route_impl',implementation)
+    assert asyncio.run(R.route('Show my pending messages'))==expected
+
+
+@pytest.mark.parametrize('existing_denial',[False,True])
+def test_public_queue_guard_preserves_exact_id_contract_and_existing_denial(monkeypatch,existing_denial):
+    import copy
+    d=_injected_queue_decision()
+    if existing_denial:d.forbidden_tools=frozenset({'cancel_scheduled_send'})
+    before=copy.deepcopy(d)
+    async def implementation(*args,**kwargs):return d
+    monkeypatch.setattr(R,'_route_impl',implementation)
+    assert asyncio.run(R.route('Cancel pending email abcdef123456'))==before
+
+
+@pytest.mark.parametrize('failure',[RuntimeError('synthetic implementation error'),asyncio.CancelledError()])
+def test_public_queue_guard_propagates_implementation_errors_and_cancellation(monkeypatch,failure):
+    calls=[]
+    async def implementation(*args,**kwargs):calls.append((args,kwargs));raise failure
+    monkeypatch.setattr(R,'_route_impl',implementation)
+    with pytest.raises(type(failure)) as caught:asyncio.run(R.route('Show my pending messages'))
+    assert caught.value is failure
+    assert len(calls)==1
+
+
+def test_public_queue_guard_has_no_cross_turn_authority(monkeypatch):
+    async def implementation(text,**kwargs):
+        await asyncio.sleep(0)
+        return _injected_queue_decision('123456abcdef' if '123456abcdef' in text else 'abcdef123456')
+    monkeypatch.setattr(R,'_route_impl',implementation)
+    async def run():
+        return await asyncio.gather(R.route('Cancel pending email abcdef123456'),
+            R.route('Show pending messages',last_user='Cancel pending email abcdef123456'),
+            R.route('Cancel pending email 123456abcdef'))
+    a,read,b=asyncio.run(run())
+    assert a.tool_argument_bindings['cancel_scheduled_send']=={'id':'abcdef123456'}
+    assert b.tool_argument_bindings['cancel_scheduled_send']=={'id':'123456abcdef'}
+    assert 'cancel_scheduled_send' in read.forbidden_tools
+    assert 'cancel_scheduled_send' not in read.tool_argument_bindings
+
+
+@pytest.mark.parametrize('prompt', ['Show my calendar today','Show my grocery list',
+    'What should I work on tomorrow?','When is my test?','What did Maya say?',
+    'Never browse the web','Read Wisp knowledge titled "Synthetic"','What is my battery level?',
+    'List my pending messages','What is queued to send?'])
+def test_public_route_all_return_paths_restrict_unrequested_cancel(prompt,exact_cancel_queue,monkeypatch):
+    async def core(*args,**kwargs):return ['list_scheduled_sends','cancel_scheduled_send']
+    monkeypatch.setattr(R,'_semantic_core',core)
+    d=asyncio.run(R.route(prompt))
+    assert 'cancel_scheduled_send' in d.forbidden_tools
+    assert 'cancel_scheduled_send' not in (d.tool_subset or ())
+    assert 'cancel_scheduled_send' not in d.tool_argument_bindings
+
+
+def test_public_queue_guard_actual_generic_read_loop_cannot_cancel(monkeypatch,exact_cancel_queue):
+    from service.agent import loop
+    from tests.test_direct_dispatch_exec import Approver,ScriptedClient
+    queue=exact_cancel_queue;a,b=_http_queue_pair(queue)
+    async def implementation(*args,**kwargs):return _injected_queue_decision(b,broad=True)
+    monkeypatch.setattr(R,'_route_impl',implementation)
+    prompt='Show recorded queue information'
+    d=asyncio.run(R.route(prompt,last_user='Cancel pending email '+b))
+    events=[]
+    async def emit(event):events.append(event)
+    client=ScriptedClient(_http_queue_script({'id':b},b))
+    asyncio.run(loop.run_agent(client,'Agents-A1-4B-oQe6',[{'role':'user','content':prompt}],emit,Approver(),
+        tools=d.tool_subset,force_first_tool=d.force_first_tool,expect_tool_first=d.expect_tool_first,
+        required_tool_groups=d.required_tool_groups,tool_argument_bindings=d.tool_argument_bindings,
+        forbidden_tools=d.forbidden_tools,multi_round=d.multi_round,include_memory_context=False,max_steps=6))
+    assert {key:queue.get(key)['status'] for key in (a,b)}=={a:'pending',b:'pending'}
+    assert not any(e.get('name')=='cancel_scheduled_send' and e['type']=='tool_start' for e in events)

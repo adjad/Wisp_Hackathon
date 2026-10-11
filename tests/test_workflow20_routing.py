@@ -1026,6 +1026,9 @@ def test_exact_cancel_complete_clause_binds_same_literal_to_both_tools(prompt):
     'Cancel pending email abcdef12345 unless it is urgent',
     'Cancel pending email',
     'Cancel pending ID abcdefabcde email',
+    'Cancel Maya email "if Maya agrees"',
+    'Cancel Maya email "abcdef1234567"',
+    'Cancel Maya email but keep it if Maya objects',
 ])
 def test_exact_cancel_unconsumed_conditions_never_offer_cancellation(prompt):
     decision = asyncio.run(R.route(prompt))

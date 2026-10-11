@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Wisp Catch: synthetic Messages with local commitment extraction.
+"""Wisp demo driver: Catch (synthetic Messages) and the behavior engine.
 
-Nothing here writes to Calendar, Reminders, Mail, Messages or Notes. Synthetic
-data lives only inside Wisp's own store, tagged so it is hidden unless the app is
-launched in demo mode and removable in one command:
+The Catch commands never write to Calendar, Reminders, Mail, Messages or Notes.
+Their synthetic data lives only inside Wisp's own store, tagged so it is hidden
+unless the app is launched in demo mode and removable in one command:
 
   * commitments   -> ~/.moe/assistant.db, source="wisp_seed" (visible only when the
                      backend runs with WISP_QA_SEED=1)
@@ -18,19 +18,33 @@ Commands (run with the repo's Python, e.g. .venv/bin/python demo/wisp_demo.py ..
   drop        deliver a synthetic text on cue (default: a natural plan the rules miss)
   status      what is currently added
   clear       remove everything this tool added (your own data is never touched)
+
+Behavior-engine demo (see docs/BEHAVIOR_DEMO.md). These DO touch the Mac's real
+apps, but only inside containers named "Wisp Demo" (a calendar, a Reminders
+list, a Notes folder) holding FICTIONAL data, removable with `persona remove`:
+
+  persona seed|remove [...]   seed/remove the fictional persona (demo/seed_mac_persona.py)
+  behavior ACTION             status | run | patterns | predict | profile | nudges | clear
+                              against the running backend (127.0.0.1:8765)
+  drop --preset gym-conflict  meeting on the next gym morning, then POST /behavior/run
+  drop --preset backtoback    four back-to-back meetings tomorrow 14:00-16:00, then run
+  drop --preset dev           no Mac change; run now and show Dev's predicted afternoon window
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import os
 import plistlib
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, time as clock, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -150,6 +164,9 @@ PRESETS = {
 
 
 def cmd_drop(a: argparse.Namespace) -> None:
+    if a.preset in BEHAVIOR_PRESETS:
+        cmd_drop_behavior(a)
+        return
     sender, make, _expect = PRESETS[a.preset]
     sender = a.sender or sender
     now = time.time()
@@ -198,6 +215,310 @@ def cmd_replay(_: argparse.Namespace) -> None:
     asyncio.run(replay())
 
 
+# ---------------------------------------------------------------------------
+# Behavior engine demo (docs/BEHAVIOR_DEMO.md)
+# ---------------------------------------------------------------------------
+
+BASE_URL = "http://127.0.0.1:8765"
+BEHAVIOR_ACTIONS = ("status", "run", "patterns", "predict", "profile", "nudges", "clear")
+DEFAULT_GYM_WEEKDAYS = (0, 2, 4)   # persona "Morning lift" Mon/Wed/Fri; used until a habit is learned
+BEHAVIOR_PRESETS = {
+    "gym-conflict": "habit_conflict nudge: auto reminder (Undo available)",
+    "backtoback": "cancel_likely nudge: 'Likely skip' tentative hold + 'Draft reschedule note'",
+    "dev": "contact_window nudge when it is Dev's usual afternoon window (no Mac data is added)",
+}
+
+
+class BackendUnavailable(RuntimeError):
+    pass
+
+
+def _http(method: str, path: str, body: dict | None = None, timeout: float = 30.0) -> tuple[int, object]:
+    """One JSON request to the running backend -> (status, decoded body)."""
+    data = None
+    headers = {}
+    if body is not None or method != "GET":
+        data = json.dumps(body or {}).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(BASE_URL + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read() or b"{}")
+        except ValueError:
+            payload = {}
+        return exc.code, payload
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise BackendUnavailable(f"Wisp backend not reachable at {BASE_URL} ({type(exc).__name__}); "
+                                 "launch Wisp (see docs/BEHAVIOR_DEMO.md) and retry") from exc
+
+
+def _quote(value: str) -> str:
+    return urllib.parse.quote(str(value), safe="")
+
+
+def _rows(obj: object, key: str) -> list:
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict) and isinstance(obj.get(key), list):
+        return obj[key]
+    return []
+
+
+def _clock(ts: object) -> str:
+    try:
+        return f"{datetime.fromtimestamp(float(ts)):%a %H:%M}"
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def _num(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _print_patterns(obj: object) -> None:
+    rows = _rows(obj, "patterns")
+    if not rows:
+        print("no patterns learned yet (run `behavior run` after the persona is synced)")
+    for p in rows:
+        print(f"{_num(p.get('confidence')):.2f}  {p.get('status', ''):9}  {p.get('kind', ''):17}  "
+              f"{p.get('statement', '')}  [id={p.get('id', '')}, "
+              f"{p.get('support', 0)}/{p.get('opportunities', 0)}]")
+
+
+def _print_predictions(obj: object) -> None:
+    rows = _rows(obj, "predictions")
+    if not rows:
+        print("no predictions for the next day")
+    for p in rows:
+        print(f"{_clock(p.get('ts'))}  {p.get('kind', ''):14}  {p.get('subject', '')}  "
+              f"p={_num(p.get('probability')):.2f}  {p.get('because', '')}")
+
+
+def _print_nudges(obj: object) -> None:
+    rows = _rows(obj, "nudges")
+    if not rows:
+        print("no nudges")
+    for n in rows:
+        print(f"[{n.get('kind', '')}] {n.get('title', '')}  (id={n.get('id') or n.get('nudge_id', '')})")
+        if n.get("body"):
+            print(f"    {n['body']}")
+        if n.get("because"):
+            print(f"    because: {n['because']}")
+        for i, act in enumerate(n.get("actions") or []):
+            flag = "AUTO, already done" if act.get("auto") is True else "offered"
+            print(f"    action {i}: {act.get('type', '')} - {act.get('label', '')} ({flag})")
+
+
+def _print_profile(obj: object) -> None:
+    if isinstance(obj, dict):
+        text = obj.get("profile") or obj.get("card") or obj.get("text")
+        print(text if isinstance(text, str) and text else json.dumps(obj, indent=2, sort_keys=True))
+    else:
+        print(obj)
+
+
+def _print_run(obj: object) -> None:
+    if isinstance(obj, dict) and "published" in obj:
+        ids = [i for i in obj.get("nudge_ids") or [] if i]
+        print(f"published {obj['published']} nudge(s)" + (f": {', '.join(ids)}" if ids else ""))
+        if not ids:
+            print("(no new nudge: already delivered, outside its window, or muted by feedback)")
+    else:
+        print(json.dumps(obj, indent=2, sort_keys=True, default=str))
+
+
+def _show(obj: object, as_json: bool, printer=None) -> None:
+    if as_json or printer is None:
+        print(json.dumps(obj, indent=2, sort_keys=True, default=str))
+    else:
+        printer(obj)
+
+
+PRINTERS = {"patterns": _print_patterns, "predict": _print_predictions, "nudges": _print_nudges,
+            "profile": _print_profile}
+
+
+def cmd_behavior(a: argparse.Namespace) -> None:
+    try:
+        _behavior(a)
+    except BackendUnavailable as exc:
+        sys.exit(str(exc))
+
+
+def _behavior(a: argparse.Namespace) -> None:
+    action = a.action
+    if action == "patterns" and (a.confirm or a.reject or a.reactivate):
+        pid, status = ((a.confirm, "confirmed") if a.confirm else
+                       (a.reject, "rejected") if a.reject else (a.reactivate, "active"))
+        code, obj = _http("POST", f"/behavior/patterns/{_quote(pid)}", {"status": status})
+        print(f"pattern {pid} -> {status}: HTTP {code}")
+        _show(obj, True)
+        return
+    if action == "nudges" and (a.feedback or a.undo or a.act):
+        if a.feedback:
+            nid, verdict = a.feedback
+            if verdict not in ("useful", "not_now", "wrong"):
+                sys.exit("verdict must be useful, not_now or wrong")
+            code, obj = _http("POST", f"/behavior/nudges/{_quote(nid)}/feedback", {"verdict": verdict})
+        elif a.undo:
+            code, obj = _http("POST", f"/behavior/nudges/{_quote(a.undo)}/undo", {})
+        else:
+            nid, index = a.act
+            code, obj = _http("POST", f"/behavior/nudges/{_quote(nid)}/act", {"action_index": int(index)})
+        print(f"HTTP {code}")
+        _show(obj, True)
+        return
+    if action == "run":
+        code, obj = _http("POST", "/behavior/run", {}, timeout=120)
+        print(f"behavior run: HTTP {code}")
+        _show(obj, a.json, _print_run)
+        return
+    if action == "clear":
+        code, obj = _http("POST", "/behavior/clear", {})
+        if code in (404, 405):
+            print("this backend has no /behavior/clear endpoint. To reset learned behavior state, quit "
+                  f"Wisp and delete {MOE_DIR / 'behavior.db'} (local brain). `persona remove` removes "
+                  "the seeded Mac data.")
+            return
+        print(f"behavior clear: HTTP {code}")
+        _show(obj, True)
+        return
+    path = "/behavior/nudges" if action == "nudges" else f"/behavior/{action}"
+    code, obj = _http("GET", path)
+    if code == 404 and action == "nudges":
+        print("this backend does not list nudges (GET /behavior/nudges); they arrive as app "
+              "notifications. Use --feedback/--undo/--act with a nudge id.")
+        return
+    if code >= 400:
+        print(f"GET {path}: HTTP {code}")
+        _show(obj, True)
+        return
+    _show(obj, a.json, PRINTERS.get(action))
+
+
+def _seed_module():
+    spec = importlib.util.spec_from_file_location(
+        "seed_mac_persona", Path(__file__).resolve().with_name("seed_mac_persona.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def cmd_persona(a: argparse.Namespace) -> None:
+    code = _seed_module().main([a.action, *a.rest])
+    if code:
+        sys.exit(code)
+
+
+def _gym_weekdays() -> tuple[int, ...]:
+    """Weekdays of the learned gym habit; falls back to weekday mornings."""
+    try:
+        code, obj = _http("GET", "/behavior/patterns", timeout=10)
+    except BackendUnavailable:
+        return DEFAULT_GYM_WEEKDAYS
+    if code != 200:
+        return DEFAULT_GYM_WEEKDAYS
+    for p in _rows(obj, "patterns"):
+        text = f"{p.get('subject', '')} {p.get('statement', '')}".lower()
+        if p.get("kind") == "habit" and p.get("status") != "rejected" and any(
+                word in text for word in ("fitness", "gym", "work out", "workout")):
+            days = (p.get("window") or {}).get("weekdays") or []
+            days = sorted({int(d) for d in days if isinstance(d, int) and 0 <= d <= 6})
+            if days:
+                return tuple(days)
+    return DEFAULT_GYM_WEEKDAYS
+
+
+def _at(day, hour: int, minute: int = 0) -> float:
+    return datetime.combine(day, clock(hour, minute)).timestamp()
+
+
+def behavior_drop_items(preset: str, now: float, gym_weekdays=DEFAULT_GYM_WEEKDAYS) -> dict:
+    """The fictional calendar events / reminders a behavior preset adds to the
+    "Wisp Demo" containers. Ids are date-stamped so re-dropping is idempotent."""
+    today = datetime.fromtimestamp(now).date()
+    tomorrow = today + timedelta(days=1)
+    if preset == "gym-conflict":
+        # Tomorrow if it is a gym day, else the next gym day.
+        day = next((today + timedelta(days=k) for k in range(1, 8)
+                    if (today + timedelta(days=k)).weekday() in gym_weekdays), tomorrow)
+        return {"day": day, "reminders": [], "events": [{
+            "demo_id": f"drop-gym-conflict-{day:%Y%m%d}", "title": "Foundry export check-in",
+            "start_ts": _at(day, 7), "end_ts": _at(day, 7, 45), "location": "Zoom",
+            "notes": "Dropped by wisp_demo.py to collide with the gym habit."}]}
+    if preset == "backtoback":
+        titles = ("Pipeline review", "Security packet sync", "Hiring debrief", "Board deck prep")
+        events = []
+        for i, title in enumerate(titles):
+            start = _at(tomorrow, 14) + i * 1800
+            events.append({"demo_id": f"drop-backtoback-{tomorrow:%Y%m%d}-{i + 1}", "title": title,
+                           "start_ts": start, "end_ts": start + 1800, "location": "",
+                           "notes": "Dropped by wisp_demo.py: four back-to-back meetings."})
+        return {"day": tomorrow, "reminders": [], "events": events}
+    if preset == "dev":
+        # Dev's afternoon rhythm comes from the persona's (synthetic) message
+        # history, which only lives inside Wisp; nothing is added to the Mac.
+        return {"day": today, "events": [], "reminders": []}
+    raise ValueError(f"unknown behavior preset {preset!r}")
+
+
+def cmd_drop_behavior(a: argparse.Namespace) -> None:
+    seed = _seed_module()
+    dry = bool(getattr(a, "dry_run", False))
+    writes = a.preset in ("gym-conflict", "backtoback")
+    if writes and not dry and not seed.is_macos():
+        sys.exit("this preset writes to the 'Wisp Demo' calendar via osascript (macOS only); "
+                 "use --dry-run to print the AppleScript")
+    weekdays = _gym_weekdays() if a.preset == "gym-conflict" and not dry else DEFAULT_GYM_WEEKDAYS
+    items = behavior_drop_items(a.preset, time.time(), weekdays)
+    scripts = []
+    if items["events"]:
+        scripts.append(("Calendar", seed.calendar_script(seed.normalize_events(items["events"]))))
+    if items["reminders"]:
+        scripts.append(("Reminders", seed.reminders_script(seed.normalize_reminders(items["reminders"]))))
+    for app, script in scripts:
+        if dry:
+            print(f"-- {app} ({a.preset}):\n{script}")
+            continue
+        try:
+            created, skipped = seed.parse_tally(seed.run_osascript(script))
+        except seed.OsaError as exc:
+            sys.exit(f"{app} write failed: {exc}")
+        print(f"{app}: {created} added to 'Wisp Demo', {skipped} already there")
+    for e in items["events"]:
+        print(f"  event     {_clock(e['start_ts'])}-{datetime.fromtimestamp(e['end_ts']):%H:%M}  {e['title']}")
+    for r in items["reminders"]:
+        print(f"  reminder  due {_clock(r['due_ts'])}  {r['title']}")
+    if dry or getattr(a, "no_run", False):
+        return
+    try:
+        code, obj = _http("POST", "/behavior/run", {"reason": "demo_drop", "preset": a.preset}, timeout=120)
+    except BackendUnavailable as exc:
+        sys.exit(str(exc))
+    print(f"behavior run: HTTP {code}; expected: {BEHAVIOR_PRESETS[a.preset]}")
+    _print_run(obj)
+    if isinstance(obj, dict) and not obj.get("nudge_ids") and items["events"]:
+        print("Wisp ingests Calendar after the app's next Calendar sync (every few minutes). "
+              "Watch for the notification, or rerun `behavior run` in a minute.")
+    if a.preset == "dev":
+        try:
+            code, preds = _http("GET", "/behavior/predict", timeout=30)
+        except BackendUnavailable:
+            return
+        dev = [p for p in _rows(preds, "predictions") if "dev" in str(p.get("subject", "")).lower()]
+        if dev:
+            _print_predictions({"predictions": dev})
+        else:
+            print("no Dev prediction for the next day; the contact window nudge fires on weekday afternoons")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -208,11 +529,32 @@ def main() -> None:
     launch.add_argument("--app", default=str(APP), help="Wisp.app to run (default /Applications/Wisp.app)")
     launch.set_defaults(fn=cmd_launch)
     drop = sub.add_parser("drop")
-    drop.add_argument("--preset", choices=sorted(PRESETS), default="natural")
+    drop.add_argument("--preset", choices=sorted(PRESETS) + sorted(BEHAVIOR_PRESETS), default="natural")
     drop.add_argument("--sender")
     drop.add_argument("--text")
     drop.add_argument("--minutes", type=int, default=120, help="how far ahead the stated time is (default 120)")
+    drop.add_argument("--dry-run", action="store_true",
+                      help="behavior presets: print the AppleScript, write nothing")
+    drop.add_argument("--no-run", action="store_true",
+                      help="behavior presets: add the items but skip POST /behavior/run")
     drop.set_defaults(fn=cmd_drop)
+    behavior = sub.add_parser("behavior", help="inspect or drive the behavior engine on the running backend")
+    behavior.add_argument("action", choices=BEHAVIOR_ACTIONS)
+    behavior.add_argument("--json", action="store_true", help="print raw JSON")
+    behavior.add_argument("--confirm", metavar="PATTERN_ID", help="patterns: mark a pattern confirmed")
+    behavior.add_argument("--reject", metavar="PATTERN_ID", help="patterns: reject a pattern")
+    behavior.add_argument("--reactivate", metavar="PATTERN_ID", help="patterns: set a pattern back to active")
+    behavior.add_argument("--feedback", nargs=2, metavar=("NUDGE_ID", "VERDICT"),
+                          help="nudges: useful | not_now | wrong")
+    behavior.add_argument("--undo", metavar="NUDGE_ID", help="nudges: undo a nudge's auto action")
+    behavior.add_argument("--act", nargs=2, metavar=("NUDGE_ID", "INDEX"),
+                          help="nudges: get the prompt for an offered action")
+    behavior.set_defaults(fn=cmd_behavior)
+    persona_cmd = sub.add_parser("persona", help="seed/remove the fictional persona in the Mac's real apps")
+    persona_cmd.add_argument("action", choices=("seed", "remove"))
+    persona_cmd.add_argument("rest", nargs=argparse.REMAINDER,
+                             help="passed to demo/seed_mac_persona.py (e.g. --all --dry-run, --yes)")
+    persona_cmd.set_defaults(fn=cmd_persona)
     args = ap.parse_args()
     args.fn(args)
 

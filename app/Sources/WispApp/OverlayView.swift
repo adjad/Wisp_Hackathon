@@ -37,6 +37,7 @@ struct OverlayView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     header
                     MemoryReviewNotice()
+                    NudgeStack(model: model)
                     inputRow.padding(.top, 10)
                     Divider().overlay(Theme.hairline).padding(.vertical, 10)
                     content

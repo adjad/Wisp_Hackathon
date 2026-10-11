@@ -127,3 +127,36 @@ WISP_HOME="$(mktemp -d -t wisp-attention-tests)" \
 Mocks cover invalid output, quote grounding, local endpoint enforcement, busy
 inference, dedupe, caps and persistence. Actual model rehearsal remains necessary:
 mocks do not measure extraction quality or prove native notification delivery.
+
+## Behavior engine demo (fictional persona)
+
+A separate demo shows Wisp learning routines, predicting tomorrow and sending
+nudges, some with an Undo for what it already did. The full script, with exact
+prompts and talking points, is in
+[docs/BEHAVIOR_DEMO.md](../docs/BEHAVIOR_DEMO.md).
+
+Unlike Catch, this demo **does write to the Mac's real Calendar, Reminders and
+Notes**, but only into containers named **Wisp Demo**. Those containers hold
+fictional data for Aria Solano / Cedarloop, and each item is tagged with
+`[wisp-demo-id:…]`.
+
+```sh
+python3 demo/seed_mac_persona.py seed --dry-run      # print the AppleScript, write nothing
+python3 demo/seed_mac_persona.py seed                # or: seed --calendar / --reminders / --notes
+.venv/bin/python demo/wisp_demo.py behavior status   # also: run, patterns, predict, profile, nudges
+.venv/bin/python demo/wisp_demo.py drop --preset gym-conflict   # meeting over the next gym morning
+.venv/bin/python demo/wisp_demo.py drop --preset backtoback     # 4 meetings tomorrow 14:00-16:00
+.venv/bin/python demo/wisp_demo.py drop --preset dev            # no Mac change; Dev's window
+python3 demo/seed_mac_persona.py remove              # quit Wisp first; deletes only "Wisp Demo"
+```
+
+Launch with `WISP_BEHAVIOR=1 WISP_BEHAVIOR_SYNTHETIC_ONLY=1`. The founder/Intel
+build turns both on automatically. Seeding runs on the macOS system Python
+3.9+ and needs only the standard library. Re-seeding skips items that already
+exist.
+
+Tests (Linux-safe, no osascript or backend):
+
+```sh
+.venv/bin/python -m pytest -q tests/test_seed_mac_persona.py tests/test_wisp_demo_behavior.py
+```

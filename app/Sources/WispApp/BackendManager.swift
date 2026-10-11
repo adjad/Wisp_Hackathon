@@ -150,6 +150,9 @@ final class BackendManager {
                                                        generation: snapshot.generation)
             proc.environment?["WISP_CREDENTIAL_PIPE"] = try BackendCredentials.pipeMetadata(credentialPipe)
             proc.environment?.merge(extraEnvironment()) { _, new in new }
+#if WISP_FOUNDER_DEMO
+            proc.environment?["WISP_FOUNDER_DEMO"] = "1"
+#endif
 #if WISP_REMOTE_ONLY_DEMO
             proc.environment?["WISP_REMOTE_ONLY"] = "1"
 #endif

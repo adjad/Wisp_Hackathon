@@ -53,11 +53,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // which only tracks bar-vs-expanded WHILE docked.
     private var notchDocked = true
     private let calendarReader = CalendarReader()
+#if !WISP_FOUNDER_DEMO
     private let remindersWriter = RemindersWriter()
+#endif
     private let mailReader = MailReader()
     private let messagesReader = MessagesReader()
+#if !WISP_FOUNDER_DEMO
     private let notesReader = NotesReader()
     private let contactsReader = ContactsReader()
+#endif
     private let browserHistoryReader = BrowserHistoryReader()
     private static let autoCollapseDelay: TimeInterval = 2
 
@@ -556,6 +560,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.calendarReader.deleteEvent(identifier: identifier, occurrenceTs: occurrenceTs)
                 ?? ["ok": false, "error": "Calendar handler unavailable"]
         }
+#if !WISP_FOUNDER_DEMO
         model.onVerifiedReminderAction = { [weak self] kind, actionID, sourceID,
             expectedTitle, expectedDueTs, title, dueTs, commitmentKind in
             self?.remindersWriter.performVerified(kind: kind, actionID: actionID,
@@ -573,6 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 sourceID: sourceID, title: title, dueTs: dueTs,
                 commitmentKind: commitmentKind)
         }
+#endif
         model.onOpenChat = { [weak self] sessionId in
             self?.chatWindow.show(sessionId: sessionId)
         }
@@ -589,10 +595,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onSyncAssistantSources = { [weak self] sources in
             guard let self else { return }
             if sources.contains("calendar") { self.calendarReader.sync() }
+#if !WISP_FOUNDER_DEMO
             if sources.contains("reminders") { self.remindersWriter.sync() }
+#endif
             if sources.contains("email") { self.mailReader.sync() }
             if sources.contains("messages") { self.messagesReader.sync() }
+#if !WISP_FOUNDER_DEMO
             if sources.contains("notes") { self.notesReader.sync() }
+#endif
             if sources.contains("browser_history") { self.browserHistoryReader.sync() }
         }
         model.startAssistant()
@@ -600,13 +610,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // identity) and push to the backend; prompts for access once, then
         // syncs periodically.
         calendarReader.start()
+#if !WISP_FOUNDER_DEMO
         remindersWriter.start()
+#endif
         mailReader.start()
         messagesReader.start()
+#if !WISP_FOUNDER_DEMO
         notesReader.start()
+#endif
         browserHistoryReader.start()
         // Resolves chat.db's bare phone/email handles to real contact names.
+#if !WISP_FOUNDER_DEMO
         contactsReader.start()
+#endif
 
         // Pointer enter/exit come from a real AppKit tracking area on the
         // panel (HoverView), not SwiftUI's flaky .onHover. Entering the bar

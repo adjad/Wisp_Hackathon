@@ -1127,3 +1127,125 @@ def test_named_cancel_discovery_acknowledgement_never_authorizes_cancellation(re
         last_assistant='Choose the exact queue ID before I can cancel it.', last_tools='list_scheduled_sends'))
     assert 'cancel_scheduled_send' not in (d.tool_subset or ())
     assert 'cancel_scheduled_send' in d.forbidden_tools
+
+
+# Real HTTP entry controls reuse disposable stores and blocked native/model sinks.
+from tests.test_workflow20_knowledge import knowledge_entrypoint, storage
+
+
+def _http_queue_pair(queue):
+    a = queue.add(channel='email', recipient='maya@synthetic.invalid', display='Maya',
+                  body='Fictional agenda', when_ts=2000000000)
+    b = queue.add(channel='email', recipient='lee@synthetic.invalid', display='Lee',
+                  body='Fictional weekly update', when_ts=2000000000)
+    return a, b
+
+
+def _http_queue_script(read_args, cancel_id=None, duplicate=False):
+    from tests.test_direct_dispatch_exec import _tool_call
+    script = [{'tool_calls':[_tool_call('list_scheduled_sends', read_args, 'read')]}]
+    if cancel_id:
+        script.append({'tool_calls':[_tool_call('cancel_scheduled_send', {'id':cancel_id}, 'cancel')]})
+    if duplicate:
+        script.append({'tool_calls':[_tool_call('cancel_scheduled_send', {'id':cancel_id}, 'duplicate')]})
+    return script + [{'content':'Synthetic queue evidence; choose an exact ID when needed.'}]
+
+
+@pytest.mark.parametrize('honest', [False, True])
+@pytest.mark.parametrize('duplicate', [False, True])
+def test_queue_actual_http_exact_id_reaches_checked_scope(knowledge_entrypoint, exact_cancel_queue, honest, duplicate):
+    state, queue = knowledge_entrypoint, exact_cancel_queue
+    a, b = _http_queue_pair(queue)
+    selected = a if honest else b
+    events = state.run('Cancel pending email ' + a, _http_queue_script({'id':selected}, selected, duplicate), transport='asgi')
+    assert queue.get(b)['status'] == 'pending'
+    if honest:
+        assert queue.get(a)['status'] == 'cancelled'
+    else:
+        assert queue.get(a)['status'] in {'pending', 'cancelled'}
+    assert state.tools == [('list_scheduled_sends', {'id':a}), ('cancel_scheduled_send', {'id':a})]
+    assert state.early == state.native == state.skill_selection == state.skill_context == []
+    assert not any(e['type'] in {'task_plan','workflow','confirm','error'} for e in events), events
+
+
+@pytest.mark.parametrize('template', [
+    'Cancel Maya agenda email', 'Cancel Maya agenda email but leave Lee weekly email',
+    'Cancel pending email "{a}"', 'Cancel pending email {a} if Maya agrees',
+    'Cancel pending email {a} and {b}', 'Cancel pending email {a}0',
+    'Show pending email {a}', 'Cancel pending email {a} unless Lee objects'])
+def test_queue_actual_http_unbound_targets_are_read_only(knowledge_entrypoint, exact_cancel_queue, template):
+    state, queue = knowledge_entrypoint, exact_cancel_queue
+    a, b = _http_queue_pair(queue)
+    prompt = template.format(a=a,b=b)
+    events = state.run(prompt, _http_queue_script({'status':'pending'}, b), transport='asgi')
+    assert {key:queue.get(key)['status'] for key in (a,b)} == {a:'pending',b:'pending'}, state.tools
+    assert [name for name,_ in state.tools] == ['list_scheduled_sends']
+    assert state.early == state.native == state.skill_selection == state.skill_context == []
+    assert not any(e['type'] in {'task_plan','workflow','confirm','error'} for e in events), events
+
+
+@pytest.mark.parametrize('failure', ['read', 'claim'])
+def test_queue_actual_http_read_failure_or_claim_blocks_cancel(knowledge_entrypoint, exact_cancel_queue, monkeypatch, failure):
+    state, queue = knowledge_entrypoint, exact_cancel_queue
+    from service.agent import loop
+    a, b = _http_queue_pair(queue)
+    actual = loop.run_tool
+    async def controlled(tool,args):
+        if tool.name == 'list_scheduled_sends' and failure == 'read':
+            state.tools.append((tool.name,dict(args)))
+            return '(error: fictional queue unavailable)'
+        result = await actual(tool,args)
+        if tool.name == 'list_scheduled_sends' and failure == 'claim':
+            assert queue.claim(a)
+        return result
+    monkeypatch.setattr(loop, 'run_tool', controlled)
+    events = state.run('Cancel pending email ' + a, _http_queue_script({'id':a},a), transport='asgi')
+    assert queue.get(a)['status'] == ('sending' if failure == 'claim' else 'pending')
+    assert queue.get(b)['status'] == 'pending'
+    if failure == 'read':
+        assert all(name != 'cancel_scheduled_send' for name,_ in state.tools)
+    assert state.early == state.native == []
+    assert not any(e['type'] in {'task_plan','workflow','confirm','error'} for e in events), events
+
+
+@pytest.mark.parametrize('named', [False, True])
+def test_queue_http_preserves_unrelated_pending_plans_and_skill(knowledge_entrypoint, exact_cancel_queue, monkeypatch, named):
+    from pathlib import Path
+    from service import skills
+    from service.tasks.models import TaskPlan, SlotValue
+    from service.workflows.models import WorkflowPlan
+    state, queue = knowledge_entrypoint, exact_cancel_queue
+    a,b = _http_queue_pair(queue)
+    sid = state.sessions.create_session()
+    state.sessions.save_workflow(sid, TaskPlan(intent='reminder.create', status='waiting_for_input',revision=4,
+        subject=SlotValue('Unrelated fictional task')).to_dict())
+    state.sessions.save_workflow(sid, WorkflowPlan(sources=['email'],status='waiting_for_channel',revision=7,
+        original_request='Unrelated fictional summary').to_dict())
+    state.sessions.set_active_skill(sid,'queue-fixture')
+    marker='SUSPENDED QUEUE SKILL MARKER'
+    monkeypatch.setattr(skills, '_skills', {'queue-fixture':skills.Skill('queue-fixture','synthetic',marker,
+        Path('/synthetic/not-read'),conversation_workflow=True)})
+    before=[tuple(row) for row in state.sessions._db.execute('SELECT id,status,state_json,updated_at FROM workflows ORDER BY id')]
+    prompt='Cancel Maya agenda email' if named else 'Cancel pending email ' + a
+    events=state.run(prompt,_http_queue_script({'status':'pending'} if named else {'id':a},b),sid=sid,transport='asgi')
+    assert before == [tuple(row) for row in state.sessions._db.execute('SELECT id,status,state_json,updated_at FROM workflows ORDER BY id')]
+    assert state.sessions.get_session(sid)['active_skill']=='queue-fixture'
+    import json
+    assert marker not in json.dumps(state.clients[0].calls)
+    assert state.early == state.native == state.skill_selection == state.skill_context == []
+    assert queue.get(b)['status']=='pending'
+    assert queue.get(a)['status']==('pending' if named else 'cancelled')
+    assert not any(e['type'] in {'task_plan','workflow','confirm','error'} for e in events), events
+
+
+@pytest.mark.parametrize('reply', ['yes','go ahead'])
+def test_queue_http_bare_acknowledgement_does_not_select_cancellation(knowledge_entrypoint, exact_cancel_queue, reply):
+    state,queue=knowledge_entrypoint,exact_cancel_queue
+    a,b=_http_queue_pair(queue)
+    events=state.run('Cancel Maya agenda email',_http_queue_script({'status':'pending'}),transport='asgi')
+    sid=events[0]['id']
+    state.tools.clear()
+    state.run(reply,_http_queue_script({'id':b},b),sid=sid,transport='asgi')
+    assert state.tools==[]
+    assert {key:queue.get(key)['status'] for key in (a,b)} == {a:'pending',b:'pending'}
+    assert state.native==[]

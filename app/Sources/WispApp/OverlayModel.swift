@@ -1288,12 +1288,20 @@ final class OverlayModel: ObservableObject {
 
     private func showNudge(_ nudge: BehaviorNudge) {
         if let i = nudges.firstIndex(where: { $0.id == nudge.id }) {
-            // Same deterministic id re-delivered: keep the card's local state.
-            var merged = nudge
-            merged.status = nudges[i].status
-            merged.undone = nudges[i].undone
-            merged.performed = nudges[i].performed
-            nudges[i] = merged
+            let old = nudges[i]
+            if !nudge.eventID.isEmpty, !old.eventID.isEmpty, nudge.eventID != old.eventID {
+                // Same id from a NEW hub event: it re-fired (e.g. after a demo
+                // reset), so the card starts fresh; Notifications.deliver
+                // replaces the old banner the same way.
+                nudges[i] = nudge
+            } else {
+                // Same deterministic id re-delivered: keep the card's local state.
+                var merged = nudge
+                merged.status = old.status
+                merged.undone = old.undone
+                merged.performed = old.performed
+                nudges[i] = merged
+            }
         } else {
             nudges.insert(nudge, at: 0)
             if nudges.count > 3 { nudges.removeLast(nudges.count - 3) }

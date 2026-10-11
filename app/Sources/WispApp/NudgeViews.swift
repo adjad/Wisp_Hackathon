@@ -67,6 +67,12 @@ struct BehaviorNudge: Identifiable, Equatable {
     let priority: Double
     let actions: [NudgeAction]
     let expiresAt: Double?
+    /// The hub event that carried it. A NEW event_id for a known nudge id
+    /// means it re-fired (e.g. after a demo reset), not a replay.
+    var eventID = ""
+    /// The backend's `can_undo` (whether something it did is still undoable);
+    /// nil from an older backend, which falls back to the auto flags.
+    var backendCanUndo: Bool? = nil
     // Card-local UI state.
     var status = ""
     var busy = false
@@ -81,7 +87,7 @@ struct BehaviorNudge: Identifiable, Equatable {
     /// The first non-auto open_prompt action ("Draft reschedule note"); the
     /// notification's "Do it" button maps to it.
     var promptAction: NudgeAction? { actions.first { !$0.auto && $0.isPrompt } }
-    var canUndo: Bool { (hasAuto || performed) && !undone }
+    var canUndo: Bool { ((backendCanUndo ?? hasAuto) || performed) && !undone }
 
     func isExpired(now: Double = Date().timeIntervalSince1970) -> Bool {
         guard let expiresAt else { return false }
@@ -107,12 +113,24 @@ struct BehaviorNudge: Identifiable, Equatable {
               !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let body = payload["body"] as? String,
               let because = payload["because"] as? String else { return nil }
+        // "Already done" comes from what the backend actually performed
+        // (auto_performed[].action_index) when it says so; else the auto flags.
+        var performedIndexes: Set<Int>?
+        if let rows = payload["auto_performed"] as? [Any] {
+            var found = Set<Int>()
+            for case let row as [String: Any] in rows {
+                if let number = row["action_index"] as? NSNumber,
+                   CFGetTypeID(number) != CFBooleanGetTypeID() { found.insert(number.intValue) }
+            }
+            if rows.isEmpty || !found.isEmpty { performedIndexes = found }
+        }
         var actions: [NudgeAction] = []
         for (index, raw) in (payload["actions"] as? [Any] ?? []).enumerated() {
             guard let row = raw as? [String: Any], let type = row["type"] as? String,
                   !type.isEmpty else { continue }
             let params = row["params"] as? [String: Any] ?? [:]
-            actions.append(NudgeAction(index: index, type: type, auto: isJSONTrue(row["auto"]),
+            let done = performedIndexes.map { $0.contains(index) } ?? isJSONTrue(row["auto"])
+            actions.append(NudgeAction(index: index, type: type, auto: done,
                                        label: row["label"] as? String ?? "",
                                        title: params["title"] as? String ?? "",
                                        prompt: params["prompt"] as? String ?? ""))
@@ -127,9 +145,14 @@ struct BehaviorNudge: Identifiable, Equatable {
            CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite {
             priority = number.doubleValue
         }
-        return BehaviorNudge(id: id, kind: payload["kind"] as? String ?? "", title: title,
-                             body: body, because: because, priority: priority,
-                             actions: actions, expiresAt: expires)
+        var nudge = BehaviorNudge(id: id, kind: payload["kind"] as? String ?? "", title: title,
+                                  body: body, because: because, priority: priority,
+                                  actions: actions, expiresAt: expires)
+        nudge.eventID = payload["event_id"] as? String ?? ""
+        if let number = payload["can_undo"] as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() {
+            nudge.backendCanUndo = number.boolValue
+        }
+        return nudge
     }
 
     /// "Added reminder “Pack gym bag”" — what Wisp already did on its own.
@@ -162,6 +185,8 @@ struct BehaviorNudge: Identifiable, Equatable {
     }
     var notificationInfo: [String: String] {
         var info = ["nudge_id": id, "kind": kind]
+        // Lets Notifications.deliver tell a re-fired nudge from a replay.
+        if !eventID.isEmpty { info["event_id"] = eventID }
         if let act = promptAction {
             info["act_index"] = String(act.index)
             info["prompt"] = act.prompt

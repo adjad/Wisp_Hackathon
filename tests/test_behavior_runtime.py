@@ -181,7 +181,10 @@ def _env(monkeypatch):
 
 
 def make_runtime(tmp_path, engine=None, *, synthetic=True, founder=False, calendar=None,
-                 messages=None, mode="local", remote=None, clock=lambda: NOW, persona=FakePersona):
+                 messages=None, mode="local", remote=None, clock=lambda: NOW, persona=FakePersona,
+                 calendar_grace_s=0.0):
+    # calendar_grace_s=0: tests that do not model Calendar start nudging at
+    # once (the startup wait for a first Calendar read has its own tests).
     engine = engine or FakeEngine()
     calls = {"persona": 0, "messages": 0}
 
@@ -199,7 +202,7 @@ def make_runtime(tmp_path, engine=None, *, synthetic=True, founder=False, calend
         persona_fn=persona_fn, messages_fn=messages_fn,
         calendar_sync_fn=lambda: calendar if calendar is not None else {"available": False},
         session_db_fn=lambda: (_ for _ in ()).throw(RuntimeError("no sessions in tests")),
-        clock=clock)
+        clock=clock, calendar_grace_s=calendar_grace_s)
     rt.calls = calls
     return rt, engine
 
@@ -499,7 +502,7 @@ def test_behavior_created_reminders_are_not_ingested_back(tmp_path, store):
 
 
 def test_approval_and_denial_are_recorded(tmp_path, store):
-    rt, eng = make_runtime(tmp_path)
+    rt, eng = make_runtime(tmp_path, synthetic=False)
     rt.record_decision("send_message", True)
     rt.record_decision("add_calendar_event", False)
     tick(rt, store, FakeHub())
@@ -507,14 +510,185 @@ def test_approval_and_denial_are_recorded(tmp_path, store):
     assert kinds == [("approval", "send_message"), ("denial", "add_calendar_event")]
 
 
+def test_synthetic_persona_never_learns_real_approvals(tmp_path, store):
+    rt, eng = make_runtime(tmp_path, synthetic=True)
+    rt.record_decision("send_message", True)
+    rt.record_decision("add_calendar_event", False)
+    assert len(rt._pending) == 0
+    rt._pending.append(Observation(id="dec:x:1", kind="approval", ts=NOW, subject="x", source="wisp"))
+    tick(rt, store, FakeHub())                 # anything queued earlier is dropped, not observed
+    assert not [o for o in eng.obs.values() if o.source == "wisp"] and len(rt._pending) == 0
+
+
 def test_agent_loop_hook_is_safe(monkeypatch, tmp_path):
     from service.agent.loop import _note_decision
     assert _note_decision("send_message", True) is True       # disabled: pass-through
     monkeypatch.setenv("WISP_BEHAVIOR", "1")
-    rt, eng = make_runtime(tmp_path)
+    rt, eng = make_runtime(tmp_path, synthetic=False)
     br.set_runtime(rt)
     assert _note_decision("send_email", False) is False
     assert [o.kind for o in rt._pending] == ["denial"]
+
+
+# --------------------------------------------------------------------------
+# Synthetic startup: no nudge before the first Calendar read settles
+# --------------------------------------------------------------------------
+
+def test_synthetic_waits_for_first_calendar_read_then_uses_demo_calendar(tmp_path, store):
+    sync = {"available": False}
+    rt, eng = make_runtime(tmp_path, FakeEngine(nudges=[gym_conflict_nudge()]), calendar=sync,
+                           calendar_grace_s=br.CALENDAR_GRACE_S)
+    hub = FakeHub()
+    assert tick(rt, store, hub, force=True) == []           # even a forced run waits
+    assert eng.generated == 0 and hub.events == []
+    assert "demo:gym:1" in eng.obs and "demo:sync:1" not in eng.obs   # history yes, upcoming no
+    assert rt.status()["waiting_for_calendar"] is True
+    # The first read lands with the seeded "Wisp Demo" calendar: it alone supplies upcoming events.
+    store.sync_source("calendar", [_cal("Team sync", at(16, 0, 1), sid="t")])
+    sync.update({"available": True, "last_sync": NOW + 30})
+    [row] = tick(rt, store, hub, now=NOW + 40)
+    assert row["nudge_id"] == "n1" and eng.generated == 1
+    assert "demo:sync:1" not in eng.obs and f"cal:t:{int(at(16, 0, 1))}" in eng.obs
+    assert rt.status()["waiting_for_calendar"] is False
+
+
+def test_synthetic_falls_back_to_persona_upcoming_after_grace(tmp_path, store):
+    clock = [NOW]
+    rt, eng = make_runtime(tmp_path, FakeEngine(nudges=[gym_conflict_nudge()]),
+                           calendar={"available": False}, clock=lambda: clock[0],
+                           calendar_grace_s=br.CALENDAR_GRACE_S)
+    hub = FakeHub()
+    assert tick(rt, store, hub) == [] and eng.generated == 0
+    clock[0] = NOW + br.CALENDAR_GRACE_S + 1                 # Calendar access off: no read ever comes
+    [row] = tick(rt, store, hub, now=clock[0])
+    assert row["nudge_id"] == "n1" and "demo:sync:1" in eng.obs
+
+
+def test_denied_calendar_read_settles_at_once(tmp_path, store):
+    rt, eng = make_runtime(tmp_path, FakeEngine(nudges=[gym_conflict_nudge()]),
+                           calendar={"available": False, "syncing": False, "last_sync": NOW - 5},
+                           calendar_grace_s=br.CALENDAR_GRACE_S)
+    [row] = tick(rt, store, FakeHub())
+    assert row["nudge_id"] == "n1" and "demo:sync:1" in eng.obs
+
+
+def test_real_mode_never_waits_for_calendar(tmp_path, store):
+    rt, eng = make_runtime(tmp_path, FakeEngine(nudges=[gym_conflict_nudge()]), synthetic=False,
+                           calendar_grace_s=br.CALENDAR_GRACE_S)
+    rt._ingest_reminders = lambda store, now: False
+    [row] = tick(rt, store, FakeHub())
+    assert row["nudge_id"] == "n1"
+
+
+class _DeletingEngine(FakeEngine):
+    """FakeEngine whose local store can delete observations (like BehaviorStore)."""
+
+    class _Store:
+        def __init__(self, outer):
+            self.outer = outer
+
+        def delete_observations(self, ids):
+            return sum(1 for i in ids if self.outer.obs.pop(i, None) is not None)
+
+    def __init__(self, nudges=()):
+        super().__init__(nudges=nudges)
+        self._store = self._Store(self)
+
+
+def test_persona_never_duplicates_a_demo_calendar_event_across_a_day_boundary(tmp_path, store):
+    """Monday the calendar supplies Tuesday's gym; Wednesday's regenerated
+    persona history has its own (jittered) copy of it: only one may count."""
+    class JitterPersona:
+        def __init__(self, now):
+            day = int((now - NOW) // 86400)
+            self.observations = [Observation(
+                id=f"demo:gym:{day}:{d}", kind="event", ts=at(6, 35, d), end_ts=at(7, 30, d),
+                subject="Gym", source="demo", category="fitness") for d in range(-3, day + 1) if at(6, 35, d) < now]
+            self.upcoming = []
+
+    clock = [NOW]
+    sync = {"available": True, "last_sync": NOW}
+    store.sync_source("calendar", [_cal("Gym", at(6, 30, 1), sid="g", end=at(7, 30, 1))])
+    rt, eng = make_runtime(tmp_path, _DeletingEngine(), calendar=sync, clock=lambda: clock[0],
+                           persona=JitterPersona)
+    tick(rt, store, FakeHub())
+    assert f"cal:g:{int(at(6, 30, 1))}" in eng.obs
+    clock[0] = at(12, 0, 2)                                  # Wednesday noon: new persona day
+    sync["last_sync"] = clock[0]
+    tick(rt, store, FakeHub(), now=clock[0])
+
+    def gyms_on(day):
+        lo, hi = at(0, 0, day), at(0, 0, day + 1)
+        return sorted(o.id.split(":")[0] for o in eng.obs.values()
+                      if o.kind == "event" and o.subject == "Gym" and lo <= o.ts < hi)
+    assert gyms_on(1) == ["cal"]                             # Tuesday: the calendar's copy only
+    assert gyms_on(0) == ["demo"] and gyms_on(2) == ["demo"]  # other days: persona history
+
+
+def test_published_auto_flags_are_true_only_for_performed_actions(tmp_path, store):
+    store.add_manual("Pack gym bag", at(21, 0))              # action 0 is already on file
+    rt, eng = make_runtime(tmp_path, FakeEngine(nudges=[gym_conflict_nudge()]))
+    hub = FakeHub()
+    tick(rt, store, hub)
+    ev = next(e["event"] for e in hub.events if e["event"]["type"] == "nudge")
+    assert [a["auto"] for a in ev["actions"]] == [False, True, False]
+    assert [p["action_index"] for p in ev["auto_performed"]] == [1] and ev["can_undo"] is True
+    [item] = rt.delivered()
+    assert [a["auto"] for a in item["actions"]] == [False, True, False]
+    rt.undo(store, "n1")
+    assert [a["auto"] for a in rt.delivered()[0]["actions"]] == [False, False, False]
+
+
+def test_forced_run_waits_for_a_running_tick_and_reports_busy(tmp_path, store, monkeypatch):
+    rt, eng = make_runtime(tmp_path, FakeEngine(nudges=[gym_conflict_nudge()]))
+    hub = FakeHub()
+
+    async def scenario():
+        rt._tick_lock = asyncio.Lock()
+        await rt._tick_lock.acquire()                       # a scheduled tick is mid-flight
+        assert await rt.tick(store, hub) == []              # a scheduled tick still skips
+        forced = asyncio.ensure_future(rt.tick(store, hub, force=True))
+        await asyncio.sleep(0.05)
+        assert not forced.done()                            # waits instead of returning []
+        rt._tick_lock.release()
+        return await forced
+    [row] = asyncio.run(scenario())
+    assert row["nudge_id"] == "n1"
+
+    monkeypatch.setattr(br, "FORCE_WAIT_S", 0.05)
+
+    async def stuck():
+        rt._tick_lock = asyncio.Lock()
+        await rt._tick_lock.acquire()
+        with pytest.raises(br.TickBusy):
+            await rt.tick(store, hub, force=True)
+    asyncio.run(stuck())
+
+
+def test_scheduler_runs_behavior_tick_in_background_one_at_a_time(monkeypatch):
+    from service.assistant import scheduler
+    monkeypatch.setenv("WISP_BEHAVIOR", "1")
+    started = []
+
+    async def slow_tick(store, hub, **kw):
+        started.append(1)
+        await asyncio.sleep(0.05)
+        return []
+    monkeypatch.setattr(br, "tick", slow_tick)
+    monkeypatch.setattr(scheduler, "_behavior_task", None)
+
+    async def scenario():
+        first = scheduler._start_behavior_tick()
+        assert first is not None and not first.done()       # returned without awaiting the tick
+        assert scheduler._start_behavior_tick() is None       # one at a time
+        await first
+        second = scheduler._start_behavior_tick()
+        assert second is not None
+        await second
+    asyncio.run(scenario())
+    assert len(started) == 2
+    monkeypatch.delenv("WISP_BEHAVIOR")
+    assert scheduler._start_behavior_tick() is None           # off: nothing started
 
 
 # --------------------------------------------------------------------------
@@ -806,7 +980,10 @@ class RemoteOnlyLifespan(RemoteFixture):
         async def run():
             with patch.dict("sys.modules", {"service.identity": identity, "service.config.quarantine": q,
                                             "service.browser": browser, "service.browser.host": host}), \
-                    patch("service.config.quarantine", q), patch.object(br, "run_loop", fake_loop):
+                    patch("service.config.quarantine", q), patch.object(br, "run_loop", fake_loop), \
+                    patch("service.demo.founder.enabled", Mock(return_value=True)):
+                # The founder fixture validator reads its flags at import time;
+                # it has its own tests, so it is stubbed here.
                 async with ns["lifespan"](None):
                     await asyncio.sleep(0)
         asyncio.run(run())
@@ -823,8 +1000,41 @@ class RemoteOnlyLifespan(RemoteFixture):
             watched, started, pair = self._run()
             self.assertEqual(len(watched[0]), 1)
             self.assertEqual(started, [pair])
+            # The Intel founder build sets only WISP_FOUNDER_DEMO=1 (plus
+            # WISP_REMOTE_ONLY): the loop must start from that flag alone.
+            os.environ.pop("WISP_BEHAVIOR")
+            os.environ["WISP_FOUNDER_DEMO"] = "1"
+            watched, started, pair = self._run()
+            self.assertEqual(len(watched[0]), 1)
+            self.assertEqual(started, [pair])
         finally:
             for k, v in old.items():
                 os.environ.pop(k, None)
                 if v is not None:
                     os.environ[k] = v
+
+
+# --------------------------------------------------------------------------
+# Swift app contract (source checks; there is no Swift toolchain in CI)
+# --------------------------------------------------------------------------
+
+def _swift(name):
+    from pathlib import Path
+    return (Path(__file__).resolve().parents[1] / "app/Sources/WispApp" / name).read_text()
+
+
+def test_swift_nudge_trusts_can_undo_and_auto_performed():
+    src = _swift("NudgeViews.swift")
+    assert 'payload["auto_performed"]' in src and 'row["action_index"]' in src
+    assert 'payload["can_undo"]' in src and "backendCanUndo ?? hasAuto" in src
+    assert 'nudge.eventID = payload["event_id"]' in src and 'info["event_id"] = eventID' in src
+
+
+def test_swift_refired_nudge_resets_card_and_banner():
+    model = _swift("OverlayModel.swift")
+    assert "nudge.eventID != old.eventID" in model
+    notes = _swift("Notifications.swift")
+    assert 'old.request.content.userInfo["event_id"]' in notes
+    assert "center.removeDeliveredNotifications(withIdentifiers: [id])" in notes
+    # Swift 6: the Task captures an immutable copy of the userInfo dictionary.
+    assert "let info = info" in notes.split("didReceive response")[1]

@@ -7294,6 +7294,12 @@ _BEHAVIOR_TAIL = (r"(?:\s+(?:so\s+far|by\s+now|yet|please|then|again|lately|rece
 _BEHAVIOR_DESCRIBE_RE = re.compile(
     _BEHAVIOR_LEAD + r"(?:"
     r"what\s+(?:do|did)\s+you\s+(?:know|think|remember)\s+about\s+me|"
+    # The week: predict_my_day covers only today/tomorrow, so the learned
+    # weekly shape (habits, rhythms) answers. Without behavior learning these
+    # fall to recall / ambiguous retrieval; no calendar rule claims them.
+    r"what\s+(?:do|did)\s+you\s+(?:know|think)\s+about\s+my\s+week|"
+    r"what(?:'s|\s+is)\s+my\s+week\s+(?:going\s+to|gonna)\s+(?:look|be)\s+like|"
+    r"what\s+(?:does|will)\s+my\s+week\s+look\s+like|how\s+(?:does|will)\s+my\s+week\s+look|"
     r"what\s+(?:have|did)\s+you\s+(?:learn(?:ed|t)?|notice[d]?|figure[d]?\s+out|pick(?:ed)?\s+up)"
     r"(?:\s+about\s+me)?|"
     r"describe\s+me|describe\s+my\s+(?:habits|routines?|patterns|week|life)|"
@@ -7337,10 +7343,25 @@ _BEHAVIOR_GUIDANCE = (
     "user's own calendar and activity, not facts: say how sure Wisp is using the evidence counts, "
     "keep any probabilities, and never invent routines, times or people that are not in the results. "
     "If nothing has been learned yet, say so plainly.")
+_BEHAVIOR_CORRECT_GUIDANCE = (
+    "\n\nThe user is correcting what Wisp learned about their routines. Find the exact pattern "
+    "(my_patterns) and call correct_pattern with status rejected for 'wrong' or confirmed for "
+    "'right'. Only Wisp's learned profile changes; never touch the calendar or reminders.")
+
+
+def behavior_guidance(decision: RouteDecision) -> str:
+    """The behavior routes' instruction ('' for any other route), for paths
+    that send the user's raw prompt instead of ``decision.resolved_request``
+    (the Intel remote-only build), so it still reaches the model."""
+    names = set(decision.tool_subset or ()) | {name for name, _ in (decision.direct_calls or ())}
+    if not names or not names <= set(_BEHAVIOR_TOOLS_ALL):
+        return ""
+    return (_BEHAVIOR_CORRECT_GUIDANCE if "correct_pattern" in names else _BEHAVIOR_GUIDANCE).strip()
 
 
 def _behavior_request(text: str, last_tools: str | None = None) -> RouteDecision | None:
-    from service.assistant.behavior_runtime import enabled as behavior_enabled
+    # Import-free flag check: routing must never load the behavior runtime.
+    from service.behavior.flags import env_enabled as behavior_enabled
     if not behavior_enabled():
         return None
     value = " ".join(mask_quoted(text).replace("’", "'").split())
@@ -7370,10 +7391,7 @@ def _behavior_request(text: str, last_tools: str | None = None) -> RouteDecision
         decision = _mk_scoped(["my_patterns", "correct_pattern"], "behavior correction -> correct_pattern",
                               expect=False, light=False)
         decision.forbidden_tools = frozenset(set(REGISTRY) - {"my_patterns", "correct_pattern"})
-        decision.resolved_request = text + (
-            "\n\nThe user is correcting what Wisp learned about their routines. Find the exact pattern "
-            "(my_patterns) and call correct_pattern with status rejected for 'wrong' or confirmed for "
-            "'right'. Only Wisp's learned profile changes; never touch the calendar or reminders.")
+        decision.resolved_request = text + _BEHAVIOR_CORRECT_GUIDANCE
         return decision
     if call is None:
         return None

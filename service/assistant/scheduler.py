@@ -78,6 +78,22 @@ def connectors_status() -> dict[str, dict]:
     return dict(_sync_status)
 
 
+_behavior_task: asyncio.Task | None = None
+
+
+def _start_behavior_tick() -> asyncio.Task | None:
+    """Start one behavior tick in the background unless one is still running."""
+    global _behavior_task
+    from service.behavior.flags import env_enabled
+    if not env_enabled() or (_behavior_task is not None and not _behavior_task.done()):
+        return None
+    from service.assistant import behavior_runtime
+    # behavior_runtime.tick catches every exception itself, so the task never
+    # ends with an unretrieved error.
+    _behavior_task = asyncio.get_running_loop().create_task(behavior_runtime.tick(assistant_store, hub))
+    return _behavior_task
+
+
 async def run() -> None:
     while True:
         # server-side connectors (none today)
@@ -102,11 +118,12 @@ async def run() -> None:
         except Exception:  # noqa: BLE001 — never break the loop
             pass
         # Behavior learning (off unless WISP_BEHAVIOR=1 or the founder demo):
-        # ingest/mine/nudge on its own internal cadence; never raises.
+        # ingest/mine/nudge on its own internal cadence; never raises. A tick
+        # can take seconds (mining, a remote brain), so it runs as a background
+        # task and never delays reminders, the brief or scheduled sends; at
+        # most one runs at a time.
         try:
-            from service.assistant import behavior_runtime
-            if behavior_runtime.enabled():
-                await behavior_runtime.tick(assistant_store, hub)
+            _start_behavior_tick()
         except Exception:  # noqa: BLE001 — never break the loop
             pass
         # once-daily brief at the configured hour (8am or 8pm), or first tick

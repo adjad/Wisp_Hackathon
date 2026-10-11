@@ -58,7 +58,13 @@ async def behavior_run() -> dict[str, Any]:
     """Ingest + mine + generate + deliver now (demo rehearsal)."""
     runtime = _runtime()
     store, hub = _store_hub()
-    published = await runtime.tick(store, hub, force=True)
+    try:
+        published = await runtime.tick(store, hub, force=True)
+    except behavior_runtime.TickBusy as exc:
+        # A scheduled tick is still running (a slow remote brain or mining):
+        # say so instead of answering "nothing new".
+        return {"ok": False, "busy": True, "published": 0, "nudge_ids": [],
+                "detail": f"{exc}; try again in a moment"}
     status = await asyncio.to_thread(runtime.status)
     return {"ok": True, "published": len(published),
             "nudge_ids": [p.get("nudge_id") for p in published if isinstance(p, dict)],

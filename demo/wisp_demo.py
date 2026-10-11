@@ -24,8 +24,10 @@ apps, but only inside containers named "Wisp Demo" (a calendar, a Reminders
 list, a Notes folder) holding FICTIONAL data, removable with `persona remove`:
 
   persona seed|remove [...]   seed/remove the fictional persona (demo/seed_mac_persona.py)
-  behavior ACTION             status | run | patterns | predict | profile | nudges | clear
+  behavior ACTION             status | run | patterns | predict | profile | nudges | clear | reset
                               against the running backend (127.0.0.1:8765)
+  behavior reset --wait       before the demo: remove rehearsal drops from "Wisp Demo",
+                              wait for one Calendar sync, then reset learned state
   drop --preset gym-conflict  meeting on the next gym morning, then POST /behavior/run
   drop --preset backtoback    four back-to-back meetings tomorrow 14:00-16:00, then run
   drop --preset dev           no Mac change; run now and show Dev's predicted afternoon window
@@ -220,7 +222,10 @@ def cmd_replay(_: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 BASE_URL = "http://127.0.0.1:8765"
-BEHAVIOR_ACTIONS = ("status", "run", "patterns", "predict", "profile", "nudges", "clear")
+BEHAVIOR_ACTIONS = ("status", "run", "patterns", "predict", "profile", "nudges", "clear", "reset")
+DROP_MARKER = "[wisp-demo-id:drop-"   # seed_mac_persona.marker() of every drop preset event
+SYNC_WAIT_S = 75.0                    # the app re-reads Calendar about once a minute
+SYNC_POLL_S = 5.0
 DEFAULT_GYM_WEEKDAYS = (0, 2, 4)   # persona "Morning lift" Mon/Wed/Fri; used until a habit is learned
 BEHAVIOR_PRESETS = {
     "gym-conflict": "habit_conflict nudge: auto reminder (Undo available)",
@@ -325,6 +330,11 @@ def _print_profile(obj: object) -> None:
 
 
 def _print_run(obj: object) -> None:
+    if isinstance(obj, dict) and obj.get("busy"):
+        print(f"behavior run: busy ({obj.get('detail') or 'another run is in progress'})")
+        return
+    if isinstance(obj, dict) and ((obj.get("status") or {}).get("waiting_for_calendar")):
+        print("waiting for Wisp's first Calendar read (up to ~3 min after launch); nudges start after it")
     if isinstance(obj, dict) and "published" in obj:
         ids = [i for i in obj.get("nudge_ids") or [] if i]
         print(f"published {obj['published']} nudge(s)" + (f": {', '.join(ids)}" if ids else ""))
@@ -380,7 +390,9 @@ def _behavior(a: argparse.Namespace) -> None:
         print(f"behavior run: HTTP {code}")
         _show(obj, a.json, _print_run)
         return
-    if action == "clear":
+    if action in ("clear", "reset"):
+        if not _remove_rehearsal_drops(a):
+            return
         code, obj = _http("POST", "/behavior/clear", {})
         if code in (404, 405):
             print("this backend has no /behavior/clear endpoint. To reset learned behavior state, quit "
@@ -401,6 +413,100 @@ def _behavior(a: argparse.Namespace) -> None:
         _show(obj, True)
         return
     _show(obj, a.json, PRINTERS.get(action))
+
+
+def drop_cleanup_script(container: str = "Wisp Demo") -> str:
+    """AppleScript deleting ONLY the events `drop` added to the ``container``
+    calendar (description carries a ``[wisp-demo-id:drop-…]`` marker). Seeded
+    persona events and every other calendar are left alone. Uids are collected
+    first, so deleting never shifts the list being walked."""
+    seed = _seed_module()
+    name = seed.as_string(container)
+    lo, hi = time.time() - 30 * 86400, time.time() + 30 * 86400
+    return (seed.DATE_HANDLER + "\n"
+            "set removedCount to 0\n"
+            'tell application "Calendar"\n'
+            "\tif exists calendar " + name + " then\n"
+            "\t\tset wispCal to first calendar whose name is " + name + "\n"
+            "\t\tset rangeStart to " + seed.as_date(lo) + "\n"
+            "\t\tset rangeEnd to " + seed.as_date(hi) + "\n"
+            "\t\tset doomed to {}\n"
+            "\t\trepeat with ev in (every event of wispCal whose start date >= rangeStart and start date <= rangeEnd)\n"
+            "\t\t\ttry\n"
+            "\t\t\t\tset d to description of ev\n"
+            "\t\t\t\tif d is not missing value and d contains " + seed.as_string(DROP_MARKER) + " then\n"
+            "\t\t\t\t\tset end of doomed to (uid of ev)\n"
+            "\t\t\t\tend if\n"
+            "\t\t\tend try\n"
+            "\t\tend repeat\n"
+            "\t\trepeat with u in doomed\n"
+            "\t\t\ttry\n"
+            "\t\t\t\tdelete (first event of wispCal whose uid is (contents of u))\n"
+            "\t\t\t\tset removedCount to removedCount + 1\n"
+            "\t\t\tend try\n"
+            "\t\tend repeat\n"
+            "\tend if\n"
+            "end tell\n"
+            'return "removed " & removedCount\n')
+
+
+def _calendar_last_sync() -> float | None:
+    try:
+        code, obj = _http("GET", "/assistant/status", timeout=5)
+    except BackendUnavailable:
+        return None
+    cal = ((obj.get("connectors") or {}).get("calendar") or {}) if isinstance(obj, dict) and code == 200 else {}
+    value = cal.get("last_sync")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _wait_for_calendar_sync(since: float, sleep=None, clock_fn=None) -> None:
+    """Wait until the app re-reads Calendar after ``since`` (polls the backend's
+    sync status), or SYNC_WAIT_S when that status is unavailable."""
+    sleep, clock_fn = sleep or time.sleep, clock_fn or time.time
+    deadline = clock_fn() + 2 * SYNC_WAIT_S
+    print(f"waiting for Wisp's next Calendar sync (about {int(SYNC_WAIT_S)} s)...", flush=True)
+    if _calendar_last_sync() is None:
+        sleep(SYNC_WAIT_S)
+        return
+    while clock_fn() < deadline:
+        last = _calendar_last_sync()
+        if last is not None and last > since:
+            print("Calendar synced.")
+            return
+        sleep(SYNC_POLL_S)
+    print("no Calendar sync seen yet; resetting anyway (rerun `behavior reset` if a rehearsal nudge reappears)")
+
+
+def _remove_rehearsal_drops(a: argparse.Namespace) -> bool:
+    """Step 1 of `behavior clear|reset`: delete rehearsal drop events from the
+    "Wisp Demo" calendar, otherwise they refire right after the reset and the
+    real drop finds them "already there". True when the reset should proceed."""
+    seed = _seed_module()
+    script = drop_cleanup_script(seed.CONTAINER)
+    if getattr(a, "dry_run", False):
+        print(f"-- Calendar (remove rehearsal drops):\n{script}")
+        print("-- then POST /behavior/clear" + (" after one Calendar sync" if getattr(a, "wait", False) else ""))
+        return False
+    if not seed.is_macos():
+        print("skipping the 'Wisp Demo' calendar cleanup: it needs osascript (macOS only); "
+              "only Wisp's learned state is reset")
+        return True
+    started = time.time()
+    try:
+        out = seed.run_osascript(script, timeout=300)
+    except seed.OsaError as exc:
+        sys.exit(f"Calendar cleanup failed: {exc}")
+    removed = int(out.rsplit(" ", 1)[-1]) if out.startswith("removed ") and out.rsplit(" ", 1)[-1].isdigit() else 0
+    print(f"Calendar: removed {removed} rehearsal drop event(s) from 'Wisp Demo'")
+    if removed == 0:
+        return True
+    if getattr(a, "wait", False):
+        _wait_for_calendar_sync(started)
+        return True
+    print(f"Wisp still has them until its next Calendar sync (~{int(SYNC_WAIT_S)} s). Rerun "
+          "`behavior reset` in a minute (or use `behavior reset --wait`); resetting now would refire them.")
+    return False
 
 
 def _seed_module():
@@ -479,6 +585,7 @@ def cmd_drop_behavior(a: argparse.Namespace) -> None:
     weekdays = _gym_weekdays() if a.preset == "gym-conflict" and not dry else DEFAULT_GYM_WEEKDAYS
     items = behavior_drop_items(a.preset, time.time(), weekdays)
     scripts = []
+    already = 0
     if items["events"]:
         scripts.append(("Calendar", seed.calendar_script(seed.normalize_events(items["events"]))))
     if items["reminders"]:
@@ -491,6 +598,7 @@ def cmd_drop_behavior(a: argparse.Namespace) -> None:
             created, skipped = seed.parse_tally(seed.run_osascript(script))
         except seed.OsaError as exc:
             sys.exit(f"{app} write failed: {exc}")
+        already += skipped
         print(f"{app}: {created} added to 'Wisp Demo', {skipped} already there")
     for e in items["events"]:
         print(f"  event     {_clock(e['start_ts'])}-{datetime.fromtimestamp(e['end_ts']):%H:%M}  {e['title']}")
@@ -504,6 +612,10 @@ def cmd_drop_behavior(a: argparse.Namespace) -> None:
         sys.exit(str(exc))
     print(f"behavior run: HTTP {code}; expected: {BEHAVIOR_PRESETS[a.preset]}")
     _print_run(obj)
+    if already and isinstance(obj, dict) and not obj.get("nudge_ids"):
+        # Re-dropped: the event was already there, so show the nudge it made.
+        _print_existing_nudges(items["events"])
+        return
     if isinstance(obj, dict) and not obj.get("nudge_ids") and items["events"]:
         print("Wisp ingests Calendar after the app's next Calendar sync (every few minutes). "
               "Watch for the notification, or rerun `behavior run` in a minute.")
@@ -517,6 +629,25 @@ def cmd_drop_behavior(a: argparse.Namespace) -> None:
             _print_predictions({"predictions": dev})
         else:
             print("no Dev prediction for the next day; the contact window nudge fires on weekday afternoons")
+
+
+def _print_existing_nudges(events: list) -> None:
+    try:
+        code, obj = _http("GET", "/behavior/nudges", timeout=30)
+    except BackendUnavailable:
+        return
+    titles = [str(e["title"]).casefold() for e in events]
+    rows = [n for n in _rows(obj, "nudges") if code == 200 and any(
+        t in f"{n.get('title', '')} {n.get('body', '')}".casefold() for t in titles)]
+    if not rows:
+        print("the drop was already on the calendar and no nudge for it is on file; "
+              "run `behavior reset --wait` to rehearse it again")
+        return
+    print("the drop was already on the calendar; its nudge:")
+    for n in rows:
+        state = n.get("verdict") or ("auto action active (Undo available)" if n.get("can_undo") else "delivered")
+        print(f"  delivered {_clock(n.get('delivered_at'))}  state: {state}")
+    _print_nudges({"nudges": rows})
 
 
 def main() -> None:
@@ -549,6 +680,10 @@ def main() -> None:
     behavior.add_argument("--undo", metavar="NUDGE_ID", help="nudges: undo a nudge's auto action")
     behavior.add_argument("--act", nargs=2, metavar=("NUDGE_ID", "INDEX"),
                           help="nudges: get the prompt for an offered action")
+    behavior.add_argument("--wait", action="store_true",
+                          help="clear/reset: after removing rehearsal drops, wait for one Calendar sync")
+    behavior.add_argument("--dry-run", action="store_true",
+                          help="clear/reset: print the Calendar cleanup AppleScript, change nothing")
     behavior.set_defaults(fn=cmd_behavior)
     persona_cmd = sub.add_parser("persona", help="seed/remove the fictional persona in the Mac's real apps")
     persona_cmd.add_argument("action", choices=("seed", "remove"))

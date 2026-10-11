@@ -150,3 +150,14 @@ def test_reset_synthetic_only(client, live, store, monkeypatch, tmp_path):
     real, _ = make_runtime(tmp_path / "real", FakeEngine(), synthetic=False)
     br.set_runtime(real)
     assert client.post("/behavior/reset").status_code == 409
+
+
+def test_run_surfaces_busy_when_another_tick_holds_the_lock(client, live, monkeypatch):
+    rt, engine, hub = live
+
+    async def busy(*a, **k):
+        raise br.TickBusy("another behavior run is still in progress after 30s")
+    monkeypatch.setattr(rt, "tick", busy)
+    data = client.post("/behavior/run").json()
+    assert data["ok"] is False and data["busy"] is True and data["published"] == 0
+    assert "in progress" in data["detail"]

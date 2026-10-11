@@ -64,8 +64,8 @@ def profile_block() -> str:
     remote_only_context_block). Cached for 60 s by the runtime and never
     blocks the event loop; any failure is simply no card.
     """
-    import os
-    if os.environ.get("WISP_BEHAVIOR") != "1" and os.environ.get("WISP_FOUNDER_DEMO") != "1":
+    from service.behavior.flags import env_enabled
+    if not env_enabled():
         return ""
     try:
         from service.assistant.behavior_runtime import profile_card

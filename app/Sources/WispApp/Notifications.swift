@@ -18,7 +18,15 @@ enum Notifications {
         guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else { return false }
         if !id.isEmpty {
             let delivered = await center.deliveredNotifications()
-            if delivered.contains(where: { $0.request.identifier == id }) { return true }
+            if let old = delivered.first(where: { $0.request.identifier == id }) {
+                // A replay of the same hub event is a no-op. A NEW event under
+                // the same identifier (a nudge re-fired after a reset carries a
+                // new event_id) replaces it, so its banner shows again.
+                let newEvent = userInfo["event_id"] ?? ""
+                let oldEvent = old.request.content.userInfo["event_id"] as? String ?? ""
+                if newEvent.isEmpty || newEvent == oldEvent { return true }
+                center.removeDeliveredNotifications(withIdentifiers: [id])
+            }
         }
         let content = UNMutableNotificationContent()
         content.title = title
@@ -125,6 +133,7 @@ final class NudgeNotificationDelegate: NSObject, UNUserNotificationCenterDelegat
         }
         let action = response.actionIdentifier
         if let nudgeID = info["nudge_id"], !nudgeID.isEmpty {
+            let info = info   // immutable copy for the Task (Swift 6 sendability)
             Task { @MainActor in Notifications.onNudgeResponse?(nudgeID, action, info) }
         }
         completionHandler()

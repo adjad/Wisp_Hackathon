@@ -144,7 +144,9 @@ fictional data for Aria Solano / Cedarloop, and each item is tagged with
 ```sh
 python3 demo/seed_mac_persona.py seed --dry-run      # print the AppleScript, write nothing
 python3 demo/seed_mac_persona.py seed                # or: seed --calendar / --reminders / --notes
-.venv/bin/python demo/wisp_demo.py behavior clear    # reset first: full nudge budget (POST /behavior/reset)
+.venv/bin/python demo/wisp_demo.py behavior reset --wait   # reset first: removes rehearsal drops from
+                                                          # "Wisp Demo", waits ~75 s for a Calendar sync,
+                                                          # then POST /behavior/clear (full nudge budget)
 .venv/bin/python demo/wisp_demo.py behavior status   # also: run, patterns, predict, profile, nudges
 .venv/bin/python demo/wisp_demo.py drop --preset gym-conflict   # meeting on the next gym morning
 .venv/bin/python demo/wisp_demo.py drop --preset backtoback     # 4 meetings tomorrow 14:00-16:00
@@ -154,7 +156,9 @@ python3 demo/seed_mac_persona.py remove              # quit Wisp first; deletes 
 
 Launch with `WISP_BEHAVIOR=1 WISP_BEHAVIOR_SYNTHETIC_ONLY=1` by starting the app
 binary from Terminal. The founder/Intel build turns both on automatically.
-`behavior clear` works only in synthetic mode. Seeding runs on the macOS system
+`behavior clear` (alias `reset`; `--dry-run` prints the cleanup AppleScript)
+works only in synthetic mode. A re-`drop` of an event that is already there
+still runs the engine and prints that event's existing nudge. Seeding runs on the macOS system
 Python 3.9+ and needs only the standard library; `wisp_demo.py` needs the repo
 venv. Re-seeding skips items that already exist.
 

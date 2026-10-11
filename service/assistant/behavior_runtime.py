@@ -63,6 +63,12 @@ INGEST_EVERY_S = 300.0
 MINE_EVERY_S = 1800.0
 NUDGE_EVERY_S = 60.0
 REMOTE_RETRY_S = 120.0
+CALENDAR_GRACE_S = 180.0   # synthetic: wait this long for a first Calendar read
+FORCE_WAIT_S = 30.0        # /behavior/run waits this long for a running tick
+# Same event: same title, starts within this window. The persona regenerates
+# each day from a seeded RNG over a shifted range, so the same routine event
+# can come back minutes away from the copy seeded into the calendar earlier.
+CAL_MATCH_S = 3 * 3600.0
 CARD_TTL_S = 60.0
 CARD_MAX_BYTES = 700
 HISTORY_S = 56 * 86400
@@ -75,11 +81,13 @@ ASK_LIMIT = 500
 # --------------------------------------------------------------------------
 
 def founder_demo() -> bool:
-    return os.environ.get("WISP_FOUNDER_DEMO") == "1"
+    from service.behavior.flags import founder_demo_env
+    return founder_demo_env()
 
 
 def enabled() -> bool:
-    return os.environ.get("WISP_BEHAVIOR") == "1" or founder_demo()
+    from service.behavior.flags import env_enabled
+    return env_enabled()
 
 
 def synthetic_only() -> bool:
@@ -203,9 +211,17 @@ def _finite(value) -> bool:
         return False
 
 
+def _norm_title(text) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
 # --------------------------------------------------------------------------
 # Runtime
 # --------------------------------------------------------------------------
+
+class TickBusy(RuntimeError):
+    """A forced run could not start: another tick held the lock too long."""
+
 
 class BehaviorRuntime:
     def __init__(self, home: Path | None = None, *, mode: str | None = None,
@@ -216,7 +232,8 @@ class BehaviorRuntime:
                  messages_fn: Callable[[], dict] | None = None,
                  calendar_sync_fn: Callable[[], dict] | None = None,
                  session_db_fn: Callable[[], Any] | None = None,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 calendar_grace_s: float | None = None) -> None:
         self.home = Path(home) if home is not None else _home()
         self.mode = mode or brain_mode()
         self.synthetic = synthetic_only() if synthetic is None else synthetic
@@ -228,6 +245,9 @@ class BehaviorRuntime:
         self._calendar_sync_fn = calendar_sync_fn or _default_calendar_sync
         self._session_db_fn = session_db_fn or _default_session_db
         self.clock = clock
+        self._started = clock()
+        self._calendar_grace_s = CALENDAR_GRACE_S if calendar_grace_s is None else float(calendar_grace_s)
+        self._calendar_ready = False
         self._local_engine = None
         self._remote_engine = None
         self._remote_built = False
@@ -329,6 +349,8 @@ class BehaviorRuntime:
     # ---- external hooks --------------------------------------------------------
     def record_decision(self, tool: str, approved: bool) -> None:
         from service.behavior.types import Observation
+        if self.synthetic:
+            return   # the synthetic persona never learns from the user's real approvals
         now = self.clock()
         tool = str(tool or "")[:64]
         if not tool:
@@ -363,6 +385,9 @@ class BehaviorRuntime:
     def _flush_decisions(self) -> bool:
         if not self._pending:
             return False
+        if self.synthetic:
+            self._pending.clear()   # real approvals never feed the synthetic persona
+            return False
         batch = []
         while self._pending:
             batch.append(self._pending.popleft())
@@ -375,6 +400,39 @@ class BehaviorRuntime:
     def _demo_calendar_seen(self) -> bool:
         return self.kv_get("demo_calendar_seen") == "1"
 
+    def _calendar_ready_for(self, sync: dict, now: float) -> bool:
+        """Synthetic demo only: whether the first Calendar read has settled.
+        Until it has, persona upcoming events are not ingested and no nudge is
+        generated: a seeded "Wisp Demo" calendar must win over the persona's
+        own copy of the same events, or both would nudge. With Calendar access
+        off (a denied read also settles it) or no report at all, the persona's
+        upcoming events are used after CALENDAR_GRACE_S of uptime."""
+        if not self.synthetic or self._calendar_ready:
+            return True
+        if _finite(sync.get("last_sync")) and not sync.get("syncing"):
+            self._calendar_ready = True
+        elif now - self._started >= self._calendar_grace_s:
+            self._calendar_ready = True
+        return self._calendar_ready
+
+    def _demo_cal_seen(self, key: str) -> dict[str, list]:
+        try:
+            value = json.loads(self.kv_get(f"demo_cal:{key}", "{}") or "{}")
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _remember_demo_cal(self, key: str, observations: list, now: float) -> None:
+        """Every "Wisp Demo" calendar event fed to engine ``key`` (title, start),
+        so a later persona regeneration never adds its own copy of the same
+        event: the calendar's copy stays in the engine after it passes, and
+        persona history would otherwise double-count that day."""
+        seen = {oid: v for oid, v in self._demo_cal_seen(key).items()
+                if isinstance(v, list) and len(v) == 2 and _finite(v[1]) and float(v[1]) >= now - HISTORY_S}
+        for o in observations:
+            seen[o.id] = [_norm_title(o.subject), float(o.ts)]
+        self.kv_set(f"demo_cal:{key}", json.dumps(seen, sort_keys=True))
+
     def _ingest_persona(self, store, now: float, stamps: dict) -> bool:
         """The synthetic persona, regenerated once per local day (ids are stable
         within a day). Rows a previous day's persona contributed that today's no
@@ -383,13 +441,24 @@ class BehaviorRuntime:
         day = datetime.fromtimestamp(now).date().isoformat()
         key = self._target_key()
         seen = self._demo_calendar_seen()
-        marker = f"{day}:{int(seen)}"
+        # Persona upcoming events only once the first Calendar read settled
+        # without a demo calendar (see _calendar_ready_for).
+        upcoming = not seen and self._calendar_ready
+        marker = f"{day}:{int(seen)}:{int(upcoming)}"
         if stamps.get("persona_day") == marker:
             return False
         persona = self._persona_fn(now)
         obs = list(getattr(persona, "observations", ()) or ())
-        if not seen:
+        if upcoming:
             obs += list(getattr(persona, "upcoming", ()) or ())
+        # An event the "Wisp Demo" calendar already supplied (same title, start
+        # within CAL_MATCH_S) comes from the calendar only, past or upcoming.
+        starts: dict[str, list[float]] = {}
+        for title, ts in self._demo_cal_seen(key).values():
+            starts.setdefault(title, []).append(float(ts))
+        if starts:
+            obs = [o for o in obs if o.kind != "event" or not any(
+                abs(float(o.ts) - ts) <= CAL_MATCH_S for ts in starts.get(_norm_title(o.subject), ()))]
         ids = sorted({o.id for o in obs})
         previous = set(json.loads(self.kv_get(f"persona_ids:{key}", "[]") or "[]"))
         stale = previous - set(ids)
@@ -451,8 +520,11 @@ class BehaviorRuntime:
             elif not self._demo_calendar_seen():
                 stamps["cal_sync"] = last_sync
                 return False   # no "Wisp Demo" calendar: persona events alone
-        result = self.call("observe_snapshot", "calendar", self.calendar_observations(rows),
+        observations = self.calendar_observations(rows)
+        result = self.call("observe_snapshot", "calendar", observations,
                            window_start=start, window_end=end, taken_at=float(last_sync)) or {}
+        if self.synthetic:
+            self._remember_demo_cal(self.active, observations, now)
         stamps["cal_sync"] = last_sync
         return any(int(result.get(k) or 0) for k in ("upserted", "cancelled", "moved"))
 
@@ -538,8 +610,11 @@ class BehaviorRuntime:
             except Exception:  # noqa: BLE001
                 pass
             fresh_calendar = _finite(sync.get("last_sync")) and sync.get("last_sync") != stamps.get("cal_sync")
-            if force or now - stamps["ingest"] >= INGEST_EVERY_S or fresh_calendar:
+            ready = self._calendar_ready_for(sync, now)
+            if (force or now - stamps["ingest"] >= INGEST_EVERY_S or fresh_calendar
+                    or stamps.get("cal_ready") != ready):
                 changed = self._ingest(store, now, stamps) or changed
+                stamps["cal_ready"] = ready
                 stamps["ingest"] = now
                 self.last["ingest"] = now
             nudges: list = []
@@ -549,7 +624,10 @@ class BehaviorRuntime:
                     stamps["mine"] = now
                     self.last["mine"] = now
                     self.invalidate_card()   # patterns changed: refreshed below
-                if force or changed or now - stamps["nudge"] >= NUDGE_EVERY_S:
+                # Synthetic: no nudge before the first Calendar read settled
+                # (otherwise the persona's copy and the calendar's copy of the
+                # same event would each nudge once).
+                if ready and (force or changed or now - stamps["nudge"] >= NUDGE_EVERY_S):
                     self.call("generate_nudges", now)
                     stamps["nudge"] = now
                     self.last["nudge"] = now
@@ -656,6 +734,13 @@ class BehaviorRuntime:
                     performed.append({"type": done["type"], "title": done["title"],
                                       "when_ts": done["when_ts"], "action_index": idx})
         event = nudge.to_event()
+        # "auto" tells the app an action is already done: true only for the
+        # actions actually performed (one skipped as already on file, or past
+        # its time, is still offered).
+        done_idx = {p["action_index"] for p in performed}
+        for idx, action in enumerate(event.get("actions") or []):
+            if isinstance(action, dict):
+                action["auto"] = idx in done_idx
         event["auto_performed"] = performed
         event["can_undo"] = bool(performed)
         self.remember_nudge(nudge)
@@ -692,24 +777,39 @@ class BehaviorRuntime:
     async def tick(self, store, hub, *, now: float | None = None, force: bool = False) -> list[dict]:
         if self._tick_lock is None:
             self._tick_lock = asyncio.Lock()
-        if self._tick_lock.locked():
+        lock = self._tick_lock
+        if lock.locked() and not force:
             return []
-        async with self._tick_lock:
-            now = now if now is not None else self.clock()
-            self.expire_events(store, now)
-            nudges, key = await asyncio.to_thread(self.work, store, now, force=force)
-            published: list[dict] = []
-            for nudge in sorted(nudges, key=lambda n: n.seq):
-                try:
-                    row = await self.deliver(store, hub, nudge, now)
-                except Exception as exc:  # noqa: BLE001 — retried next tick (dedupe + idempotent actions)
-                    self.errors["deliver"] = f"{type(exc).__name__}: {exc}"[:200]
-                    break
-                self.kv_set(f"cursor:{key}", str(max(int(nudge.seq), int(self.kv_get(f'cursor:{key}', '0') or 0))))
-                if row is not None:
-                    published.append(row)
-            self.last["tick"] = now
-            return published
+        if lock.locked():
+            # /behavior/run: wait for the running tick instead of silently
+            # doing nothing, so a demo drop is really ingested; bounded.
+            try:
+                await asyncio.wait_for(lock.acquire(), FORCE_WAIT_S)
+            except asyncio.TimeoutError:
+                raise TickBusy(f"another behavior run is still in progress after {int(FORCE_WAIT_S)}s") from None
+        else:
+            await lock.acquire()
+        try:
+            return await self._tick_locked(store, hub, now, force)
+        finally:
+            lock.release()
+
+    async def _tick_locked(self, store, hub, now: float | None, force: bool) -> list[dict]:
+        now = now if now is not None else self.clock()
+        self.expire_events(store, now)
+        nudges, key = await asyncio.to_thread(self.work, store, now, force=force)
+        published: list[dict] = []
+        for nudge in sorted(nudges, key=lambda n: n.seq):
+            try:
+                row = await self.deliver(store, hub, nudge, now)
+            except Exception as exc:  # noqa: BLE001 — retried next tick (dedupe + idempotent actions)
+                self.errors["deliver"] = f"{type(exc).__name__}: {exc}"[:200]
+                break
+            self.kv_set(f"cursor:{key}", str(max(int(nudge.seq), int(self.kv_get(f'cursor:{key}', '0') or 0))))
+            if row is not None:
+                published.append(row)
+        self.last["tick"] = now
+        return published
 
     # ---- user verdicts --------------------------------------------------------------
     def feedback(self, store, nudge_id: str, verdict: str) -> None:
@@ -754,6 +854,10 @@ class BehaviorRuntime:
             except ValueError:
                 continue
             actions = self.actions_for(r["id"])
+            live = {a["idx"] for a in actions if a["undone_at"] is None}
+            for idx, action in enumerate(item.get("actions") or []):
+                if isinstance(action, dict):
+                    action["auto"] = idx in live   # done (and not undone), as in deliver()
             item.update({"delivered_at": r["delivered_at"], "event_id": r["event_id"],
                          "verdict": r["verdict"],
                          "auto_performed": [{"type": a["type"], "title": a["title"], "when_ts": a["when_ts"],
@@ -825,6 +929,8 @@ class BehaviorRuntime:
             "last": dict(self.last), "errors": dict(self.errors),
             "cursor": {k: int(self.kv_get(f"cursor:{k}", "0") or 0) for k in ("local", "remote")},
             "pending_decisions": len(self._pending),
+            # Synthetic: nudges wait for the first Calendar read (or the grace period).
+            "waiting_for_calendar": self.synthetic and not self._calendar_ready,
         }
         with self._db_lock:
             info["delivered_nudges"] = self._db.execute("SELECT COUNT(*) FROM nudges").fetchone()[0]

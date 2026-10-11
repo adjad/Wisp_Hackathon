@@ -358,7 +358,9 @@ async def lifespan(app: FastAPI):
     else:
         # The remote-only build starts no assistant scheduler, so behavior
         # learning (on automatically in the founder demo) runs its own loop.
-        from service.assistant.behavior_runtime import enabled as behavior_enabled
+        # The flag is read BEFORE importing the runtime: its import chain must
+        # not load while behavior learning is off.
+        from service.behavior.flags import env_enabled as behavior_enabled
         if behavior_enabled():
             from service.assistant import behavior_runtime
             started_tasks.append(asyncio.create_task(
@@ -1812,6 +1814,15 @@ async def agent(body: dict[str, Any]):
                     # the same gate the memory block uses elsewhere.
                     from service.memory.prompt_blocks import remote_only_context_block
                     style_hint += remote_only_context_block()
+                if remote_only_profile() is not None:
+                    # Remote-only sends the raw prompt, not decision.resolved_request,
+                    # so a behavior route's "answer only from these results"
+                    # instruction rides in the style hint instead (a few hundred
+                    # bytes, well inside the gateway's budget).
+                    from service.router.router import behavior_guidance
+                    guidance = behavior_guidance(decision)
+                    if guidance:
+                        style_hint += "\n" + guidance
                 final = await run_agent(turn_client, decision.model, messages, emit, approver,
                                         tools=decision.tool_subset,
                                         active_skill=active_skill,

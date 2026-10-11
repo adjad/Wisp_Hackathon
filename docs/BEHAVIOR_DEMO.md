@@ -17,8 +17,9 @@ sentences. How it works: [BEHAVIOR_ENGINE.md](BEHAVIOR_ENGINE.md). GX10 side:
 > 1. `python3 demo/seed_mac_persona.py seed --calendar` (Calendar is all the
 >    Intel build reads).
 > 2. Launch the demo build. Notifications on, style **Alerts**, Focus off.
-> 3. Ten minutes before going on: `.venv/bin/python demo/wisp_demo.py behavior clear`,
->    then `behavior run` and `behavior nudges`.
+> 3. Ten minutes before going on: `.venv/bin/python demo/wisp_demo.py behavior reset --wait`
+>    (removes rehearsal drops from **Wisp Demo**, waits about 75 s for one
+>    Calendar sync, then resets), then `behavior run` and `behavior nudges`.
 > 4. On cue: beats 1 and 2, then `drop --preset gym-conflict` (beat 5) and
 >    `drop --preset backtoback` (beat 6).
 >
@@ -48,6 +49,16 @@ sentences. How it works: [BEHAVIOR_ENGINE.md](BEHAVIOR_ENGINE.md). GX10 side:
 | Card in the panel | Yes, up to 3 cards at the top | Same |
 | Wisp-schedule reminder from an auto action | Created and undoable, but **never fires**: this build has no scheduler. The nudge notification is what shows | Created, and fires at its own time (the evening before the clash, not on stage) |
 | Reminders and Notes seeds | Not read by this build. Calendar is what matters | Seeded and visible to other features. Never used for learning |
+
+**Latency on the Intel build.** Nudge rewording sends up to 2 short requests
+per pass to the GX10 (it never runs while a chat request is in flight). If the
+GX10 feels slow in rehearsal, turn rewording off for the live run; nudges then
+show their code-composed text, which reads fine. The backend inherits the
+app's environment, so either start the app binary from Terminal
+(`WISP_BEHAVIOR_PHRASER=0 /Applications/Wisp.app/Contents/MacOS/Wisp`, keep
+the window open) or run `launchctl setenv WISP_BEHAVIOR_PHRASER 0`, then quit
+and reopen Wisp normally (`launchctl unsetenv WISP_BEHAVIOR_PHRASER` after the
+demo).
 
 ## Setup (start at least 30 minutes before 1 PM)
 
@@ -122,16 +133,32 @@ click can mute a kind of nudge for a week. Before each rehearsal, and again
 about 10 minutes before the real run:
 
 ```sh
-.venv/bin/python demo/wisp_demo.py behavior clear   # POST /behavior/reset (same handler as /behavior/clear):
-                                                    # forgets learned state, delivered nudges, and the
-                                                    # Wisp-schedule items behavior learning created
+.venv/bin/python demo/wisp_demo.py behavior reset --wait   # 1. delete the events earlier `drop`s added to
+                                                           #    "Wisp Demo" ([wisp-demo-id:drop-…] only)
+                                                           # 2. wait for one Calendar sync (~75 s)
+                                                           # 3. POST /behavior/clear: forget learned state,
+                                                           #    delivered nudges, Wisp-schedule items it made
 .venv/bin/python demo/wisp_demo.py behavior run     # re-learn from the persona, nudge now
 .venv/bin/python demo/wisp_demo.py behavior nudges  # what already fired
 ```
 
-`curl -s -X POST http://127.0.0.1:8765/behavior/reset` does the same. Reset
-works only in synthetic mode. It never touches real data or the seeded
-**Wisp Demo** items. Expect two things:
+Why the drop cleanup matters: a rehearsal `drop` leaves its meeting in the
+**Wisp Demo** calendar. Without the cleanup it refires right after the reset,
+and the real drop then only says "already there". Use `--dry-run` to print the
+AppleScript instead. Without `--wait`, `reset` removes the drops and stops,
+telling you to rerun it a minute later (resetting before Calendar syncs would
+refire them). `behavior clear` is the same command. Off macOS the calendar
+step is skipped with a message.
+
+`curl -s -X POST http://127.0.0.1:8765/behavior/reset` resets Wisp's learned
+state only (no calendar cleanup). Reset works only in synthetic mode. It never
+touches real data or the seeded persona items in **Wisp Demo**. Expect:
+
+- Right after launch, nudges wait for Wisp's first Calendar read (up to about
+  3 minutes; `behavior run` prints "waiting for Wisp's first Calendar read").
+  This keeps the seeded calendar and the persona from nudging twice about the
+  same meeting. With Calendar access off, the persona alone is used after 3
+  minutes.
 
 - Anything seeded inside the look-ahead, such as the persona's meeting over
   tomorrow's gym time, fires again within about 30 seconds. That nudge can be
@@ -259,7 +286,9 @@ vote too, and turns that nudge's auto action into an offer next time.
 | Notifications are off or don't show | Use the **card at the top of the Wisp panel**. It has the same buttons: Undo, the draft button, Useful / Not now / Wrong. |
 | The GX10 is down or slow | Nudges, cards and Undo still work with the **code-composed text**. In the Intel build, chat questions (beats 1–4) need the GX10, so show `behavior patterns`, `behavior predict` and `behavior profile` in Terminal instead. |
 | A nudge doesn't show | `.venv/bin/python demo/wisp_demo.py behavior run`, then `.venv/bin/python demo/wisp_demo.py behavior nudges`. If it is listed, it was delivered: point at the card in the panel. |
-| `behavior run` says "no new nudge" | It already fired (a nudge never fires twice until a reset), it is outside the look-ahead, it is quiet hours (22:00–07:00), the 4-per-day budget is spent, or the kind is muted. Run `behavior clear`, then `behavior run`. |
+| `drop` says "already there" | The event is still in **Wisp Demo** from a rehearsal. `drop` still runs the engine and prints that event's existing nudge. To fire it fresh: `behavior reset --wait`, then `drop` again. |
+| `behavior run` says "busy" | A scheduled pass (mining, or a slow GX10) is still running; `run` waited 30 s. Rerun it. |
+| `behavior run` says "no new nudge" | It already fired (a nudge never fires twice until a reset), it is outside the look-ahead, it is quiet hours (22:00–07:00), the 4-per-day budget is spent, or the kind is muted. Run `behavior reset --wait`, then `behavior run`. |
 | A `drop` produced nothing | Wisp reads Calendar about once a minute. Wait, then `behavior run`. Check the event is in the **Wisp Demo** calendar. |
 | The demo script won't start (missing packages) | Use `curl`: `curl -s -X POST http://127.0.0.1:8765/behavior/run`, `curl -s http://127.0.0.1:8765/behavior/nudges`, `curl -s -X POST http://127.0.0.1:8765/behavior/reset`. |
 | Everything is broken | Show `behavior patterns`, `behavior predict` and the profile card, and say the rest is the same engine. |

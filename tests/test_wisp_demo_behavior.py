@@ -263,3 +263,96 @@ def test_catch_presets_still_available(demo):
     for name in ("natural", "quad", "dinner", "known", "promo", "scam"):
         assert name in demo.PRESETS
     assert not set(demo.PRESETS) & set(demo.BEHAVIOR_PRESETS)
+
+
+# --- rehearsal reset: drops leave the "Wisp Demo" calendar before the reset ----------
+
+def _mac_seed(demo, monkeypatch, output="removed 2"):
+    seed = demo._seed_module()
+    scripts = []
+    monkeypatch.setattr(seed, "is_macos", lambda: True)
+    monkeypatch.setattr(seed, "run_osascript", lambda script, timeout=900: scripts.append(script) or output)
+    monkeypatch.setattr(demo, "_seed_module", lambda: seed)
+    return scripts
+
+
+def test_cleanup_script_deletes_only_drop_events_in_wisp_demo(demo):
+    script = demo.drop_cleanup_script()
+    assert 'calendar "Wisp Demo"' in script and '"[wisp-demo-id:drop-"' in script
+    assert "delete (first event of wispCal whose uid is" in script
+    # Never the calendar itself, never another calendar.
+    assert "delete (first calendar" not in script and "every calendar" not in script
+
+
+@pytest.mark.parametrize("action", ["clear", "reset"])
+def test_reset_removes_drops_waits_for_sync_then_clears(demo, backend, monkeypatch, action, capsys):
+    scripts = _mac_seed(demo, monkeypatch)
+    syncs = iter([100.0, 100.0, 9e12])            # baseline, stale, then a fresh sync
+    monkeypatch.setattr(demo, "_calendar_last_sync", lambda: next(syncs))
+    slept = []
+    monkeypatch.setattr(demo.time, "sleep", slept.append)
+    demo.cmd_behavior(args(action=action, wait=True, dry_run=False))
+    assert len(scripts) == 1 and "[wisp-demo-id:drop-" in scripts[0]
+    assert slept == [demo.SYNC_POLL_S]
+    assert backend.calls == [("POST", "/behavior/clear", {})]
+    out = capsys.readouterr().out
+    assert "removed 2 rehearsal drop event(s)" in out and "Calendar synced" in out
+
+
+def test_reset_without_wait_does_not_clear_while_calendar_is_stale(demo, backend, monkeypatch, capsys):
+    _mac_seed(demo, monkeypatch, output="removed 1")
+    demo.cmd_behavior(args(action="reset", wait=False, dry_run=False))
+    assert backend.calls == []                       # clearing now would refire the rehearsal drop
+    assert "behavior reset --wait" in capsys.readouterr().out
+
+
+def test_reset_with_no_drops_clears_at_once(demo, backend, monkeypatch):
+    _mac_seed(demo, monkeypatch, output="removed 0")
+    demo.cmd_behavior(args(action="reset", wait=True, dry_run=False))
+    assert backend.calls == [("POST", "/behavior/clear", {})]
+
+
+def test_reset_dry_run_and_off_macos(demo, backend, monkeypatch, capsys):
+    seed = demo._seed_module()
+    monkeypatch.setattr(seed, "run_osascript", lambda *a, **k: pytest.fail("no osascript"))
+    monkeypatch.setattr(demo, "_seed_module", lambda: seed)
+    demo.cmd_behavior(args(action="reset", wait=True, dry_run=True))
+    assert backend.calls == [] and "[wisp-demo-id:drop-" in capsys.readouterr().out
+    monkeypatch.setattr(seed, "is_macos", lambda: False)
+    demo.cmd_behavior(args(action="reset", wait=False, dry_run=False))
+    assert backend.calls == [("POST", "/behavior/clear", {})]
+    assert "macOS only" in capsys.readouterr().out
+
+
+def test_wait_falls_back_to_a_fixed_sleep_without_sync_status(demo, monkeypatch):
+    monkeypatch.setattr(demo, "_calendar_last_sync", lambda: None)
+    slept = []
+    demo._wait_for_calendar_sync(0.0, sleep=slept.append)
+    assert slept == [demo.SYNC_WAIT_S]
+
+
+def test_redrop_still_runs_and_shows_the_existing_nudge(demo, backend, monkeypatch, capsys):
+    _mac_seed(demo, monkeypatch, output="created 0 skipped 1")
+    backend.routes[("POST", "/behavior/run")] = (200, {"ok": True, "published": 0, "nudge_ids": []})
+    backend.routes[("GET", "/behavior/nudges")] = (200, {"nudges": [
+        {"id": "n7", "kind": "habit_conflict", "title": "Foundry export check-in overlaps your workout",
+         "body": "", "because": "", "delivered_at": _day(1), "verdict": None, "can_undo": True,
+         "actions": [{"type": "add_reminder", "label": "Remind me", "auto": True}]},
+        {"id": "n8", "kind": "cancel_likely", "title": "You might skip Board deck prep", "body": "",
+         "because": "", "actions": []}]})
+    demo.cmd_drop(SimpleNamespace(preset="gym-conflict", dry_run=False, no_run=False))
+    assert [c[:2] for c in backend.calls][-2:] == [("POST", "/behavior/run"), ("GET", "/behavior/nudges")]
+    out = capsys.readouterr().out
+    assert "1 already there" in out and "its nudge" in out and "Undo available" in out
+    assert "Foundry export check-in" in out and "Board deck prep" not in out
+
+
+def test_run_reports_busy_and_calendar_wait(demo, backend, capsys):
+    backend.routes[("POST", "/behavior/run")] = (200, {"ok": False, "busy": True, "published": 0,
+                                                      "detail": "another behavior run is still in progress"})
+    demo.cmd_behavior(args(action="run"))
+    assert "busy" in capsys.readouterr().out
+    backend.routes[("POST", "/behavior/run")] = (200, {"ok": True, "published": 0, "nudge_ids": [],
+                                                      "status": {"waiting_for_calendar": True}})
+    demo.cmd_behavior(args(action="run"))
+    assert "first Calendar read" in capsys.readouterr().out

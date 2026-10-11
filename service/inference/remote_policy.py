@@ -176,8 +176,9 @@ def remote_demo_tool_allowed(tool_name: str | None) -> bool:
     # pinned read set (_READ_TOOLS) is unchanged. Their schemas are small; the
     # demo routes offer them alone (see router._behavior_request).
     if tool_name in _BEHAVIOR_TOOLS:
-        # Mirrors service.assistant.behavior_runtime.enabled() without importing
-        # the assistant package (which opens stores) from this policy module.
-        return os.environ.get("WISP_BEHAVIOR") == "1" or os.environ.get("WISP_FOUNDER_DEMO") == "1"
+        # The same import-free switch behavior_runtime.enabled() uses; the
+        # assistant package (which opens stores) is never imported from here.
+        from service.behavior.flags import env_enabled
+        return env_enabled()
     from service.demo.founder import enabled
     return tool_name in {"search_notes", "lookup_contact", "list_contacts"} and enabled()

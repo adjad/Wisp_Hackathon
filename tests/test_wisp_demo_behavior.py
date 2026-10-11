@@ -301,6 +301,17 @@ def test_cleanup_script_deletes_only_drop_events_in_wisp_demo(demo):
     assert "delete (first calendar" not in script and "every calendar" not in script
 
 
+def test_cleanup_script_bulk_fetches_instead_of_walking_event_references(demo):
+    import re
+    script = demo.drop_cleanup_script()
+    # `repeat with ev in (every event ... whose ...)` re-runs the filtered query on
+    # every property read (quadratic; timed out on ~200 events).
+    assert not re.search(r"repeat with \w+ in \(every event", script)
+    assert "set uidList to uid of (every event of wispCal whose" in script
+    assert "set descList to description of (every event of wispCal whose" in script
+    assert "repeat with i from 1 to (count of descList)" in script
+
+
 @pytest.mark.parametrize("action", ["clear", "reset"])
 def test_reset_removes_drops_waits_for_sync_then_clears(demo, backend, monkeypatch, action, capsys):
     scripts = _mac_seed(demo, monkeypatch)

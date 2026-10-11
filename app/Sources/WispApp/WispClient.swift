@@ -31,6 +31,20 @@ final class WispClient {
     private let deliverySession: URLSession
     private let deliveryURL: URL
 
+    struct AriaDemoResetResponse {
+        let counts: [String: Int]
+    }
+
+    enum AriaDemoResetError: LocalizedError {
+        case request(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .request(let detail): return detail
+            }
+        }
+    }
+
     init(deliverySession: URLSession = .shared, deliveryURL: URL = WispClient.baseURL) {
         self.deliverySession = deliverySession
         self.deliveryURL = deliveryURL
@@ -47,6 +61,37 @@ final class WispClient {
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
         return object
+    }
+
+    func resetAriaDemoData() async throws -> AriaDemoResetResponse {
+        var request = URLRequest(url: deliveryURL.appendingPathComponent("demo/aria/reset"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{}".utf8)
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await deliverySession.data(for: request)
+        } catch {
+            throw AriaDemoResetError.request("Couldn't reach the Wisp service. Try again in a moment.")
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw AriaDemoResetError.request("The Wisp service returned an invalid response.")
+        }
+        let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        if http.statusCode == 409 {
+            let detail = object?["detail"] as? String
+                ?? "The backend is not running in Aria demo mode."
+            throw AriaDemoResetError.request(detail)
+        }
+        guard (200..<300).contains(http.statusCode),
+              object?["ok"] as? Bool == true,
+              let counts = object?["counts"] as? [String: Int] else {
+            throw AriaDemoResetError.request("The Wisp service couldn't reset Aria demo data.")
+        }
+        return AriaDemoResetResponse(counts: counts)
     }
 
     struct Event {

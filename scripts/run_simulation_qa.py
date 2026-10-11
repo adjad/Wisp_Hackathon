@@ -303,6 +303,24 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_user_facing_summary_thinking.py",
     # Reviewed synthetic Workflow20 fixtures: temporary state, fake providers,
     # and guarded owned Python children; no live inference or personal sources.
+    # Behavior engine: pure SQLite in temp dirs, the fictional persona, ASGI
+    # TestClient/httpx MockTransport (no listener) and FakeHub; no model, Keychain,
+    # Calendar, Messages or network. Deploy-script checks run bash -n / --dry-run
+    # against a fake `tailscale` on PATH; demo seeding mocks every osascript call.
+    "tests/test_behavior_api.py",
+    "tests/test_behavior_boundary.py",
+    "tests/test_behavior_client.py",
+    "tests/test_behavior_engine.py",
+    "tests/test_behavior_miners.py",
+    "tests/test_behavior_persona.py",
+    "tests/test_behavior_phraser.py",
+    "tests/test_behavior_predict_nudges.py",
+    "tests/test_behavior_routing.py",
+    "tests/test_behavior_runtime.py",
+    "tests/test_behavior_tools.py",
+    "tests/test_brain_server.py",
+    "tests/test_seed_mac_persona.py",
+    "tests/test_wisp_demo_behavior.py",
     # Intel/GX10 founder preview: fictional fixtures, patched sockets, mocked
     # transports and AST-selected main functions; no network, Keychain or model.
     "tests/test_founder_demo.py",

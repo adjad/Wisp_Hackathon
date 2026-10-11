@@ -1321,13 +1321,18 @@ def _weather_request_dates(period: str) -> set[str] | None:
 
 def _weather_location_has_time(place: str) -> bool:
     """Do not send an unconsumed temporal constraint as part of a city name."""
+    if re.fullmatch(r"\d{8}", place):
+        return False  # Preserve standalone postal codes; no city/time split exists.
     return bool(re.search(
         r"\b(?:today|tomorrow|tonight|yesterday)\b|"
         r"\b(?:this|next|last)\s+(?:morning|afternoon|evening|night|weekend|week|month|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|"
         r"\s(?:now|currently|later|overnight|morning|afternoon|evening|night|noon|midday|midnight|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s+please)?\s*[.!?]*$|"
         r"\b\d{4}-\d{1,2}(?:-\d{1,2})?\b|"
+        # Compact and ISO week dates remain temporal even when followed by a
+        # datetime separator or when their calendar/clock fields are invalid.
+        r"\b\d{4}(?:\d{4}|-?w\d{2}(?:-?\d)?)(?=\D|$)|"
         r"\b\d{1,2}:\d{2}\b|\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b|"
-        r"\bat\s+\d{1,2}\b", place, re.I))
+        r"\bat\s+\d{1,6}\b", place, re.I))
 
 
 def _weather_number(node: dict, key: str, *, low=None, high=None) -> str:

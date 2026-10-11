@@ -393,3 +393,42 @@ def test_datetime_guard_preserves_existing_date_only_ranges(separator, monkeypat
     assert classify_tool_outcome("get_weather", result).status == "succeeded", result
     assert len(calls) == 1 and "now:" not in result
     assert "forecast (2026-10-12)" in result and "forecast (2026-10-13)" in result
+
+
+@pytest.mark.parametrize("location", [
+    "Tokyo 20261012T180000", "Tokyo 2026-W42-1T180000", "Tokyo at 1800",
+    "Tokyo 20261012t180000", "Tokyo 2026W421T180000",
+    "Tokyo 20261012X180000", "Tokyo 2026-W42-1X180000",
+    "Tokyo 20261012T180000+0900", "Tokyo 2026-W42-1T180000+09:00",
+    "Tokyo 20261012", "Tokyo 2026-W42-1", "Tokyo 2026W421",
+    "Tokyo 20269999T180000", "Tokyo 2026-W99-9T180000",
+    "Tokyo at 0000", "Tokyo at 2400", "Tokyo at 180000", "Tokyo at 999999",
+])
+def test_compact_temporal_location_constraint_is_rejected_before_fetch(location, monkeypatch):
+    calls = fake_weather(monkeypatch, payload("Tokyo", "Tokyo", "Japan"))
+    result = dispatch_weather(location=location)
+    from service.tools.registry import classify_tool_outcome
+    assert classify_tool_outcome("get_weather", result).status == "failed", result
+    assert "time constraint" in result and calls == []
+    assert "°F" not in result and "chance of rain" not in result
+
+
+@pytest.mark.parametrize("location,city,region,country", [
+    ("Tokyo", "Tokyo", "Tokyo", "Japan"),
+    ("Tokyo, Japan", "Tokyo", "Tokyo", "Japan"),
+    ("94568", "Dublin", "California", "United States"),
+    ("01310930", "São Paulo", "São Paulo", "Brazil"),
+    ("DUB", "Dublin", "Leinster", "Ireland"),
+    ("Dublin, Ireland", "Dublin", "Leinster", "Ireland"),
+    ("San José, Costa Rica", "San José", "San José", "Costa Rica"),
+    ("SF", "San Francisco", "California", "United States"),
+])
+@pytest.mark.parametrize("period", ["", "2026-10-12", "20261012",
+                                     "2026-10-12 through 2026-10-13"])
+def test_compact_location_guard_preserves_city_and_date_arguments(location, city, region, country, period, monkeypatch):
+    calls = fake_weather(monkeypatch, payload(city, region, country))
+    result = dispatch_weather(location=location, period=period)
+    from service.tools.registry import classify_tool_outcome
+    assert classify_tool_outcome("get_weather", result).status == "succeeded", result
+    assert len(calls) == 1 and f"Weather for {city}" in result
+    assert "forecast (2026-10-12)" in result

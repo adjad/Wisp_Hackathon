@@ -1,33 +1,35 @@
 # iPhone capability matrix
 
-Verified against official Apple documentation on October 10, 2026. Implementation
-is an initial source inspector, not a semantic replacement for the Mac service.
+Prototype checkpoint on October 10, 2026. Deterministic queries run over supplied
+synthetic/imported records; native sources and models remain disconnected.
 
-| Workflow families | Foundation behavior | Incomplete capability |
+| Workflow families | Current bounded behavior | Incomplete capability |
 | --- | --- | --- |
-| 01 overview, 02 daily | Synthetic/imported source excerpts with IDs and coverage limitations | Native inboxes and semantic summaries |
-| 03 calendar ranges | Synthetic today interval in explicit timezone | Tomorrow/week/month natural-language planning |
-| 04 California weather | Literal search over explicitly synthetic forecast | Live WeatherKit, attribution, typo/city resolution |
-| 05 priorities | Reminder/calendar excerpts labeled unranked | Grounded priority selection and estimates |
-| 06 contact said, 07 thread recap | Literal search over structured synthetic sender/thread | Identity disambiguation and recap synthesis |
-| 08 groceries | Synthetic note/reminder excerpts | Item merging, completed/negated item resolution, native Notes access |
-| 09 event time | Literal synthetic event search | Ambiguity handling and structured answer generation |
-| 10 reminder/calendar create | Clarification plus explicit unavailable integration | Native creation, exact time and write approval |
-| 11 SFO trip | Unsupported; no schedule or Maps action | Scoped location, live traffic, arrival planning and handoff |
-| 12 grounded communication | No send/draft/queue effects | Cross-source drafting, composers and scheduled provider delivery |
-| 13 unsubscribe | Unsupported with zero effects | Complete engagement history and authorized provider integration |
-| 14 file organization | Unsupported with zero effects | Scoped directory access, preview plan, approved reversible moves |
-| 15 personal knowledge | Synthetic memory/note excerpts | Persistent index, editable memory, follow-ups and receipts |
-| 16 meeting | Clarification plus explicit unavailable integration | Contact resolution, after-event timing, event/invitation writes |
-| 17 fuzzy test | Literal search labeled limited | Validated semantic aliases and ambiguity handling |
-| 18 unread | Only explicit `unread == true`; unknown is disclosed | Native unread synchronization and importance ranking |
-| 19 availability reply | Clarification plus explicit unavailable integration | Interval reasoning, grounded draft and exact approved send |
-| 20 pending actions | Synthetic queue inspection (empty fixture) | Durable queue, inspect/cancel effects and receipts |
+| 01 overview, 02 daily | Source quotes, IDs, local date filters and coverage | Native inboxes and semantic synthesis |
+| 03 calendar ranges | Today/tomorrow/yesterday, weekdays, this/next week/month, one ISO date, timezone/DST overlap | Custom ranges and richer temporal language |
+| 04 weather | Verify envelope/forecast city and canonical region metadata for one day | Live weather, broad location resolution, region aliases |
+| 05 priorities | Explicit requests and structured due dates | Inferred ranking, effort and estimates |
+| 06 contact, 07 thread | Sender identity ambiguity, full-name/address selection, user-history pronouns, literal topics, stable threads and chronological quotes | Broad identity linking and synthesized final decisions |
+| 08 groceries | Structured shopping items, completed-item exclusion, name dedupe and quantity conflicts | Plain-text completion inference and native Notes |
+| 09 event time | Title matching, date filters and ambiguous-title clarification | Rich temporal relations and broad semantic aliases |
+| 10 reminder/event create | Clarification; exact user-entered form preview | Native creation and receipts |
+| 11 trip | Unsupported, zero effects | Location, traffic, arrival planning and Maps handoff |
+| 12 communication | Clarification; exact user-entered form preview | Grounded drafting, composers, sends and scheduled delivery |
+| 13 unsubscribe | Unsupported, zero effects | Engagement history and provider integration |
+| 14 files | Unsupported, zero effects | Scoped files, approved reversible moves and receipts |
+| 15 knowledge | Imported memory/note quotes | Persistent editable index and richer retrieval |
+| 16 meeting | Clarification, no action | Contact resolution, scheduling, invitations |
+| 17 fuzzy test | Bounded typo matching, assessment-kind filtering, next active subject match | Model semantics and broader course aliases |
+| 18 unread | Explicit true only; unknown state excluded and disclosed | Native synchronization and importance ranking |
+| 19 availability reply | Clarification, no action | Interval reasoning, grounded draft and approved send |
+| 20 pending | Unsupported, zero effects | Durable queue and cancellation receipts |
 
-The shared contract-only adapter reports all twenty semantic families unsupported.
-Its result cannot establish capability completion, even where the app can show
-useful excerpts. Zero effects are intentional in the foundation, not a claim that
-requested actions succeeded.
+The production adapter ignores the benchmark's gold family and reference oracle.
+Canonical source-field claims are emitted separately from arbitrary v1 oracle fact
+aliases. The independent evaluator owns strict whole-value/provenance mapping;
+no twenty-workflow completion claim follows from status counts, source-provenance
+checks or arbitrary prose. Preview confirmation performs no
+native or provider effect. All actual effect/approval arrays stay empty.
 
 ## Platform boundaries
 
@@ -76,6 +78,6 @@ requested actions succeeded.
 Unsigned simulator compilation covers SwiftUI, iOS API availability and framework
 linkage for arm64/x86_64. It does not prove a signed device build, installation,
 permissions, UI interaction, inference quality, memory, thermals, speed or battery
-behavior. No supported simulator device was available during inventory. Native
+behavior. No simulator was launched in this checkpoint; physical-device installation remains untested. Native
 permission adapters need isolated specialist QA before integration. Independent
 release review and any required QA must bind the exact frozen candidate SHA.

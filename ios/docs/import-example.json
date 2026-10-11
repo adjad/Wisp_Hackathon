@@ -1,0 +1,27 @@
+{
+  "clock": "2026-10-10T09:00:00-07:00",
+  "timezone": "America/Los_Angeles",
+  "sources": {
+    "messages": {
+      "state": "partial",
+      "complete": false,
+      "records": [
+        {"id": "selected-message-1", "sender": "Mira Chen", "conversation": "Garden volunteers", "thread_id": "garden", "timestamp": "2026-10-10T08:40:00-07:00", "body": "West gate at 11. Bring gloves.", "unread": true}
+      ]
+    },
+    "calendar": {
+      "state": "ready",
+      "complete": true,
+      "records": [
+        {"id": "selected-event-1", "title": "Garden volunteering", "start": "2026-10-10T11:00:00-07:00", "end": "2026-10-10T12:00:00-07:00"}
+      ]
+    },
+    "notes": {
+      "state": "ready",
+      "complete": true,
+      "records": [
+        {"id": "selected-list-1", "title": "Shopping list", "items": [{"name": "Pears", "quantity": "4", "completed": false}, {"name": "Tea", "completed": true}]}
+      ]
+    }
+  }
+}

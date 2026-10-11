@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact-commit offline foundation verification; never installs apps or runs models."""
+"""Exact-commit offline iPhone verification; never installs apps or runs models."""
 import argparse
 import hashlib
 import json
@@ -28,7 +28,7 @@ if head != args.expected_sha or dirty:
     p.error('Expected exact SHA and a clean checkout before verification.')
 report = {'schema_version': 1, 'head': head, 'tree': tree, 'clean_before': True,
           'commands': [], 'model_execution': 'NOT_RUN', 'device_install': 'NOT_RUN',
-          'simulator_launch': 'NOT_RUN', 'inference_latency': None, 'semantic_completion': 'NOT_VALIDATED'}
+          'simulator_launch': 'NOT_RUN', 'inference_latency': None, 'semantic_completion': 'LIMITED_SOURCE_SEMANTICS; independent shared grading reported separately'}
 def run(name, command):
     log = artifacts / (name + '.log')
     with log.open('w') as output:
@@ -49,17 +49,16 @@ if args.fixtures and ok:
     if ok:
         observations = [json.loads(line) for line in (artifacts/'contract-consumer.log').read_text().splitlines()]
         (artifacts/'observations.json').write_text(json.dumps(observations, indent=2) + '\n')
-        report['contract_consumption'] = {'cases': len(observations), 'statuses': sorted({row['status'] for row in observations}),
+        report['contract_consumption'] = {'cases': len(observations), 'statuses': {status: sum(row['status'] == status for row in observations) for status in sorted({row['status'] for row in observations})},
             'effects': sum(len(row['effects']) for row in observations),
             'inference_executed': any(row['metrics']['inference_executed'] for row in observations),
-            'meaning': 'Schema plumbing only; unsupported cases are capability failures, not workflow passes.'}
-        ok = all(row['status'] == 'unsupported' and not row['effects'] and not row['facts'] and
-                 not row['approval']['approved_effects'] and not row['approval']['granted'] and
-                 not row['metrics']['inference_executed'] for row in observations) and ok
+            'meaning': 'Actual bounded adapter observations. Status counts are not workflow accuracy; runtime facts stay empty; any strict canonical mapping belongs to the independent evaluator.'}
+        ok = run('claim-integrity', ['python3', 'ios/scripts/audit_claims.py', '--fixtures', str(args.fixtures.resolve()),
+                 '--observations', str(artifacts/'observations.json'), '--output', str(artifacts/'claim-integrity.json')]) and ok
 report['clean_after'] = not git('status', '--porcelain')
 report['head_after'], report['tree_after'] = git('rev-parse', 'HEAD'), git('rev-parse', 'HEAD^{tree}')
 ok = ok and report['clean_after'] and report['head_after'] == head and report['tree_after'] == tree
-report['foundation_mechanical_pass'] = ok
+report['iphone_mechanical_pass'] = ok
 (artifacts/'mechanical.json').write_text(json.dumps(report, indent=2) + '\n')
 print(json.dumps({'head': head, 'mechanical_pass': ok, 'report': str(artifacts/'mechanical.json')}))
 sys.exit(0 if ok else 1)

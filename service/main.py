@@ -15,8 +15,9 @@ load/swap) that has no other visible signal — see OMLXClient.ensure_only.
 from __future__ import annotations
 
 import asyncio
-from service.inference.remote_policy import (remote_full_mode, remote_only_profile, remote_read_only_mode,
-                                             require_generation_role, require_local_models_disabled)
+from service.inference.remote_policy import (aria_demo_mode, remote_full_mode, remote_only_profile,
+                                             remote_read_only_mode, require_generation_role,
+                                             require_local_models_disabled)
 import json
 import os
 import re
@@ -367,6 +368,12 @@ async def lifespan(app: FastAPI):
         # idle unloader (local engine only), Super Model warmup, proactive
         # nodes (other hosts), and conversation-memory capture (local model
         # only; it would idle anyway since the fast role is unmanaged).
+        if aria_demo_mode():
+            # The Aria demo: open (seeding on first use) the synthetic world
+            # and mirror its calendar/reminders into the demo assistant store
+            # before the scheduler's first tick.
+            from service.demo.aria import tools as aria_tools
+            aria_tools.mirror()
         started_tasks.append(asyncio.create_task(assistant_scheduler.run()))
     else:
         # The remote-only build starts no assistant scheduler, so behavior
@@ -2278,6 +2285,10 @@ async def assistant_sync_status(sources: str = "calendar,reminders,email,message
     return sources_snapshot(wanted)
 
 
+# _ARIA_SYNC_NOTE: the Aria demo reads nothing from the Mac. Every native
+# sync push below is refused while it runs (the v5 app also stops syncing), so
+# no real Calendar, Reminders, Mail, Messages, Notes, Contacts or browser
+# history reaches it.
 @app.post("/assistant/sync/calendar")
 async def assistant_sync_calendar(body: dict[str, Any]) -> dict[str, Any]:
     """Receive calendar events (or, with source='reminders', native
@@ -2285,6 +2296,10 @@ async def assistant_sync_calendar(body: dict[str, Any]) -> dict[str, Any]:
     (which holds the TCC grant) and sync into the commitments store. Each
     `source` is a separate replace-set (see AssistantStore.sync_source), so
     Calendar and Reminders syncing independently can't wipe each other out."""
+    from service.inference.remote_policy import aria_demo_mode as _aria_demo
+    if _aria_demo():
+        # The Aria demo reads nothing from the Mac (see _ARIA_SYNC_NOTE).
+        return {"ok": True, "synced": 0, "ignored_native_sync": True, "demo": "Aria demo — fictional data only"}
     raw_source = body.get("source", "calendar")
     aliases = {"calendar": "calendar", "apple calendar": "calendar", "apple_calendar": "calendar",
                "reminders": "reminders", "apple reminders": "reminders", "apple_reminders": "reminders"}
@@ -2484,6 +2499,10 @@ async def assistant_sync_emails(body: dict[str, Any]) -> dict[str, Any]:
     only touched when present: MailReader posts them on separate cadences, so
     a headers-only sync must not wipe out the still-fresh raw cache (and
     vice versa)."""
+    from service.inference.remote_policy import aria_demo_mode as _aria_demo
+    if _aria_demo():
+        # The Aria demo reads nothing from the Mac (see _ARIA_SYNC_NOTE).
+        return {"ok": True, "synced": 0, "ignored_native_sync": True, "demo": "Aria demo — fictional data only"}
     from service.tools.email_tools import (
         cache_emails, cache_history_headers, cache_raw_emails, set_email_availability)
     if "headers" in body:
@@ -2519,6 +2538,10 @@ async def assistant_sync_emails(body: dict[str, Any]) -> dict[str, Any]:
 async def assistant_sync_notes(body: dict[str, Any]) -> dict[str, Any]:
     """Receive raw Notes.app content from the Swift app (which holds Notes
     Automation access) so search_notes can look through it verbatim."""
+    from service.inference.remote_policy import aria_demo_mode as _aria_demo
+    if _aria_demo():
+        # The Aria demo reads nothing from the Mac (see _ARIA_SYNC_NOTE).
+        return {"ok": True, "synced": 0, "ignored_native_sync": True, "demo": "Aria demo — fictional data only"}
     from service.demo.founder import enabled, PROVENANCE
     if enabled():
         # The Aria demo answers Notes from fictional fixtures. In the Intel v5
@@ -2548,6 +2571,10 @@ async def assistant_contacts_privacy_status() -> dict[str, Any]:
 @app.post("/assistant/sync/browser_history")
 async def assistant_sync_browser_history(body: dict[str, Any]) -> dict[str, Any]:
     """Receive an explicit consent state and authoritative browser snapshot."""
+    from service.inference.remote_policy import aria_demo_mode as _aria_demo
+    if _aria_demo():
+        # The Aria demo reads nothing from the Mac (see _ARIA_SYNC_NOTE).
+        return {"ok": True, "synced": 0, "ignored_native_sync": True, "demo": "Aria demo — fictional data only"}
     from service.tools.browser_history_tools import apply_browser_history_sync, browser_history_privacy_status
     try:
         applied = apply_browser_history_sync(body)
@@ -2561,6 +2588,10 @@ async def assistant_sync_messages(body: dict[str, Any]) -> dict[str, Any]:
     """Receive recent iMessage/SMS lines from the Swift app (which holds the
     Full Disk Access needed to read chat.db directly) so the messages tool
     can summarize them with the summarizer."""
+    from service.inference.remote_policy import aria_demo_mode as _aria_demo
+    if _aria_demo():
+        # The Aria demo reads nothing from the Mac (see _ARIA_SYNC_NOTE).
+        return {"ok": True, "synced": 0, "ignored_native_sync": True, "demo": "Aria demo — fictional data only"}
     from service.tools.imessage_tools import apply_contacts_sync, cache_messages, contacts_privacy_status
     diag = body.get("diagnostics") or {}
     # Contacts arrive on their own (much slower) schedule from ContactsReader,
@@ -2588,6 +2619,19 @@ async def assistant_delete(cid: str) -> dict[str, Any]:
     c = assistant_store.get(cid)
     if not c:
         return {"ok": False, "error": "not found"}
+    from service.inference.remote_policy import aria_demo_mode
+    if aria_demo_mode() and c["source"] in {"calendar", "reminders"}:
+        # Mirrored from the Aria demo's synthetic world: change it there.
+        from service.demo.aria import tools as aria_tools
+        from service.demo.aria.world import get_world
+        world = get_world()
+        if c["source"] == "calendar":
+            world.cancel_event(c.get("source_id") or "")
+        else:
+            world.update_reminder(c.get("source_id") or "", status="deleted")
+        aria_tools.mirror()
+        await assistant_hub.publish({"type": "changed"})
+        return {"ok": True}
     if c["source"] == "calendar":
         from service.assistant.outbox import request as app_request
         if not c.get("source_id") or c.get("when_ts") is None:
@@ -2735,12 +2779,48 @@ async def assistant_send_message_draft(body: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "result": "The message must be text."}
     if not message.strip():
         return {"ok": False, "result": "The message is empty."}
-    with human_reviewed_content():
-        result = await send_message(to=to, text=message)
-    ok = result.startswith("Message sent to ")
+    from service.inference.remote_policy import aria_demo_mode
+    if aria_demo_mode():
+        # The Aria demo's draft card sends into the synthetic thread only.
+        from service.demo.aria import tools as aria_tools
+        result = await aria_tools.send_message(to=to, text=message)
+        ok = "Sent (simulated" in result
+    else:
+        with human_reviewed_content():
+            result = await send_message(to=to, text=message)
+        ok = result.startswith("Message sent to ")
     audit("draft_card_send", tool="send_message",
           args={"to": to, "text": message}, result=result, ok=ok)
     return {"ok": ok, "result": result}
+
+
+@app.get("/demo/aria/status")
+async def aria_demo_status() -> dict[str, Any]:
+    """Whether this backend is the Aria demo, and its synthetic-world counts."""
+    if not aria_demo_mode():
+        return {"enabled": False, "counts": None}
+    from service.demo.aria import tools as aria_tools
+    return await asyncio.to_thread(aria_tools.status)
+
+
+@app.post("/demo/aria/reset")
+async def aria_demo_reset() -> dict[str, Any]:
+    """Restore the Aria demo's seeded world and clear its learned behavior.
+
+    Only ever touches demo state (service.paths.state_dir() is the demo
+    directory whenever this is reachable). 409 outside the demo."""
+    if not aria_demo_mode():
+        raise HTTPException(status_code=409, detail="Wisp is not running the Aria demo")
+    from service.demo.aria import tools as aria_tools
+    from service.demo.aria.world import get_world
+    counts = await asyncio.to_thread(get_world().reset)
+    from service.behavior.flags import env_enabled as behavior_enabled
+    if behavior_enabled():
+        from service.assistant import behavior_runtime
+        await asyncio.to_thread(behavior_runtime.clear_demo_state, assistant_store)
+    await asyncio.to_thread(aria_tools.mirror)
+    await assistant_hub.publish({"type": "changed"})
+    return {"ok": True, "counts": counts}
 
 
 @app.get("/assistant/events")

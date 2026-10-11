@@ -193,6 +193,7 @@ class MainChecks(FullFixture):
     def _lifespan_ns(self, fake, scheduler_run, bomb):
         return {'asyncio': asyncio, 'asynccontextmanager': asynccontextmanager,
                 'remote_only_profile': policy.remote_only_profile, 'remote_full_mode': policy.remote_full_mode,
+                'aria_demo_mode': policy.aria_demo_mode,
                 'require_local_models_disabled': policy.require_local_models_disabled,
                 'OMLXClient': lambda: fake, 'role_to_model': lambda role: 'qwen3.6:35b',
                 'skills': SimpleNamespace(load=bomb), 'mcp_manager': SimpleNamespace(start=bomb, stop=bomb),
@@ -334,19 +335,21 @@ def _paths_in_subprocess(extra_env: dict) -> dict:
             'paths, store, outbound_queue = m("service.paths"), m("service.assistant.store"), m("service.assistant.outbound_queue")\n'
             'sessions, facts, grants = m("service.memory.store"), m("service.memory.facts"), m("service.safety.grants")\n'
             'scheduler, behavior_runtime = m("service.assistant.scheduler"), m("service.assistant.behavior_runtime")\n'
+            'cache_store = m("service.tools.cache_store")\n'
             'print(json.dumps({"moe": str(paths.MOE_DIR), "state": str(paths.STATE_DIR),\n'
             '  "assistant": str(store.DB_PATH), "queue": str(outbound_queue.DB_PATH),\n'
             '  "sessions": str(sessions.DB_PATH), "facts": str(facts.DB_PATH),\n'
             '  "grants": str(grants.GRANTS_PATH), "brief": str(scheduler._brief_state_path()),\n'
-            '  "behavior": str(behavior_runtime._home())}))\n')
-    env = {k: v for k, v in os.environ.items() if k not in {'WISP_FOUNDER_DEMO', 'WISP_REMOTE_FULL', 'WISP_REMOTE_ONLY'}}
+            '  "behavior": str(behavior_runtime._home()), "cache": str(cache_store.CACHE_DIR)}))\n')
+    env = {k: v for k, v in os.environ.items()
+           if k not in {'WISP_FOUNDER_DEMO', 'WISP_REMOTE_FULL', 'WISP_REMOTE_ONLY', 'WISP_ARIA_DEMO'}}
     env.update(extra_env)
     out = subprocess.run([sys.executable, '-c', code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
     assert out.returncode == 0, out.stderr[-2000:]
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-class AriaStateSeparation(RemoteFixture):
+class FounderStateSeparation(RemoteFixture):
     def test_demo_and_real_state_never_share_files(self):
         real = _paths_in_subprocess({'WISP_REMOTE_ONLY': '1', 'WISP_REMOTE_FULL': '1'})
         demo = _paths_in_subprocess({'WISP_REMOTE_ONLY': '1', 'WISP_FOUNDER_DEMO': '1'})
@@ -354,7 +357,7 @@ class AriaStateSeparation(RemoteFixture):
         self.assertEqual(Path(real['state']).resolve(), home)
         self.assertEqual(Path(demo['state']).resolve(), home / 'aria-demo')
         self.assertEqual(real['moe'], demo['moe'])  # shared home: caches and identity unchanged
-        for key in ('assistant', 'queue', 'sessions', 'facts', 'grants', 'brief', 'behavior'):
+        for key in ('assistant', 'queue', 'sessions', 'facts', 'grants', 'brief', 'behavior', 'cache'):
             with self.subTest(key=key):
                 self.assertNotEqual(real[key], demo[key])
                 self.assertTrue(Path(demo[key]).resolve().is_relative_to(home / 'aria-demo'))
@@ -363,9 +366,9 @@ class AriaStateSeparation(RemoteFixture):
     def test_demo_ignores_native_notes_reminders_contacts_pushes(self):
         tree = ast.parse((ROOT / 'service/main.py').read_text())
         notes = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == 'assistant_sync_notes')
-        first_if = next(n for n in notes.body if isinstance(n, ast.If))
-        self.assertEqual(ast.unparse(first_if.test), 'enabled()')
-        self.assertIn('ignored_native_sync', ast.unparse(first_if))
+        ifs = [n for n in notes.body if isinstance(n, ast.If)]
+        self.assertEqual([ast.unparse(n.test) for n in ifs[:2]], ['_aria_demo()', 'enabled()'])
+        self.assertIn('ignored_native_sync', ast.unparse(ifs[1]))
 
 
 class SwiftModeMapping(RemoteFixture):

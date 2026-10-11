@@ -93,7 +93,10 @@ def enabled() -> bool:
 
 
 def synthetic_only() -> bool:
-    return os.environ.get("WISP_BEHAVIOR_SYNTHETIC_ONLY") == "1" or founder_demo()
+    # The Aria demo learns the synthetic persona plus its synthetic calendar
+    # (mirrored into the demo store as the "Wisp Demo" calendar), never real data.
+    from service.demo.aria import env_requested as aria_demo
+    return os.environ.get("WISP_BEHAVIOR_SYNTHETIC_ONLY") == "1" or founder_demo() or aria_demo()
 
 
 def brain_url() -> str:
@@ -109,6 +112,9 @@ def brain_url() -> str:
 
 
 def brain_mode() -> str:
+    from service.demo.aria import env_requested as aria_demo
+    if aria_demo():
+        return "local"   # a remote brain is shared with real mode; the demo never feeds it
     mode = os.environ.get("WISP_BRAIN_MODE", "").strip().lower()
     if not mode:
         try:

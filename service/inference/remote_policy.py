@@ -33,6 +33,8 @@ _FORCED_MODE = os.environ.get("WISP_REMOTE_ONLY")
 # Read once at import, like _FORCED_MODE: the mode is a launch decision.
 _FULL_MODE = os.environ.get("WISP_REMOTE_FULL")
 _FOUNDER_MODE = os.environ.get("WISP_FOUNDER_DEMO")
+# The Aria demo (service/demo/aria): full mode against a synthetic world.
+_ARIA_MODE = os.environ.get("WISP_ARIA_DEMO")
 _READ_TOOLS = frozenset({"get_upcoming", "get_past_events", "search_reminders",
                          "view_emails", "summarize_emails", "view_messages",
                          "summarize_messages"})
@@ -130,8 +132,10 @@ REMOTE_FULL_PROFILE = RemoteOnlyProfile(**REMOTE_FULL_LIMITS)
 
 
 def _full_requested() -> bool:
-    if _FULL_MODE not in {None, "1"}:
+    if _FULL_MODE not in {None, "1"} or _ARIA_MODE not in {None, "1"}:
         _refuse("Invalid remote full launch mode")
+    if _ARIA_MODE == "1" and _FULL_MODE != "1":
+        _refuse("The Aria demo requires the full remote launch")
     if _FULL_MODE != "1":
         return False
     if _FORCED_MODE != "1":
@@ -191,6 +195,11 @@ def remote_full_mode() -> bool:
     return remote_only_profile() is not None and _full_requested()
 
 
+def aria_demo_mode() -> bool:
+    """True in the validated full remote build launched as the Aria demo."""
+    return remote_full_mode() and _ARIA_MODE == "1"
+
+
 def remote_read_only_mode() -> bool:
     """True in the read-only remote build (the Intel founder demo)."""
     return remote_only_profile() is not None and not _full_requested()
@@ -238,13 +247,21 @@ def remote_tool_allowed(tool_name: str | None) -> bool:
     """Whether a remote-only build may offer/run this tool at all.
 
     Full mode: every built-in except _REMOTE_FULL_EXCLUDED; the normal safety
-    policy then decides allow/confirm/deny for each call. Read-only mode: the
-    fixed founder-demo allowlist (remote_demo_tool_allowed)."""
+    policy then decides allow/confirm/deny for each call. Aria demo (full mode
+    + WISP_ARIA_DEMO=1): only the demo's synthetic or data-free tools, still
+    under the normal policy. Read-only mode: the fixed founder-demo allowlist
+    (remote_demo_tool_allowed)."""
     if not isinstance(tool_name, str) or not tool_name:
         return False
     if remote_full_mode():
         if tool_name in _REMOTE_FULL_EXCLUDED:
             return False
+        if aria_demo_mode():
+            # The Aria demo runs only tools with a synthetic implementation or
+            # that touch no personal data or native app (demo/aria/tools.py).
+            from service.demo.aria.tools import allowed
+            from service.tools.registry import REGISTRY
+            return allowed(tool_name) and tool_name in REGISTRY
         # Only tools registered by Wisp itself; skill and MCP runtimes never
         # start in a remote-only build, but refuse their names regardless.
         from service.tools.registry import REGISTRY

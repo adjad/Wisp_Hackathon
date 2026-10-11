@@ -2575,9 +2575,9 @@ async def assistant_send_message_draft(body: dict[str, Any]) -> dict[str, Any]:
     """Send the exact editable draft the user approved in Wisp's draft card.
 
     Pressing the card's explicit Send button is the confirmation for this
-    payload. The request still goes through ``send_message`` so recipient
-    resolution, the native Messages bridge, and verified delivery reporting all
-    remain identical to an agent initiated send.
+    payload. Only a literal phone/email recipient is accepted; legacy name-only
+    cards must be prepared again. The native Messages bridge and verified
+    delivery reporting remain those of ``send_message``.
 
     The content heuristics (unfilled placeholders, mid-sentence truncation) are
     the one thing that does NOT apply here: this text is sitting in an editable
@@ -2588,10 +2588,14 @@ async def assistant_send_message_draft(body: dict[str, Any]) -> dict[str, Any]:
     from service.safety.audit import audit
     from service.tools.action_tools import human_reviewed_content, send_message
 
-    to = str(body.get("to") or "").strip()
-    message = str(body.get("text") or "")
-    if not to:
-        return {"ok": False, "result": "Choose a recipient before sending."}
+    from service.tools.registry import _literal_message_recipient
+
+    to = _literal_message_recipient(body.get("to"))
+    message = body.get("text")
+    if to is None:
+        return {"ok": False, "result": "Choose one literal phone number or email address, or create a new draft before sending."}
+    if type(message) is not str:
+        return {"ok": False, "result": "The message must be text."}
     if not message.strip():
         return {"ok": False, "result": "The message is empty."}
     with human_reviewed_content():

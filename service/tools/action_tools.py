@@ -929,27 +929,26 @@ async def draft_email(to: str, subject: str, body: str, cc: str = "") -> str:
     category="messages_draft",
 )
 async def draft_message(to: str, text: str) -> str:
-    # No _own_address_guard here — same reasoning as draft_email above: this
-    # is the safe landing spot for an explicit self-send request, and a draft
-    # never sends on its own.
-    to = (to or "").strip()
-    if not to:
+    from service.tools.registry import _literal_message_recipient, _prepared_message_draft
+
+    # Preparation sends nothing. Only this successful host path mints a card.
+    if type(to) is not str or type(text) is not str:
+        return "(error: Draft recipient and body must be strings.)"
+    to = to.strip(" ")
+    if not to or any(ord(c) < 32 or ord(c) == 127 for c in to):
         return "(no recipient — ask the user who to text)"
     text = _degarble(text)
     if not text.strip():
         return "(nothing to draft — the message body is empty)"
-    display = to
-    if not (_EMAIL_RE.match(to) or re.fullmatch(r"[+()\-.\s\d]{7,}", to)):
+    literal = _literal_message_recipient(to)
+    if literal is None:
         handle, problem = _resolve_recipient(to)
         if problem:
             return problem
-        display = f"{to} ({handle})"
-        to = handle
-    # The structured card is emitted by the agent loop after this succeeds.
-    # Do not open Messages or type into its active conversation: the draft now
-    # remains inside Wisp until the user presses the card's Send button.
-    return (f"Message draft prepared in Wisp for {display} — nothing has been "
-            "sent. The user can edit or send it from the draft card.")
+        literal = _literal_message_recipient(handle)
+    if literal is None:
+        return "(error: Choose one supported literal phone number or email address.)"
+    return _prepared_message_draft(literal, text)
 
 
 @register(
@@ -1111,7 +1110,8 @@ async def send_message(to: str, text: str, confirmed_self_send: bool = False) ->
     to = (to or "").strip()
     if not to:
         return "(no recipient — ask the user who to text)"
-    text = _degarble(text)
+    if _unreviewed():
+        text = _degarble(text)
     if _unreviewed() and _looks_truncated(text):
         return ("(NOT sent — the draft looks cut off mid-sentence rather than "
                 "a complete message. Rewrite the complete text in "

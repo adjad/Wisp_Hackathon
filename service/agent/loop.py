@@ -1901,10 +1901,11 @@ async def run_agent(
         elif _direct_outcome.status in {"succeeded", "planned"}:
             tools_answered.add(_name)
         if _direct_outcome.status == "succeeded" and _name == "draft_message":
-            await emit({"type": "message_draft",
-                        "to": str(_args.get("to") or ""),
-                        "text": str(_args.get("text") or "")})
-            return ""
+            from service.tools.registry import _valid_message_draft
+            if _valid_message_draft(_result, _name):
+                await emit({"type": "message_draft",
+                            "to": _result.resolved_to, "text": _result.prepared_text})
+                return ""
         if (_direct_outcome.status == "denied"
                 and _name in _TERMINAL_OUTBOUND_DENIALS):
             return await _finish_denied_outbound(emit)
@@ -2959,10 +2960,11 @@ async def run_agent(
                 # End the turn after emitting the exact editable recipient/body
                 # so the model cannot replace the card with a Markdown draft or
                 # ask another "should I send it?" question.
-                await emit({"type": "message_draft",
-                            "to": str(args.get("to") or ""),
-                            "text": str(args.get("text") or "")})
-                return ""
+                from service.tools.registry import _valid_message_draft
+                if _valid_message_draft(result, name):
+                    await emit({"type": "message_draft",
+                                "to": result.resolved_to, "text": result.prepared_text})
+                    return ""
             if outcome.status == "denied" and name in _TERMINAL_OUTBOUND_DENIALS:
                 return await _finish_denied_outbound(emit)
             if name == "create_tool" and get_tool(str(args.get("name", "")).strip().lower()):

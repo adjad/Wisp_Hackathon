@@ -168,6 +168,11 @@ final class OverlayModel: ObservableObject {
         didSet { UserDefaults.standard.set(debugMode, forKey: "wisp.debugMode") }
     }
 
+    // Intel v5: whether the running backend is the Aria founder demo (fictional
+    // data, read-only tools). Set at launch and by the menu-bar toggle; drives
+    // the panel's "Aria demo" indicator. Always false outside WISP_REMOTE_FULL.
+    @Published var ariaDemo = AriaDemoMode.available && AriaDemoMode.isOn()
+
     // --- assistant layer (calendar/reminders) ---
     // Upcoming commitments themselves surface as system notifications (see
     // Notifications.swift / handleAssistantEvent's "reminder" case) rather

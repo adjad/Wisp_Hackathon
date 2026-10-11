@@ -233,8 +233,8 @@ async def _fire_scheduled_sends() -> None:
 
 
 def _brief_state_path():
-    from service.paths import MOE_DIR
-    return MOE_DIR / "brief_state.json"
+    from service.paths import STATE_DIR
+    return STATE_DIR / "brief_state.json"
 
 
 def _brief_date() -> date | None:

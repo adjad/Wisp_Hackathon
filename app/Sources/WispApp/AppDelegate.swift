@@ -299,6 +299,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // switching it on partway through a chat doesn't lose earlier turns.
         let debugItem = menu.addItem(withTitle: "Debug Mode", action: #selector(toggleDebugMode), keyEquivalent: "")
         debugModeItem = debugItem
+        if AriaDemoMode.available {
+            ariaDemoItem = menu.addItem(withTitle: "Aria demo mode", action: #selector(toggleAriaDemo),
+                                        keyEquivalent: "")
+        }
         menu.addItem(withTitle: "Report a Problem…", action: #selector(reportProblem), keyEquivalent: "")
         menu.addItem(withTitle: "Export Chat Debug Log…", action: #selector(exportDebugLog), keyEquivalent: "")
         menu.addItem(.separator())
@@ -311,6 +315,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var rightClickMenu: NSMenu?
     private var debugModeItem: NSMenuItem?
+    private var ariaDemoItem: NSMenuItem?
 
     // The panel is always on screen; the hotkey and menu-bar click just flip
     // between the notch bar and the expanded assistant. No reset — the visible
@@ -318,6 +323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggle() {
         if let event = NSApp.currentEvent, event.type == .rightMouseUp, let menu = rightClickMenu {
             debugModeItem?.state = model.debugMode ? .on : .off
+            ariaDemoItem?.state = model.ariaDemo ? .on : .off
             statusItem.menu = menu
             statusItem.button?.performClick(nil)
             statusItem.menu = nil
@@ -596,12 +602,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             if sources.contains("calendar") { self.calendarReader.sync() }
 #if !WISP_FOUNDER_DEMO
-            if sources.contains("reminders") { self.remindersWriter.sync() }
+            if sources.contains("reminders") && !self.model.ariaDemo { self.remindersWriter.sync() }
 #endif
             if sources.contains("email") { self.mailReader.sync() }
             if sources.contains("messages") { self.messagesReader.sync() }
 #if !WISP_FOUNDER_DEMO
-            if sources.contains("notes") { self.notesReader.sync() }
+            if sources.contains("notes") && !self.model.ariaDemo { self.notesReader.sync() }
 #endif
             if sources.contains("browser_history") { self.browserHistoryReader.sync() }
         }
@@ -610,19 +616,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // identity) and push to the backend; prompts for access once, then
         // syncs periodically.
         calendarReader.start()
-#if !WISP_FOUNDER_DEMO
-        remindersWriter.start()
-#endif
         mailReader.start()
         messagesReader.start()
-#if !WISP_FOUNDER_DEMO
-        notesReader.start()
-#endif
         browserHistoryReader.start()
-        // Resolves chat.db's bare phone/email handles to real contact names.
-#if !WISP_FOUNDER_DEMO
-        contactsReader.start()
-#endif
+        // Reminders, Notes and Contacts (which resolves chat.db's bare
+        // phone/email handles to real contact names). The Aria demo answers
+        // these from fictional fixtures, so they are not read while it runs;
+        // switching to real mode starts them (see setAriaDemo).
+        startNativePersonalReaders()
 
         // Pointer enter/exit come from a real AppKit tracking area on the
         // panel (HoverView), not SwiftUI's flaky .onHover. Entering the bar
@@ -730,6 +731,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleDebugMode() {
         model.debugMode.toggle()
+    }
+
+    private var nativePersonalReadersStarted = false
+
+    private func startNativePersonalReaders() {
+#if !WISP_FOUNDER_DEMO
+        guard !nativePersonalReadersStarted, !model.ariaDemo else { return }
+        nativePersonalReadersStarted = true
+        remindersWriter.start()
+        notesReader.start()
+        contactsReader.start()
+#endif
+    }
+
+    // Intel v5 (WISP_REMOTE_FULL): switch between real mode and the Aria
+    // founder demo. The choice persists, the conversation in the panel is left
+    // (it belongs to the other mode's history), and the bundled backend is
+    // restarted with exactly one of WISP_REMOTE_FULL=1 / WISP_FOUNDER_DEMO=1.
+    @objc private func toggleAriaDemo() {
+        let wanted = !model.ariaDemo
+        if !wanted && AriaDemoMode.forcedByEnvironment() {
+            let alert = NSAlert()
+            alert.messageText = "Aria demo mode is forced on"
+            alert.informativeText = "Wisp was launched with WISP_FOUNDER_DEMO=1. Relaunch it without that setting to use real mode."
+            alert.runModal()
+            return
+        }
+        let effective = AriaDemoMode.setSaved(wanted)
+        guard effective != model.ariaDemo else { return }
+        model.newChat()
+        model.ariaDemo = effective
+        if !effective { startNativePersonalReaders() }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.backend.restart()
+            self.model.refreshAssistant()
+        }
     }
 
     // Writes the full conversation (every turn's model, route decision,

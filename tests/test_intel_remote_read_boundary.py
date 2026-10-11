@@ -1,6 +1,6 @@
 import asyncio
 from unittest.mock import patch,Mock
-from test_intel_remote_policy import RemoteFixture,policy
+from tests.test_intel_remote_policy import RemoteFixture,policy
 from service.safety import policy as safety
 from service.tools.registry import Tool,run_tool
 

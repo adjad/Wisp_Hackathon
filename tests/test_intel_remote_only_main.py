@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace,ModuleType
 from unittest.mock import AsyncMock, Mock, patch
 from fastapi import HTTPException
-from test_intel_remote_policy import RemoteFixture,policy
+from tests.test_intel_remote_policy import RemoteFixture,policy
 
 SOURCE=Path(__file__).resolve().parents[1]/'service/main.py'
 def selected(names,namespace):

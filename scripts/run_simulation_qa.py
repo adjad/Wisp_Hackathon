@@ -303,6 +303,18 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_user_facing_summary_thinking.py",
     # Reviewed synthetic Workflow20 fixtures: temporary state, fake providers,
     # and guarded owned Python children; no live inference or personal sources.
+    # Intel/GX10 founder preview: fictional fixtures, patched sockets, mocked
+    # transports and AST-selected main functions; no network, Keychain or model.
+    "tests/test_founder_demo.py",
+    "tests/test_intel_remote_no_local.py",
+    "tests/test_intel_remote_only_client.py",
+    "tests/test_intel_remote_only_main.py",
+    "tests/test_intel_remote_policy.py",
+    "tests/test_intel_remote_read_boundary.py",
+    # Workflow20 draft/receipt identity: sockets and subprocess forbidden, disposable stores.
+    "tests/test_workflow20_draft_identity.py",
+    "tests/test_workflow20_executor_draft_identity.py",
+    "tests/test_workflow20_outbound_receipts.py",
     "tests/test_workflow20_availability.py",
     "tests/test_workflow20_calendar.py",
     "tests/test_workflow20_calendar_identity.py",

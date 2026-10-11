@@ -1,6 +1,6 @@
 import asyncio
 from unittest.mock import patch,Mock,AsyncMock
-from test_intel_remote_policy import RemoteFixture,policy,EndpointConfigurationError,config
+from tests.test_intel_remote_policy import RemoteFixture,policy,EndpointConfigurationError,config
 from service.config import endpoints
 from service.inference import super_model
 from service.inference.readiness import TurnInferenceClient

@@ -17,11 +17,28 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _no_osascript(*args, **kwargs):
+    raise AssertionError("a test reached the real osascript")
+
+
 @pytest.fixture()
 def demo():
     spec = importlib.util.spec_from_file_location("wisp_demo_behavior_test", ROOT / "demo/wisp_demo.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # Every seed module the CLI loads is off-macOS and cannot run osascript
+    # unless a test opts in (see _mac_seed). Without this, the macOS CI runner
+    # took the real path and drove Calendar.app.
+    real_seed_module = module._seed_module
+
+    def guarded_seed_module():
+        seed = real_seed_module()
+        seed.is_macos = lambda: False
+        seed.run_osascript = _no_osascript
+        seed.subprocess = SimpleNamespace(run=_no_osascript, PIPE=None, TimeoutExpired=TimeoutError)
+        return seed
+
+    module._seed_module = guarded_seed_module
     return module
 
 

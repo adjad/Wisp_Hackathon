@@ -20,6 +20,10 @@ def smp():
     spec = importlib.util.spec_from_file_location("seed_mac_persona_test", ROOT / "demo/seed_mac_persona.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # Safe by default even on a macOS runner: tests opt in to "macOS" and to a
+    # fake subprocess explicitly, so nothing can reach the real osascript.
+    module.is_macos = lambda: False
+    module.subprocess = SimpleNamespace(run=no_subprocess, TimeoutExpired=TimeoutError)
     return module
 
 

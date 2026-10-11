@@ -956,14 +956,14 @@ def exact_cancel_queue(tmp_path, monkeypatch):
 
 
 def _exact_cancel_loop(monkeypatch, queue, *, read_error=False, missing=False, read_only=False,
-                       claim_after_read=False, duplicate=False, suffix=''):
+                       claim_after_read=False, duplicate=False, suffix='', quoted_id=False):
     from service.agent import loop
     from service.safety import policy
     from tests.test_direct_dispatch_exec import ScriptedClient, Approver, _tool_call
     a = queue.add(channel='email', recipient='a@synthetic.invalid', body='Fixture A', when_ts=2000000000)
     b = queue.add(channel='email', recipient='b@synthetic.invalid', body='Fixture B', when_ts=2000000000)
     target = '000000000000' if missing else a
-    prompt = f'Cancel pending email {target}' + suffix
+    prompt = f'Cancel pending email ' + (f'"{target}"' if quoted_id else target) + suffix
     decision = asyncio.run(R.route(prompt))
     monkeypatch.setattr(policy, '_READ_ONLY', read_only)
     actual = loop.run_tool
@@ -1048,3 +1048,11 @@ def test_exact_cancel_actual_loop_conditional_request_cannot_mutate(monkeypatch,
     assert queue.get(a)['status'] == queue.get(b)['status'] == 'pending'
     assert all(name != 'cancel_scheduled_send' for name, _ in calls)
     assert not any(event['type']=='tool_result' and event['result'].startswith('Cancelled [') for event in events)
+
+
+@pytest.mark.parametrize('suffix', ['', ' if Maya agrees'])
+def test_exact_cancel_quoted_id_never_grants_unbound_effect(monkeypatch, exact_cancel_queue, suffix):
+    queue = exact_cancel_queue
+    a, b, _, calls, _ = _exact_cancel_loop(monkeypatch, queue, quoted_id=True, suffix=suffix)
+    assert queue.get(a)['status'] == queue.get(b)['status'] == 'pending', calls
+    assert all(name != 'cancel_scheduled_send' for name, _ in calls)

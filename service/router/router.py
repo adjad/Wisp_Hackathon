@@ -7005,7 +7005,8 @@ def _scheduled_send_review(text: str) -> RouteDecision | None:
     # A literal target belongs to the host contract. Conditional, multi-target
     # or otherwise unconsumed cancellation clauses must clarify after reading;
     # one unique ID appearing somewhere is not unconditional effect authority.
-    may_cancel = cancel and (not ids or exact_cancel is not None)
+    has_literal_id = bool(re.search(r"\b[0-9a-f]{12}\b", text, re.I))
+    may_cancel = cancel and (not has_literal_id or exact_cancel is not None)
     tools = ["list_scheduled_sends"] + (["cancel_scheduled_send"] if may_cancel else [])
     decision = _mk_scoped(tools, "recorded scheduled-send review; delivery unverified", force="list_scheduled_sends", light=False)
     decision.required_tool_groups = (frozenset({"list_scheduled_sends"}),)
@@ -7014,13 +7015,13 @@ def _scheduled_send_review(text: str) -> RouteDecision | None:
         target = {"id": exact_cancel.group("id")}
         decision.tool_argument_bindings["list_scheduled_sends"] = target.copy()
         decision.tool_argument_bindings["cancel_scheduled_send"] = target.copy()
-    elif cancel and ids:
+    elif cancel and has_literal_id:
         decision.forbidden_tools |= frozenset({"cancel_scheduled_send"})
     decision.forbidden_tools |= frozenset({"schedule_send", "send_email", "send_message", "draft_email", "draft_message"})
     decision.resolved_request = (text + "\n\nInspect the recorded queue and preserve every recipient, time, body and status constraint. "
         "A pending-only view cannot establish prior outcomes. 'sent' means app acceptance, not recipient delivery. "
         "Never automatically retry an uncertain send; missing records cannot establish delivery or cancellation.")
-    if cancel and ids and exact_cancel is None:
+    if cancel and has_literal_id and exact_cancel is None:
         decision.resolved_request += " Ask for an unconditional single exact-ID cancellation; no cancellation is authorized by this scoped route."
     return decision
 

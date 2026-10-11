@@ -14,6 +14,18 @@
 #   account "wispbrain:<sha256 of WISP_BRAIN_URL exactly as configured, no trailing slash>"
 set -euo pipefail
 
+# Prints this script's header comment. Pure bash so --help works even where
+# only the shell is available (the sandboxed QA allows bash but not awk).
+print_header() {
+  local line first=1
+  while IFS= read -r line; do
+    if (( first )); then first=0; continue; fi
+    [[ $line == \#* ]] || break
+    line=${line#\#}; line=${line# }
+    printf '%s\n' "$line"
+  done < "$1"
+}
+
 BASE="https://6wjp.tail4cc204.ts.net"
 MODEL="qwen3.6:35b"
 CHAT=1
@@ -25,7 +37,7 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL="$2"; shift 2 ;;
     --no-chat) CHAT=0; shift ;;
     --brain) BRAIN="${2%/}"; shift 2 ;;
-    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    -h|--help) print_header "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
 done

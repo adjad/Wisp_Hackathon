@@ -7,6 +7,18 @@
 #       (prevents a duplicate gateway next to a manually started one).
 set -euo pipefail
 
+# Prints this script's header comment. Pure bash so --help works even where
+# only the shell is available (the sandboxed QA allows bash but not awk).
+print_header() {
+  local line first=1
+  while IFS= read -r line; do
+    if (( first )); then first=0; continue; fi
+    [[ $line == \#* ]] || break
+    line=${line#\#}; line=${line# }
+    printf '%s\n' "$line"
+  done < "$1"
+}
+
 url="http://127.0.0.1:11434/api/version"
 timeout_s=180
 port=""
@@ -16,7 +28,7 @@ while [[ $# -gt 0 ]]; do
     --url) url="$2"; shift 2 ;;
     --timeout) timeout_s="$2"; shift 2 ;;
     --require-free-port) port="$2"; shift 2 ;;
-    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    -h|--help) print_header "$0"; exit 0 ;;
     *) echo "wait-for-ollama: unknown argument $1" >&2; exit 2 ;;
   esac
 done

@@ -33,6 +33,18 @@
 #   -h, --help
 set -euo pipefail
 
+# Prints this script's header comment. Pure bash so --help works even where
+# only the shell is available (the sandboxed QA allows bash but not awk).
+print_header() {
+  local line first=1
+  while IFS= read -r line; do
+    if (( first )); then first=0; continue; fi
+    [[ $line == \#* ]] || break
+    line=${line#\#}; line=${line# }
+    printf '%s\n' "$line"
+  done < "$1"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PREFIX="${HOME}/.local/share/wisp-brain"
@@ -51,7 +63,9 @@ WHEELS=""
 SERVE=0
 NO_START=0
 DRY_RUN=0
-TS="$(date +%Y%m%d-%H%M%S)"
+# Backup suffix only; fall back rather than abort where `date` is unavailable
+# (e.g. the sandboxed QA that runs --help/--dry-run).
+TS="$(date +%Y%m%d-%H%M%S 2>/dev/null)" || TS="undated-$$"
 PIP_PINS=(fastapi==0.138.1 uvicorn==0.49.0 httpx==0.28.1)
 
 while [[ $# -gt 0 ]]; do
@@ -68,7 +82,7 @@ while [[ $# -gt 0 ]]; do
     --wheels) WHEELS="$2"; shift 2 ;;
     --serve) SERVE=1; shift ;;
     --no-start) NO_START=1; shift ;;
-    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    -h|--help) print_header "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -110,8 +124,8 @@ print("foreign", json.dumps({"web": web, "tcp": tcp}, sort_keys=True)[:300])
 ' "$PORT"
 }
 
-if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]]; then
-  XDG_RUNTIME_DIR="/run/user/$(id -u)"
+if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/${EUID}" ]]; then
+  XDG_RUNTIME_DIR="/run/user/${EUID}"
   export XDG_RUNTIME_DIR
 fi
 

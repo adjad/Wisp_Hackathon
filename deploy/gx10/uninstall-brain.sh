@@ -16,6 +16,18 @@
 #   -h, --help
 set -euo pipefail
 
+# Prints this script's header comment. Pure bash so --help works even where
+# only the shell is available (the sandboxed QA allows bash but not awk).
+print_header() {
+  local line first=1
+  while IFS= read -r line; do
+    if (( first )); then first=0; continue; fi
+    [[ $line == \#* ]] || break
+    line=${line#\#}; line=${line# }
+    printf '%s\n' "$line"
+  done < "$1"
+}
+
 PREFIX="${HOME}/.local/share/wisp-brain"
 CONFIG_DIR="${HOME}/.config/wisp-brain"
 STATE_DIR="${HOME}/.local/state/wisp-brain"
@@ -27,7 +39,9 @@ RESTORE=0
 PURGE=0
 PORT=8790
 PYTHON="python3"
-TS="$(date +%Y%m%d-%H%M%S)"
+# Backup suffix only; fall back rather than abort where `date` is unavailable
+# (e.g. the sandboxed QA that runs --help/--dry-run).
+TS="$(date +%Y%m%d-%H%M%S 2>/dev/null)" || TS="undated-$$"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,7 +51,7 @@ while [[ $# -gt 0 ]]; do
     --purge) PURGE=1; shift ;;
     --port) PORT="$2"; shift 2 ;;
     --python) PYTHON="$2"; shift 2 ;;
-    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    -h|--help) print_header "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -74,8 +88,8 @@ print("foreign", json.dumps({"web": web, "tcp": tcp}, sort_keys=True)[:300])
 ' "$PORT"
 }
 
-if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]]; then
-  XDG_RUNTIME_DIR="/run/user/$(id -u)"
+if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/${EUID}" ]]; then
+  XDG_RUNTIME_DIR="/run/user/${EUID}"
   export XDG_RUNTIME_DIR
 fi
 

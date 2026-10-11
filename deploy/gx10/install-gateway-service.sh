@@ -56,9 +56,23 @@ UNIT_PATH="${UNIT_DIR}/${UNIT}"
 SUPPORT_DIR="${HOME}/.local/share/wisp-gx10-supervision"
 STATE_DIR="${HOME}/.local/state/wisp-gx10-supervision"
 WAIT_SCRIPT="${SUPPORT_DIR}/wait-for-ollama.sh"
-TS="$(date +%Y%m%d-%H%M%S)"
+# Backup suffix only; fall back rather than abort where `date` is unavailable
+# (e.g. the sandboxed QA that runs --help/--dry-run).
+TS="$(date +%Y%m%d-%H%M%S 2>/dev/null)" || TS="undated-$$"
 
-usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
+# Prints this script's header comment. Pure bash so --help works even where
+# only the shell is available (the sandboxed QA allows bash but not awk).
+print_header() {
+  local line first=1
+  while IFS= read -r line; do
+    if (( first )); then first=0; continue; fi
+    [[ $line == \#* ]] || break
+    line=${line#\#}; line=${line# }
+    printf '%s\n' "$line"
+  done < "$1"
+}
+
+usage() { print_header "$0"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -88,8 +102,8 @@ run()  {
 }
 
 # systemctl --user over SSH needs the user's runtime dir.
-if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]]; then
-  XDG_RUNTIME_DIR="/run/user/$(id -u)"
+if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/${EUID}" ]]; then
+  XDG_RUNTIME_DIR="/run/user/${EUID}"
   export XDG_RUNTIME_DIR
 fi
 
@@ -151,7 +165,7 @@ existing_pid="$(listener_pid)"
 # Python processes of this user whose command line contains the gateway path
 # (filters out this script itself when --gateway is passed).
 manual_pids=""
-for cand in $(pgrep -u "$(id -u)" -f -- "$GATEWAY" || true); do
+for cand in $(pgrep -u "${EUID}" -f -- "$GATEWAY" || true); do
   [[ "$cand" == "$$" ]] && continue
   exe="$(readlink -f "/proc/${cand}/exe" 2>/dev/null || true)"
   [[ "$(basename "${exe:-x}")" == python* ]] || continue

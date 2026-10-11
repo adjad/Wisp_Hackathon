@@ -18,8 +18,8 @@ ok()   { printf '  [ok]   %s\n' "$*"; }
 bad()  { printf '  [FAIL] %s\n' "$*"; fail=1; }
 info() { printf '  [info] %s\n' "$*"; }
 
-if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]]; then
-  XDG_RUNTIME_DIR="/run/user/$(id -u)"
+if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/${EUID}" ]]; then
+  XDG_RUNTIME_DIR="/run/user/${EUID}"
   export XDG_RUNTIME_DIR
 fi
 

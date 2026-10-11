@@ -282,3 +282,54 @@ exact checkpoint passed 290 focused cases; hourly/daypart forecasts remain
 unsupported. No completeness, local-model, device, native-provider, performance
 or all-20 qualification is implied. A fresh combined head must pass full checks,
 both required CI jobs, independent audit and distinct QA.
+
+
+## Combined validated reads successor
+
+Both independent reviewers sealed BLOCK results for the preserved 80d candidate.
+The QA packet independently reproduced the wrong-target queue mutation and 24
+grocery HTTP failures; all 12 unintended destructive cards were declined. Its
+2,804 unique synthetic checks include 25 failures. Those results and the failed
+full run remain preserved and cannot qualify this successor.
+
+The Calendar repair now uses one raw Calendar contribution throughout schedule
+presentation. Secondary legacy rows and their Calendar provenance cannot mix an
+older occurrence generation with the selected raw rows. Exact native identity
+and conflict variants remain visible. The returned Calendar checkpoint passed
+430 checks plus 61 subtests, including mixed-generation location, moved-event
+and deletion cases. Calendar completeness and production reader qualification
+remain open.
+
+Additional actual isolated HTTP regressions reproduced punctuation, adjacent
+quoted selectors, common Show-me/courtesy wording, and excluded-source history
+or memory entering grocery/priority model inputs. The shared anchored grocery
+prefix and word boundary keep those malformed addressed reads inert; executable
+read grammar still consumes the whole request. Valid grocery and priority reads,
+and grocery clarification, use the existing current-evidence-only context flag.
+Prior conversation and memory cannot reintroduce excluded-source claims in these
+self-contained routes. This is a bounded grammar, not a guarantee for arbitrary
+natural-language paraphrases. Genuine Reminder commands and prior knowledge
+controls remain covered.
+
+Named cancellation also reproduced an actual wrong-target mutation under the
+ordinary write policy. Its discovery route now offers only recorded queue reads,
+shows actual IDs, and asks for a new unconditional exact-ID request. A scripted
+model cannot select an unrelated cancellation target after named discovery.
+Separate explicit-ID controls still bind the selected ID to both read and cancel;
+read failures, pending-state races and duplicate execution retain their controls.
+Full host-resolved named cancellation remains unsupported.
+
+Weather rejects unsupported clock/offset/datetime period components before HTTP,
+including midnight and compound forms. The returned exact checkpoint passed 329
+focused checks; 24 prerepair failures are retained. Whole-date, relative-date and
+bounded range controls pass. Hourly/daypart forecasts remain unsupported.
+
+The combined development selection passed 1,403 checks over eight suites. Its
+initial failures and fixture corrections are retained outside the checkout.
+Fresh exact-head full checks, required CI, independent audit and distinct QA are
+still necessary. Real local-model behavior, grounded final answers across all 20
+families, native actions and device performance remain unqualified. Authenticated
+unsubscribe/open-history, live traffic/location, attendee invitations, unknown
+send receipts and frozen draft recipients still need separate implementation or
+qualification. Synthetic input does not authorize real communications or native
+side effects.

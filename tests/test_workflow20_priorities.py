@@ -14,6 +14,9 @@ from tests.fixtures.wire import email_raw
 from service.assistant.store import AssistantStore, parse_undated_snapshot
 from service.tools import assistant_tools
 
+from service.main import _agent_memory_context_allowed as _real_memory_context_allowed
+from tests.test_workflow20_knowledge import knowledge_entrypoint, storage
+
 NOW = dt.datetime(2026, 10, 12, 8)
 STAMP = NOW.timestamp()
 
@@ -293,3 +296,31 @@ def test_all_sources_excluded_has_no_reads(monkeypatch, isolated):
     result = dispatch(**{f"include_{source}": False for source in T._SOURCES})
     assert result["sources"] == {} and set(result["excluded_sources"]) == set(T._SOURCES)
     assert trace == []
+
+
+@pytest.mark.parametrize('source', ['notes', 'reminders'])
+def test_priority_http_excluded_sources_cannot_enter_through_history_or_memory(knowledge_entrypoint, monkeypatch, source):
+    from service import main
+    from service.memory import context, prompt_blocks
+    state = knowledge_entrypoint
+    monkeypatch.setattr(context, 'store', state.sessions)
+    monkeypatch.setattr(main, '_agent_memory_context_allowed', _real_memory_context_allowed)
+    sid = state.sessions.create_session()
+    old = 'EXCLUDED_OLD_MAIL_0a1b'
+    remembered = 'EXCLUDED_MAIL_MEMORY_1b2c'
+    state.sessions.add_turn(sid, 'user', 'Read mail earlier.')
+    state.sessions.add_turn(sid, 'assistant', old, tool_digest='view_emails')
+    memory_calls = []
+    def memory(**kw):
+        memory_calls.append(kw)
+        return remembered
+    monkeypatch.setattr(prompt_blocks, 'memory_block', memory)
+    N.cache_notes(N._FS.join((str(STAMP), 'Fictional work', 'Work', 'Current fictional work item')))
+    events = state.run('What should I work on today using ' + source + ' only',
+        [{'content':'Synthetic priorities based on current selected evidence.'}], sid=sid, transport='asgi')
+    assert [name for name, _ in state.tools] == ['collect_task_evidence']
+    assert state.tools[0][1]['include_email'] is False
+    model_input = json.dumps(state.clients[0].calls)
+    assert old not in model_input and remembered not in model_input
+    assert memory_calls == []
+    assert not any(e['type'] in {'task_plan', 'workflow', 'confirm', 'error'} for e in events)

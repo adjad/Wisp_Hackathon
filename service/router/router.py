@@ -7008,11 +7008,9 @@ def _scheduled_send_review(text: str) -> RouteDecision | None:
     # A literal target belongs to the host contract. Conditional, multi-target
     # or otherwise unconsumed cancellation clauses must clarify after reading;
     # one unique ID appearing somewhere is not unconditional effect authority.
-    has_literal_id = bool(re.search(r"\b[0-9a-f]{12}\b", text, re.I))
-    named_discovery = (named_cancel and re.fullmatch(named_pattern, text, re.I)
-        and not has_literal_id and not re.search(
-            r"\b(?:queued|pending|scheduled|id|if|unless|until|only|provided|when|except)\b", value, re.I))
-    may_cancel = cancel and (exact_cancel is not None or named_discovery)
+    # Named discovery does not resolve a host-owned unique target. Show actual
+    # queue IDs, then require a new unconditional user request selecting one.
+    may_cancel = cancel and exact_cancel is not None
     tools = ["list_scheduled_sends"] + (["cancel_scheduled_send"] if may_cancel else [])
     decision = _mk_scoped(tools, "recorded scheduled-send review; delivery unverified", force="list_scheduled_sends", light=False)
     decision.required_tool_groups = (frozenset({"list_scheduled_sends"}),)
@@ -7071,6 +7069,7 @@ def _priority_read(text: str) -> RouteDecision | None:
     tools = list(read.tools)
     decision = _mk_scoped(tools, "source-grounded personal priorities",
                           multi=True, after=frozenset(tools), light=False)
+    decision.verified_results_only = True
     decision.required_tool_groups = read.groups
     decision.tool_argument_bindings = read.bindings
     decision.direct_calls = [(tool, read.bindings[tool]) for tool in tools]

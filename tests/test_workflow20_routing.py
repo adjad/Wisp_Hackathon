@@ -805,10 +805,12 @@ def test_calendar_as_verb_does_not_turn_reads_into_writes(prompt):
     "Cancel Maya agenda email", "Cancel Maya agenda email but leave Lee weekly email",
     "Please cancel the Mom summary text",
 ])
-def test_named_delivery_cancel_requires_queue_discovery_and_exact_selection(prompt):
+def test_named_delivery_cancel_requires_read_only_discovery_and_new_exact_selection(prompt):
     decision = asyncio.run(R.route(prompt))
     assert "list_scheduled_sends" in decision.tool_subset
-    assert "cancel_scheduled_send" in decision.tool_subset
+    assert "cancel_scheduled_send" not in decision.tool_subset
+    assert "cancel_scheduled_send" in decision.forbidden_tools
+    assert "unconditional single exact-ID" in decision.resolved_request
     assert decision.tool_argument_bindings["list_scheduled_sends"] == {"status": "pending"}
     assert not decision.direct_calls
     assert decision.resolved_request.startswith(prompt + "\n")
@@ -1071,3 +1073,57 @@ def test_exact_cancel_malformed_id_never_grants_unbound_effect(monkeypatch, exac
     a, b, _, calls, _ = _exact_cancel_loop(monkeypatch, queue, malformed_id=True, suffix=' if Maya agrees')
     assert queue.get(a)['status'] == queue.get(b)['status'] == 'pending', calls
     assert all(name != 'cancel_scheduled_send' for name, _ in calls)
+
+
+@pytest.mark.parametrize('prompt', ['Cancel Maya agenda email',
+    'Cancel Maya agenda email but leave Lee weekly email', 'Please cancel the Mom summary text'])
+def test_named_cancel_actual_loop_requires_new_user_exact_id(monkeypatch, exact_cancel_queue, prompt):
+    from service.agent import loop
+    from tests.test_direct_dispatch_exec import ScriptedClient, Approver, _tool_call
+    queue = exact_cancel_queue
+    a = queue.add(channel='email', recipient='maya@synthetic.invalid', display='Maya', subject='Agenda',
+                  body='Fictional Maya agenda', when_ts=2000000000)
+    b = queue.add(channel='email', recipient='lee@synthetic.invalid', display='Lee', subject='Weekly',
+                  body='Fictional Lee weekly', when_ts=2000000000)
+    calls = []
+    actual = loop.run_tool
+    async def run(tool, args):
+        calls.append((tool.name, dict(args)))
+        return await actual(tool, args)
+    monkeypatch.setattr(loop, 'run_tool', run)
+    async def turn(request, script):
+        decision = await R.route(request)
+        events = []
+        async def emit(event): events.append(event)
+        client, approver = ScriptedClient(script), Approver()
+        await loop.run_agent(client, 'Agents-A1-4B-oQe6', [{'role':'user','content':decision.resolved_request}],
+            emit, approver, tools=decision.tool_subset, force_first_tool=decision.force_first_tool,
+            expect_tool_first=decision.expect_tool_first, required_tool_groups=decision.required_tool_groups,
+            tool_argument_bindings=decision.tool_argument_bindings, forbidden_tools=decision.forbidden_tools,
+            multi_round=decision.multi_round, include_memory_context=False, allow_skill_context=False, max_steps=8)
+        return events, approver
+    events, approver = asyncio.run(turn(prompt, [
+        {'tool_calls':[_tool_call('list_scheduled_sends', {'status':'pending'}, 'read')]},
+        {'tool_calls':[_tool_call('cancel_scheduled_send', {'id':b}, 'hostile')]},
+        {'content':'Please choose the exact queue ID.'}]))
+    assert {key:queue.get(key)['status'] for key in (a,b)} == {a:'pending', b:'pending'}, calls
+    assert calls == [('list_scheduled_sends', {'status':'pending'})]
+    result = next(e['result'] for e in events if e['type']=='tool_result' and e['id']=='read')
+    assert a in result and b in result
+    assert approver.seen == []
+    # A separate, unconditional human request mints the exact target binding.
+    calls.clear()
+    asyncio.run(turn('Cancel scheduled message ' + a, [
+        {'tool_calls':[_tool_call('list_scheduled_sends', {'id':b}, 'read-selected')]},
+        {'tool_calls':[_tool_call('cancel_scheduled_send', {'id':b}, 'cancel-selected')]},
+        {'content':'Synthetic exact-target result.'}]))
+    assert calls == [('list_scheduled_sends', {'id':a}), ('cancel_scheduled_send', {'id':a})]
+    assert {key:queue.get(key)['status'] for key in (a,b)} == {a:'cancelled', b:'pending'}
+
+
+@pytest.mark.parametrize('response', ['yes', 'go ahead'])
+def test_named_cancel_discovery_acknowledgement_never_authorizes_cancellation(response):
+    d = asyncio.run(R.route(response, last_user='Cancel Maya agenda email',
+        last_assistant='Choose the exact queue ID before I can cancel it.', last_tools='list_scheduled_sends'))
+    assert 'cancel_scheduled_send' not in (d.tool_subset or ())
+    assert 'cancel_scheduled_send' in d.forbidden_tools

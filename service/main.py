@@ -15,6 +15,7 @@ load/swap) that has no other visible signal — see OMLXClient.ensure_only.
 from __future__ import annotations
 
 import asyncio
+from service.inference.remote_policy import remote_only_profile, require_generation_role, require_local_models_disabled
 import json
 import os
 import re
@@ -256,6 +257,8 @@ def _sync_keep_warm() -> None:
     wasted, never idle-unloaded) while the model actually in use pays a cold
     reload every time it's gone idle for 5+ minutes.
     """
+    if remote_only_profile() is not None:
+        return
     keep = {role_target("fast").model}
     try:
         agent = role_target("agent")
@@ -274,6 +277,14 @@ async def lifespan(app: FastAPI):
     quarantine.check()
     global client
     client = OMLXClient()
+    profile = remote_only_profile()
+    started_tasks = []
+    if profile is not None:
+        try:
+            await _prepare_remote_inference(client)
+        except Exception:
+            await client.aclose()
+            raise
     # Keep the resident chat model warm. Every text role resolves to it now
     # (see config/models.yaml), so this is the model essentially every request
     # needs and there is no second chat model for it to contend with. Warm it
@@ -314,11 +325,12 @@ async def lifespan(app: FastAPI):
     # contribute tools to the registry, so they load before the first request
     # can arrive. Neither is required — a fresh install has zero of each — and
     # a failure in either must not stop the backend from serving.
-    try:
-        skills.load()
-    except Exception:  # noqa: BLE001
-        pass
-    mcp_task = asyncio.create_task(mcp_manager.start())
+    if profile is None:
+        try:
+            skills.load()
+        except Exception:  # noqa: BLE001
+            pass
+        started_tasks.append(asyncio.create_task(mcp_manager.start()))
 
     # Retention: unpinned research jobs keep their evidence/quotes/report
     # forever, but the full fetched page bodies (only needed for re-extraction,
@@ -331,17 +343,17 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001
         pass
 
-    warm_task = asyncio.create_task(_warm_summarizer())
-    if cloud_super_model_enabled():
-        start_laya_warmup()
-    unloader_task = asyncio.create_task(idle_unloader.run(client))
-    assistant_task = asyncio.create_task(assistant_scheduler.run())
-    from service import nodes
-    node_task = asyncio.create_task(nodes.run())
-    from service.memory.api import worker as memory_worker
-    memory_task = asyncio.create_task(memory_worker.run(client))
-    recovery_task = asyncio.create_task(quarantine.watch(
-        (warm_task, unloader_task, assistant_task, node_task, memory_task, mcp_task), client.aclose))
+    if profile is None:
+        started_tasks.append(asyncio.create_task(_warm_summarizer()))
+        if cloud_super_model_enabled():
+            start_laya_warmup()
+        started_tasks.append(asyncio.create_task(idle_unloader.run(client)))
+        started_tasks.append(asyncio.create_task(assistant_scheduler.run()))
+        from service import nodes
+        started_tasks.append(asyncio.create_task(nodes.run()))
+        from service.memory.api import worker as memory_worker
+        started_tasks.append(asyncio.create_task(memory_worker.run(client)))
+    recovery_task = asyncio.create_task(quarantine.watch(tuple(started_tasks), client.aclose))
     # A10 WP3: serves the app's private bridge socket only when the app launched
     # this process with one (a browser enabled by the user). Otherwise this is a no-op.
     bridge_link = None
@@ -350,21 +362,19 @@ async def lifespan(app: FastAPI):
         bridge_link = browser_bridge_host.start_from_environment(assistant_store)
     except Exception:  # noqa: BLE001 — an optional bridge never blocks startup
         pass
-    yield
-    if bridge_link is not None:
-        bridge_link.stop()
-    recovery_task.cancel()
-    await asyncio.gather(recovery_task, return_exceptions=True)
-    memory_task.cancel()
-    await asyncio.gather(memory_task, return_exceptions=True)
-    warm_task.cancel()
-    unloader_task.cancel()
-    assistant_task.cancel()
-    node_task.cancel()
-    await asyncio.gather(node_task, return_exceptions=True)
-    mcp_task.cancel()
-    await mcp_manager.stop()
-    await client.aclose()
+    try:
+        yield
+    finally:
+        if bridge_link is not None:
+            bridge_link.stop()
+        recovery_task.cancel()
+        await asyncio.gather(recovery_task, return_exceptions=True)
+        for task in started_tasks:
+            task.cancel()
+        await asyncio.gather(*started_tasks, return_exceptions=True)
+        if profile is None:
+            await mcp_manager.stop()
+        await client.aclose()
 
 
 app = FastAPI(title="Wisp", lifespan=lifespan)
@@ -403,8 +413,17 @@ async def _await_omlx(seconds: float) -> bool:
         return False
 
 
+async def _prepare_remote_inference(active_client) -> None:
+    profile = remote_only_profile()
+    if profile is None:
+        raise ValueError("Remote-only inference is not enabled")
+    async with asyncio.timeout(profile.readiness_timeout):
+        await active_client.health()
+
+
 async def ensure_omlx() -> None:
     """Start only the Pro-owned engine, with bounded readiness."""
+    require_local_models_disabled("Local oMLX lifecycle")
     from service.inference.omlx_client import ModelLoadError
     if not getattr(client, "managed", True):
         raise ModelLoadError("Remote inference cannot invoke local lifecycle commands")
@@ -973,6 +992,10 @@ async def set_idle_timeout(body: dict[str, Any]) -> dict[str, Any]:
 async def chat(body: dict[str, Any]):
     target = role_target(body.get("role") or models_config().get("default_role", "agent"))
     max_tokens = body.get("max_tokens", 8000)
+    profile = remote_only_profile()
+    if profile is not None:
+        require_generation_role(target.role)
+        max_tokens = profile.fit_output(max_tokens)
     local_prompt = None
     if target.endpoint.name == "local_provider":
         local_prompt = body.get("prompt")
@@ -998,6 +1021,8 @@ async def chat(body: dict[str, Any]):
                 body.get("messages") or [{"role": "user", "content": body["prompt"]}])
     streaming_started = False
     try:
+        if profile is not None:
+            await _prepare_remote_inference(active)
         await active.ensure_only(model)
         if body.get("stream"):
             async def gen():
@@ -1377,22 +1402,26 @@ async def agent(body: dict[str, Any]):
             # their first question. Keep one active skill on the session until
             # the user stops it, switches explicitly, or the skill emits its
             # completion marker.
-            active_skill = "" if literal_envelope else skills.select_for_turn(
-                prompt,
-                str((sess or {}).get("active_skill") or ""),
-                last_assistant or "",
-            )
-            if not literal_envelope and sess and active_skill != str(sess.get("active_skill") or ""):
-                store.set_active_skill(sid, active_skill)
-            # Skills stay on the managed model. Beyond an active conversational
-            # workflow, that covers a turn that invokes ANY enabled skill (an
-            # explicit @name or a trigger phrase) and the follow-up to a turn that
-            # loaded a skill with use_skill or ran a skill-defined tool.
-            skill_turn = ""
-            if active_skill:
-                skill_turn = "active_skill_local"
-            elif not literal_envelope and (skills.turn_skill_names(prompt) or skills.digest_used_skill(last_tools)):
-                skill_turn = "skill_local"
+            if remote_only_profile() is not None:
+                active_skill = ""
+                skill_turn = ""
+            else:
+                active_skill = "" if literal_envelope else skills.select_for_turn(
+                    prompt,
+                    str((sess or {}).get("active_skill") or ""),
+                    last_assistant or "",
+                )
+                if not literal_envelope and sess and active_skill != str(sess.get("active_skill") or ""):
+                    store.set_active_skill(sid, active_skill)
+                # Skills stay on the managed model. Beyond an active conversational
+                # workflow, that covers a turn that invokes ANY enabled skill (an
+                # explicit @name or a trigger phrase) and the follow-up to a turn that
+                # loaded a skill with use_skill or ran a skill-defined tool.
+                skill_turn = ""
+                if active_skill:
+                    skill_turn = "active_skill_local"
+                elif not literal_envelope and (skills.turn_skill_names(prompt) or skills.digest_used_skill(last_tools)):
+                    skill_turn = "skill_local"
 
             # Common assistant actions are moving behind a typed task boundary.
             # The compiler owns semantic roles and canonical arguments; the
@@ -1557,13 +1586,15 @@ async def agent(body: dict[str, Any]):
                 await emit({"type": "done"})
                 return
 
-            turn_client = TurnInferenceClient(client, ensure_omlx, emit=emit)
+            turn_client = TurnInferenceClient(
+                client, (lambda: _prepare_remote_inference(client))
+                if remote_only_profile() is not None else ensure_omlx, emit=emit)
             # Optional embedding/reranker routing needs the engine before it
             # can retrieve a menu. The default lexical provider uses no model;
             # leave it cold until a real generation is needed.
             retrieval_provider = str((models_config().get("tool_retrieval") or {}).get(
                 "provider", "embedding")).lower()
-            if retrieval_provider != "lexical":
+            if remote_only_profile() is None and retrieval_provider != "lexical":
                 retrieval_role = "reranker" if retrieval_provider == "reranker" else "embedding"
                 try:
                     if role_target(retrieval_role).endpoint.managed:
@@ -1599,7 +1630,7 @@ async def agent(body: dict[str, Any]):
             # and keep complete greetings/thanks on the tool-free fast path.
             decision = apply_session_pin(decision, sess, prompt, active_skill=active_skill)
             super_model_cloud = False
-            if cloud_super_model_enabled():
+            if remote_only_profile() is None and cloud_super_model_enabled():
                 if active_skill:
                     super_reason = "an active local skill must remain on this Mac"
                 else:
@@ -1657,11 +1688,14 @@ async def agent(body: dict[str, Any]):
                 decision.model = target.model
                 owned_inference_client = OMLXClient(target=target)
                 async def remote_ready():
-                    async with asyncio.timeout(target.endpoint.readiness_timeout):
-                        await owned_inference_client.health()
+                    if remote_only_profile() is not None:
+                        await _prepare_remote_inference(owned_inference_client)
+                    else:
+                        async with asyncio.timeout(target.endpoint.readiness_timeout):
+                            await owned_inference_client.health()
                 fallback_role = models_config().get("inference", {}).get("bindings", {}).get(decision.role, {}).get("fallback_role")
                 turn_client = TurnInferenceClient(owned_inference_client, remote_ready, emit=emit,
-                    fallback_start=ensure_omlx if fallback_role == "fast" and not decision.needs_tools else None)
+                    fallback_start=ensure_omlx if remote_only_profile() is None and fallback_role == "fast" and not decision.needs_tools else None)
 
 
             await emit({"type": "routed", **decision.as_dict()})
@@ -1670,13 +1704,13 @@ async def agent(body: dict[str, Any]):
 
             user_msg: dict[str, Any] = {
                 "role": "user",
-                "content": prompt if super_model_cloud else (decision.resolved_request or prompt),
+                "content": prompt if super_model_cloud or remote_only_profile() is not None else (decision.resolved_request or prompt),
             }
             schedule_read = (not (workflow_turn and workflow_turn.decision)
                              and _current_schedule_source_route(decision, prompt))
             # Test mode is stateless (see the endpoint docstring) — the prompt
             # stands alone, with no session history loaded or built on.
-            messages = ([user_msg] if super_model_cloud else _tool_turn_messages(
+            messages = ([user_msg] if super_model_cloud or remote_only_profile() is not None else _tool_turn_messages(
                 sid, user_msg, max_tokens=max(1500, target.context_window - 11500),
                 test_mode=test_mode,
                 verified_results_only=(decision.verified_results_only or
@@ -1760,13 +1794,13 @@ async def agent(body: dict[str, Any]):
                 final = await run_agent(turn_client, decision.model, messages, emit, approver,
                                         tools=decision.tool_subset,
                                         active_skill=active_skill,
-                                        allow_skill_context=not literal_envelope,
+                                        allow_skill_context=remote_only_profile() is None and not literal_envelope,
                                         force_first_tool=force_tool,
                                         expect_tool_first=decision.expect_tool_first,
                                         short_circuit_tools=_PRESYNTHESIZED_TOOLS,
                                         style_hint=style_hint or None,
                                         public_web_synthesis=super_model_cloud,
-                                        include_memory_context=_agent_memory_context_allowed(
+                                        include_memory_context=remote_only_profile() is None and _agent_memory_context_allowed(
                                             decision, cloud=super_model_cloud,
                                             grounded_workflow=bool(workflow_turn and
                                                                    workflow_turn.decision),
@@ -1822,7 +1856,9 @@ async def agent(body: dict[str, Any]):
                 # tool-free. Excluded for "coding" too: several of the
                 # style rules (no em/en dashes, no hyphenated compounds) are
                 # prose-specific and could otherwise bleed into code syntax.
-                if super_model_cloud:
+                if remote_only_profile() is not None:
+                    msgs = [{"role": "system", "content": ROLE_SYSTEM.get(decision.role, ROLE_SYSTEM["general"])}] + messages
+                elif super_model_cloud:
                     # The privacy decision covers only the literal current prompt.
                     # Do not attach local memory, conversation rewrites, role prompts,
                     # skill files, or timestamps to a cloud Super Model request.
@@ -1936,7 +1972,7 @@ async def agent(body: dict[str, Any]):
                 # Rolling conversation summaries contain prior user turns and
                 # are a local memory operation even when this turn used cloud
                 # inference. Never reuse the remote turn client here.
-            if not test_mode:
+            if not test_mode and remote_only_profile() is None:
                 summary_target = role_target("fast")
 
                 async def prepare_local_summary() -> None:
@@ -1951,8 +1987,9 @@ async def agent(body: dict[str, Any]):
                 )
         except Exception as e:  # noqa: BLE001
             trace.event("error", error_kind=type(e).__name__)
-            message, detail = translate_error(e, retry_omlx=ensure_omlx if owned_inference_client is None else None,
-                                              endpoint_name=owned_inference_client.endpoint_name if owned_inference_client else "local")
+            message, detail = translate_error(e, retry_omlx=ensure_omlx if remote_only_profile() is None and owned_inference_client is None else None,
+                                              endpoint_name=(remote_only_profile().endpoint_name if remote_only_profile() is not None
+                                                             else owned_inference_client.endpoint_name if owned_inference_client else "local"))
             await emit({"type": "error", "message": message, "detail": detail})
             await emit({"type": "done"})
             # Persist the user's prompt even though the turn failed — it was
@@ -2240,6 +2277,8 @@ async def assistant_sync_calendar(body: dict[str, Any]) -> dict[str, Any]:
 @app.post("/assistant/commitments")
 async def assistant_add(body: dict[str, Any]) -> dict[str, Any]:
     """Manually add a reminder/event. Accepts when_ts (epoch) or when_iso."""
+    if remote_only_profile() is not None:
+        raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     title = str(body.get("title") or "").strip()
     if not title:
         return {"ok": False, "error": "title required"}
@@ -2262,6 +2301,8 @@ async def assistant_add(body: dict[str, Any]) -> dict[str, Any]:
 @app.post("/assistant/commitments/{cid}")
 async def assistant_update(cid: str, body: dict[str, Any]) -> dict[str, Any]:
     """Mark a commitment done/dismissed (status)."""
+    if remote_only_profile() is not None:
+        raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     status = str(body.get("status") or "").strip()
     if status not in {"active", "done", "dismissed"}:
         return {"ok": False, "error": "status must be active|done|dismissed"}
@@ -2452,6 +2493,8 @@ async def assistant_delete(cid: str) -> dict[str, Any]:
     """Cancel/delete a commitment. For a real calendar event, ask the Swift app
     to remove it from macOS Calendar (it holds the write grant); the re-sync then
     drops it from the store. Manual items are deleted outright."""
+    if remote_only_profile() is not None:
+        raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     c = assistant_store.get(cid)
     if not c:
         return {"ok": False, "error": "not found"}
@@ -2537,6 +2580,8 @@ async def assistant_event_ack(event_id: str, body: dict[str, Any]) -> dict[str, 
 
 @app.post("/assistant/events/{event_id}/claim")
 async def assistant_event_claim(event_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    if remote_only_profile() is not None:
+        raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     if set(body) != {"kind", "action_id", "payload"}:
         raise HTTPException(status_code=422, detail="kind, action_id and exact payload are required")
     try:
@@ -2585,6 +2630,8 @@ async def assistant_send_message_draft(body: dict[str, Any]) -> dict[str, Any]:
     on it, not a regex. Those checks are for catching the model before a human
     looks — see action_tools.human_reviewed_content.
     """
+    if remote_only_profile() is not None:
+        raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     from service.safety.audit import audit
     from service.tools.action_tools import human_reviewed_content, send_message
 
@@ -2619,6 +2666,8 @@ async def assistant_events() -> StreamingResponse:
 
 @app.post("/agent/approve")
 async def approve(body: dict[str, Any]) -> dict[str, Any]:
+    if remote_only_profile() is not None:
+        raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     sid, action_id = body.get("session_id"), body.get("action_id")
     approved, request_id = body.get("approved"), body.get("request_id")
     # A decision authorizes or refuses a real action, so the body is validated

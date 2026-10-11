@@ -488,6 +488,9 @@ async def run_tool(tool: Tool, args: dict) -> str:
     the model can read and correct on its next step, the same way a wrong
     file path or an ambiguous title already does.
     """
+    from service.inference.remote_policy import remote_only_profile, remote_demo_tool_allowed
+    if remote_only_profile() is not None and not remote_demo_tool_allowed(tool.name):
+        return "This action is unavailable in the four-read remote-only demo; nothing was executed."
     if tool.unavailable_reason:
         return tool.unavailable_reason
     # Drop junk empty-name keys before dispatch. Small models emit `{"": ""}`

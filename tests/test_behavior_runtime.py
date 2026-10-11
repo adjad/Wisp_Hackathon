@@ -232,6 +232,16 @@ def test_founder_demo_turns_it_on_and_synthetic(monkeypatch):
     assert br.synthetic_only()
 
 
+def test_behavior_zero_is_a_kill_switch_even_in_the_founder_demo(monkeypatch):
+    from service.behavior.flags import env_enabled
+    from service.memory.prompt_blocks import profile_block
+    from service.tools.behavior_tools import _unavailable
+    monkeypatch.setenv("WISP_FOUNDER_DEMO", "1")
+    monkeypatch.setenv("WISP_BEHAVIOR", "0")
+    assert not env_enabled() and not br.enabled()
+    assert profile_block() == "" and _unavailable()
+
+
 def test_brain_mode_selection(monkeypatch):
     assert br.brain_mode() == "local"
     monkeypatch.setenv("WISP_BRAIN_URL", "https://brain.example.test")

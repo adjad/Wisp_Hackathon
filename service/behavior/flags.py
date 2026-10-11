@@ -16,5 +16,10 @@ def founder_demo_env() -> bool:
 
 
 def env_enabled() -> bool:
-    """On with ``WISP_BEHAVIOR=1`` or automatically in the founder demo build."""
-    return os.environ.get("WISP_BEHAVIOR") == "1" or founder_demo_env()
+    """On with ``WISP_BEHAVIOR=1`` or automatically in the founder demo build.
+    ``WISP_BEHAVIOR=0`` is an explicit kill switch that wins over the founder
+    demo, so a live demo can turn the feature off without another build."""
+    value = os.environ.get("WISP_BEHAVIOR")
+    if value == "0":
+        return False
+    return value == "1" or founder_demo_env()

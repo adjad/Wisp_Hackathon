@@ -158,6 +158,7 @@ GX10 outage does not blank it.
 | Flag | Meaning |
 | --- | --- |
 | `WISP_BEHAVIOR=1` | Behavior learning on. Off by default. |
+| `WISP_BEHAVIOR=0` | Kill switch: behavior learning off even in the founder demo build. |
 | `WISP_FOUNDER_DEMO=1` | Founder build: turns behavior on and implies synthetic-only. The Intel app sets this (with `WISP_REMOTE_ONLY=1`) for its backend. |
 | `WISP_BEHAVIOR_SYNTHETIC_ONLY=1` | Learn from the persona and the `Wisp Demo` calendar only. Required for `/behavior/reset`. |
 | `WISP_BRAIN_MODE` | `local` (default) or `remote`. Falls back to `brain.mode` in `<WISP_HOME>/config.yaml`. If neither is valid, a set `WISP_BRAIN_URL` selects `remote`. |

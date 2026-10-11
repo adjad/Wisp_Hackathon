@@ -22,9 +22,8 @@ _OFF = ("Behavior learning is off in this Wisp build, so I haven't learned any r
 def _unavailable() -> str:
     """Non-routable (hidden from retrieval and dispatch) while behavior
     learning is off, so builds without it keep their exact tool menus."""
-    import os
-    on = os.environ.get("WISP_BEHAVIOR") == "1" or os.environ.get("WISP_FOUNDER_DEMO") == "1"
-    return "" if on else _OFF
+    from service.behavior.flags import env_enabled
+    return "" if env_enabled() else _OFF
 
 
 _EMPTY = ("I haven't learned any reliable routines yet — I need a few more weeks of your calendar "

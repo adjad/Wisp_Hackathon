@@ -279,6 +279,8 @@ vote too, and turns that nudge's auto action into an offer next time.
   flags removed, the same engine learns from your own Calendar, Reminders
   and message metadata.
 
+> **Kill switch:** if behavior learning misbehaves live, relaunch with `WISP_BEHAVIOR=0`. That turns it off even in the founder build, and the rest of Wisp is unchanged.
+
 ## Plan B
 
 | If… | Do this |

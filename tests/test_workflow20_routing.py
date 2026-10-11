@@ -956,14 +956,15 @@ def exact_cancel_queue(tmp_path, monkeypatch):
 
 
 def _exact_cancel_loop(monkeypatch, queue, *, read_error=False, missing=False, read_only=False,
-                       claim_after_read=False, duplicate=False, suffix='', quoted_id=False):
+                       claim_after_read=False, duplicate=False, suffix='', quoted_id=False, malformed_id=False):
     from service.agent import loop
     from service.safety import policy
     from tests.test_direct_dispatch_exec import ScriptedClient, Approver, _tool_call
     a = queue.add(channel='email', recipient='a@synthetic.invalid', body='Fixture A', when_ts=2000000000)
     b = queue.add(channel='email', recipient='b@synthetic.invalid', body='Fixture B', when_ts=2000000000)
     target = '000000000000' if missing else a
-    prompt = f'Cancel pending email ' + (f'"{target}"' if quoted_id else target) + suffix
+    selector = target + '0' if malformed_id else target
+    prompt = f'Cancel pending email ' + (f'"{selector}"' if quoted_id else selector) + suffix
     decision = asyncio.run(R.route(prompt))
     monkeypatch.setattr(policy, '_READ_ONLY', read_only)
     actual = loop.run_tool
@@ -1021,6 +1022,10 @@ def test_exact_cancel_complete_clause_binds_same_literal_to_both_tools(prompt):
     'Cancel pending email abcdef123456 containing "if Maya agrees"',
     'Cancel pending email abcdef123456 tomorrow',
     'Cancel pending email abcdef123456 "if Maya agrees"',
+    'Cancel pending email abcdef1234567 if Maya agrees',
+    'Cancel pending email abcdef12345 unless it is urgent',
+    'Cancel pending email',
+    'Cancel pending ID abcdefabcde email',
 ])
 def test_exact_cancel_unconsumed_conditions_never_offer_cancellation(prompt):
     decision = asyncio.run(R.route(prompt))
@@ -1054,5 +1059,12 @@ def test_exact_cancel_actual_loop_conditional_request_cannot_mutate(monkeypatch,
 def test_exact_cancel_quoted_id_never_grants_unbound_effect(monkeypatch, exact_cancel_queue, suffix):
     queue = exact_cancel_queue
     a, b, _, calls, _ = _exact_cancel_loop(monkeypatch, queue, quoted_id=True, suffix=suffix)
+    assert queue.get(a)['status'] == queue.get(b)['status'] == 'pending', calls
+    assert all(name != 'cancel_scheduled_send' for name, _ in calls)
+
+
+def test_exact_cancel_malformed_id_never_grants_unbound_effect(monkeypatch, exact_cancel_queue):
+    queue = exact_cancel_queue
+    a, b, _, calls, _ = _exact_cancel_loop(monkeypatch, queue, malformed_id=True, suffix=' if Maya agrees')
     assert queue.get(a)['status'] == queue.get(b)['status'] == 'pending', calls
     assert all(name != 'cancel_scheduled_send' for name, _ in calls)

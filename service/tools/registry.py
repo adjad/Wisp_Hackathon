@@ -11,6 +11,40 @@ from typing import Any, Callable
 REGISTRY: dict[str, "Tool"] = {}
 
 
+class _OutboundUnknownResult(str):
+    """Ephemeral host uncertainty, never reconstructed from model/JSON text.
+
+    Only the four outbound wrappers mint this carrier after bridge dispatch or
+    a mismatched reply acknowledgment. Primitive metadata is immutable and
+    deliberately lost when a result is serialized, sliced, or coerced to str.
+    """
+    __slots__ = ("_operation", "_action_id")
+
+    def __new__(cls, text: str, *, operation: str, action_id: str):
+        if operation not in {"send_email", "send_message", "forward_email", "reply_to_email"}:
+            raise ValueError("Invalid outbound receipt operation")
+        if not isinstance(action_id, str) or not re.fullmatch(r"[A-Za-z0-9:_-]{0,128}", action_id):
+            raise ValueError("Invalid outbound action identity")
+        instance = super().__new__(cls, text)
+        object.__setattr__(instance, "_operation", operation)
+        object.__setattr__(instance, "_action_id", action_id)
+        return instance
+
+    @property
+    def operation(self):
+        return self._operation
+
+    @property
+    def action_id(self):
+        return self._action_id
+
+    def __setattr__(self, name, value):
+        raise AttributeError("Outbound uncertainty receipts are immutable")
+
+    def __delattr__(self, name):
+        raise AttributeError("Outbound uncertainty receipts are immutable")
+
+
 class DisplayOnlyToolResult(str):
     """Escaped publisher text for deterministic UI presentation, never inference.
 
@@ -169,7 +203,7 @@ class ToolOutcome:
     loop a reliable distinction between success, denial/failure, and dry-run
     planning while individual tools migrate to richer native outcomes.
     """
-    status: str  # succeeded | no_match | needs_input | denied | failed | planned | unsupported
+    status: str  # succeeded | unknown | no_match | needs_input | denied | failed | planned | unsupported
     text: str
     effect: str = ""
     facts: dict[str, Any] = field(default_factory=dict)
@@ -200,6 +234,8 @@ def classify_tool_outcome(tool_name: str, result: str, *, planned: bool = False,
             "unsupported", text or UNAVAILABLE_TOOL_REASONS[tool_name], effect)
     if planned:
         return ToolOutcome("planned", text, effect)
+    if not denied and type(result) is _OutboundUnknownResult and result.operation == tool_name:
+        return ToolOutcome("unknown", text, effect, {"action_id": result.action_id})
     low = text.strip().lower()
     if tool_name == "organize_files" and low.startswith("would move "):
         return ToolOutcome("preview", text, effect)
@@ -396,13 +432,17 @@ async def run_tool(tool: Tool, args: dict) -> str:
         # tool at a time, and nothing here touches oMLX.
         if inspect.iscoroutinefunction(tool.func):
             res = await tool.func(**args)
-            return res if isinstance(res, (DisplayOnlyToolResult, PublicSearchToolResult)) else str(res)
+            if type(res) is _OutboundUnknownResult or isinstance(res, (DisplayOnlyToolResult, PublicSearchToolResult)):
+                return res
+            return str(res)
         res = await asyncio.to_thread(tool.func, **args)
         # A sync function can still RETURN an awaitable (a plain `def` that
         # hands back a coroutine); to_thread only resolves the call itself.
         if inspect.isawaitable(res):
             res = await res
-        return res if isinstance(res, (DisplayOnlyToolResult, PublicSearchToolResult)) else str(res)
+        if type(res) is _OutboundUnknownResult or isinstance(res, (DisplayOnlyToolResult, PublicSearchToolResult)):
+            return res
+        return str(res)
     except TypeError as e:
         return (f"(error calling {tool.name}({args!r}): {e}. "
                 f"Expected arguments — {_arg_hint(tool)}. Call it again with corrected arguments.)")

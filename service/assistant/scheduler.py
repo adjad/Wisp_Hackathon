@@ -185,7 +185,19 @@ async def _fire_scheduled_sends() -> None:
         else:
             res = await app_request("send_message",
                                     {"to": row["recipient"], "text": row["body"]})
-        ok = bool(res.get("ok"))
+        ok = res.get("ok") is True and ("status" not in res or res["status"] == "succeeded")
+        if not ok and not (res.get("ok") is False and res.get("status") == "not_attempted"
+                           and res.get("dispatch_started") is False):
+            # The claim already left the pending queue. A lost/generic native
+            # receipt must never invite another send or a definite failed UI.
+            outbound_queue.mark(row["id"], "unknown", "Sending was not confirmed; check the sending app before retrying")
+            await hub.publish({
+                "type": "scheduled_send_unknown", "notice_id": row["id"],
+                "channel": row["channel"], "display": row["display"],
+                "body": row["body"], "when_ts": row["when_ts"],
+            }, dedupe_key="scheduled_unknown:" + row["id"],
+               target={"type": "scheduled_unknown", "id": row["id"]})
+            continue
         outbound_queue.mark(row["id"], "sent" if ok else "failed",
                             "" if ok else str(res.get("error") or "unknown error"))
         await hub.publish({

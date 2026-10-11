@@ -1655,6 +1655,13 @@ async def run_agent(
         return set(group or ()) - (attempted_tools - previews)
 
     def _verified_final(text: str) -> str:
+        uncertain = [outcome for name, outcome in tool_outcomes
+                     if name in {"send_email", "send_message", "forward_email", "reply_to_email"}
+                     and outcome.status == "unknown"]
+        if uncertain:
+            # A missing receipt proves neither sent nor not sent. Stop before
+            # the generic verifier can replace it with a definite negative.
+            return uncertain[-1].text
         from service.agent.verification import verify_delivery_claims
         text = verify_delivery_claims(text, tool_outcomes)
         actions = [(name, outcome) for name, outcome in tool_outcomes
@@ -1880,6 +1887,11 @@ async def run_agent(
                 response = "The requested action was not completed because approval was denied."
                 await emit({"type": "text", "text": response})
                 return response
+        elif (_direct_outcome.status == "unknown"
+              and _name in {"send_email", "send_message", "forward_email", "reply_to_email"}):
+            response = _verified_final(_direct_outcome.text)
+            await emit({"type": "text", "text": response})
+            return response
         elif _direct_outcome.status in {"failed", "needs_input", "no_match", "unsupported"}:
             failed_tools.add(_name)
             if _direct_outcome.effect != "read":
@@ -2927,6 +2939,11 @@ async def run_agent(
                     response = "The requested action was not completed because approval was denied."
                     await emit({"type": "text", "text": response})
                     return response
+            elif (outcome.status == "unknown"
+                  and name in {"send_email", "send_message", "forward_email", "reply_to_email"}):
+                response = _verified_final(outcome.text)
+                await emit({"type": "text", "text": response})
+                return response
             elif outcome.status in {"failed", "needs_input", "unsupported"}:
                 failed_tools.add(name)
                 if outcome.effect != "read":

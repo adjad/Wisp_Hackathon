@@ -512,7 +512,13 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
         "to": recipients, "cc": _split_recipients(cc),
         "subject": subject or "", "body": body or "",
     })
-    if not res.get("ok"):
+    if res.get("ok") is not True or ("status" in res and res["status"] != "succeeded"):
+        if not (res.get("ok") is False and res.get("status") == "not_attempted"
+                and res.get("dispatch_started") is False):
+            from service.tools.registry import _OutboundUnknownResult
+            return _OutboundUnknownResult(
+                "Email outcome unknown — sending was not confirmed. Check Mail before trying again; do not retry automatically.",
+                operation="send_email", action_id=res.get("action_id") or "")
         return f"(the email was NOT sent: {res.get('error') or 'unknown error'})"
     return f"Email sent to {', '.join(recipients)}."
 
@@ -806,11 +812,19 @@ async def reply_to_email(message_id: str, body: str, reply_all: bool = False,
         "message_id": message_id, "body": body, "reply_all": bool(reply_all),
         "account": account, "expected_reply": expected,
     })
-    if res.get("ok") is not True:
-        return (f"(the reply was not confirmed as sent: {res.get('error') or 'unknown error'}. "
-                "Check Mail before trying again; do not retry automatically.)")
+    if res.get("ok") is not True or ("status" in res and res["status"] != "succeeded"):
+        if (res.get("ok") is False and res.get("status") == "not_attempted"
+                and res.get("dispatch_started") is False):
+            return f"(reply NOT sent: {res.get('error') or 'publication did not start'})"
+        from service.tools.registry import _OutboundUnknownResult
+        return _OutboundUnknownResult(
+            "Reply outcome unknown — sending was not confirmed. Check Mail before trying again; do not retry automatically.",
+            operation="reply_to_email", action_id=res.get("action_id") or "")
     if res.get("accepted") is not True or not envelope_matches(res.get("reply"), expected):
-        return "(reply outcome unknown — the bridge did not confirm the approved reply. Check Mail before trying again; do not retry automatically.)"
+        from service.tools.registry import _OutboundUnknownResult
+        return _OutboundUnknownResult(
+            "Reply outcome unknown — the bridge did not confirm the approved reply. Check Mail before trying again; do not retry automatically.",
+            operation="reply_to_email", action_id=res.get("action_id") or "")
     return make_receipt(expected)
 
 
@@ -1028,7 +1042,13 @@ async def forward_email(message_id: str, to: str, note: str = "") -> str:
     res = await app_request("forward_email", {
         "message_id": message_id, "to": resolved, "body": note,
     })
-    if not res.get("ok"):
+    if res.get("ok") is not True or ("status" in res and res["status"] != "succeeded"):
+        if not (res.get("ok") is False and res.get("status") == "not_attempted"
+                and res.get("dispatch_started") is False):
+            from service.tools.registry import _OutboundUnknownResult
+            return _OutboundUnknownResult(
+                "Forward outcome unknown — sending was not confirmed. Check Mail before trying again; do not retry automatically.",
+                operation="forward_email", action_id=res.get("action_id") or "")
         return f"(the forward was NOT sent: {res.get('error') or 'unknown error'})"
     return f"Forwarded to {', '.join(resolved)}."
 
@@ -1120,7 +1140,13 @@ async def send_message(to: str, text: str, confirmed_self_send: bool = False) ->
         return (f"(NOT sent — the message still has unfilled placeholders: "
                 f"{', '.join(holes[:4])}. Rewrite it with the real values.)")
     res = await app_request("send_message", {"to": to, "text": text})
-    if not res.get("ok"):
+    if res.get("ok") is not True or ("status" in res and res["status"] != "succeeded"):
+        if not (res.get("ok") is False and res.get("status") == "not_attempted"
+                and res.get("dispatch_started") is False):
+            from service.tools.registry import _OutboundUnknownResult
+            return _OutboundUnknownResult(
+                "Message outcome unknown — sending was not confirmed. Check Messages before trying again; do not retry automatically.",
+                operation="send_message", action_id=res.get("action_id") or "")
         return f"(the message was NOT sent: {res.get('error') or 'unknown error'})"
     return f"Message sent to {display}."
 

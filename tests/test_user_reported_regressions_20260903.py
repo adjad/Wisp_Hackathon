@@ -169,6 +169,7 @@ class UserReportedRegressions20260903(unittest.TestCase):
         with patch("service.assistant.sync_status.ensure_sources",
                    new=AsyncMock(return_value=readiness)), \
              patch.object(assistant_tools.assistant_store, "upcoming", return_value=events), \
+             patch.object(assistant_tools.assistant_store, "calendar_events_overlapping", return_value=events), \
              patch.object(assistant_tools.time, "time", return_value=1_799_999_000.0):
             default = asyncio.run(assistant_tools.get_upcoming(days=7))
             explicit = asyncio.run(assistant_tools.get_upcoming(days=7, include_holidays=True))

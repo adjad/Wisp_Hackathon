@@ -400,7 +400,9 @@ def test_adjacent_quoted_grocery_attempt_cannot_authorize_reminder_delete(knowle
 
 
 @pytest.mark.parametrize('prefix', ['Show me my', 'Can you please show my', 'Please can you show my',
-    'Could you please show me my', 'Would you show me my'])
+    'Could you please show me my', 'Would you show me my',
+    'Please, show my', 'Please,show my', 'Please , show my', 'Can you, please, show me my',
+    'Please, can you please, show my'])
 @pytest.mark.parametrize('closed', [False, True])
 def test_courteous_grocery_http_read_keeps_literal_selectors(knowledge_entrypoint, prefix, closed):
     state = knowledge_entrypoint

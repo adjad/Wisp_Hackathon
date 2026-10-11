@@ -6964,6 +6964,11 @@ async def _reminder_compound_boundary(text: str, request: _WebRequest) -> RouteD
 def _scheduled_send_review(text: str) -> RouteDecision | None:
     """Review recorded outgoing status; no inference from absence or resend."""
     value = mask_quoted(text)
+    canonical_read = bool(re.fullmatch(
+        r"\s*(?:please\s+)?(?:what(?:'s|\s+is)|"
+        r"(?:show|list|check)(?:\s+(?:me|what(?:'s|\s+is)))?|"
+        r"which\s+(?:e-?mails?|texts?|messages?|sends?)\s+are)\s+"
+        r"(?:currently\s+)?queued\s+to\s+send[.!?\s]*", text, re.I))
     outgoing = r"(?:sends?|e-?mails?|texts?|messages?|deliver(?:y|ies))"
     queue_hint = bool(re.search(
         rf"\b(?:outbound\s+queue|queued|pending\s+{outgoing}|future\s+{outgoing}|"
@@ -6989,9 +6994,13 @@ def _scheduled_send_review(text: str) -> RouteDecision | None:
         return None
     if not re.match(r"\s*(?:please\s+)?(?:what|which|show|list|check|review|inspect|was|were|did|is|are|cancel|stop)\b", value, re.I):
         return None
+    exact_cancel = re.fullmatch(
+        r"\s*(?:please\s+)?(?:cancel|stop)\s+(?:(?:the|my)\s+)?"
+        r"(?:queued|pending|scheduled)\s+(?:e-?mail|text|message|send|delivery)\s+"
+        r"(?:(?:with\s+)?id\s+)?(?P<id>[0-9a-f]{12})[.!?\s]*", text, re.I)
     # Other requested effects belong to the complete ordinary interpreter.
     if re.search(r"\b(?:send|draft|reply|forward|create|add|retry|resend)\b", value, re.I):
-        if not re.search(r"\b(?:safe\s+to\s+retry|outcome|status)\b", value, re.I):
+        if not canonical_read and exact_cancel is None and not re.search(r"\b(?:safe\s+to\s+retry|outcome|status)\b", value, re.I):
             return None
     cancel = bool(re.match(r"\s*(?:please\s+)?(?:cancel|stop)\b", value, re.I))
     if not cancel and re.search(r"\b(?:cancel|stop)\b", value, re.I):
@@ -7001,10 +7010,6 @@ def _scheduled_send_review(text: str) -> RouteDecision | None:
     ids = re.findall(r"\b[0-9a-f]{12}\b", value, re.I)
     if len(set(ids)) == 1:
         args = {"id": ids[0]}
-    exact_cancel = re.fullmatch(
-        r"\s*(?:please\s+)?(?:cancel|stop)\s+(?:(?:the|my)\s+)?"
-        r"(?:queued|pending|scheduled)\s+(?:e-?mail|text|message|send|delivery)\s+"
-        r"(?:(?:with\s+)?id\s+)?(?P<id>[0-9a-f]{12})[.!?\s]*", text, re.I) if cancel else None
     # A literal target belongs to the host contract. Conditional, multi-target
     # or otherwise unconsumed cancellation clauses must clarify after reading;
     # one unique ID appearing somewhere is not unconditional effect authority.
@@ -7019,12 +7024,17 @@ def _scheduled_send_review(text: str) -> RouteDecision | None:
         target = {"id": exact_cancel.group("id")}
         decision.tool_argument_bindings["list_scheduled_sends"] = target.copy()
         decision.tool_argument_bindings["cancel_scheduled_send"] = target.copy()
-    elif cancel and not may_cancel:
+    elif not may_cancel:
         decision.forbidden_tools |= frozenset({"cancel_scheduled_send"})
     decision.forbidden_tools |= frozenset({"schedule_send", "send_email", "send_message", "draft_email", "draft_message"})
     decision.resolved_request = (text + "\n\nInspect the recorded queue and preserve every recipient, time, body and status constraint. "
         "A pending-only view cannot establish prior outcomes. 'sent' means app acceptance, not recipient delivery. "
         "Never automatically retry an uncertain send; missing records cannot establish delivery or cancellation.")
+    if canonical_read:
+        from service.tools.registry import REGISTRY
+        decision.forbidden_tools |= frozenset(REGISTRY) - {"list_scheduled_sends"}
+        decision.tool_argument_bindings["list_scheduled_sends"] = {"status":"pending", "id":"", "count":20}
+        decision.verified_results_only = True
     if cancel and not may_cancel:
         decision.resolved_request += " Ask for an unconditional single exact-ID cancellation; no cancellation is authorized by this scoped route."
     return decision
@@ -7232,7 +7242,57 @@ def _arrival_plan(text: str) -> RouteDecision | None:
     return decision
 
 
+def _guard_scheduled_cancel(decision: RouteDecision, original_text: str) -> RouteDecision:
+    """Restrict queue cancellation using this public call's current prompt."""
+    read, cancel = "list_scheduled_sends", "cancel_scheduled_send"
+    envelope = _scheduled_send_review(original_text)
+    target = envelope.tool_argument_bindings.get(cancel) if envelope else None
+    # A discovered name, a classifier guess or a previous turn cannot grant
+    # effect authority. Keep the existing successful-read prerequisite intact;
+    # this guard never adds a capability or repairs missing argument bindings.
+    authorized = (
+        target is not None and set(target) == {"id"}
+        and decision.tool_argument_bindings.get(read) == target
+        and decision.tool_argument_bindings.get(cancel) == target
+        and decision.force_first_tool == read
+        and frozenset({read}) in decision.required_tool_groups
+        and read not in decision.forbidden_tools
+        and (decision.tool_subset is None or read in decision.tool_subset)
+        and not any(name == cancel for name, _ in decision.direct_calls)
+    )
+    if authorized:
+        return decision
+    decision.forbidden_tools |= frozenset({cancel})
+    if decision.tool_subset is not None:
+        decision.tool_subset = [name for name in decision.tool_subset if name != cancel]
+    decision.direct_calls = [(name, args) for name, args in decision.direct_calls if name != cancel]
+    if decision.force_first_tool == cancel:
+        decision.force_first_tool = None
+    decision.tool_argument_bindings = {
+        name: args for name, args in decision.tool_argument_bindings.items() if name != cancel}
+    decision.conditional_tools = tuple(
+        item for item in decision.conditional_tools if cancel not in item[:2])
+    # An empty obligation stays unsatisfied: stripping a forbidden action must
+    # not turn an incomplete request into apparent completion.
+    decision.required_tool_groups = tuple(group - {cancel} for group in decision.required_tool_groups)
+    decision.narration_after -= frozenset({cancel})
+    decision.strict_read_limits = {
+        name: limit for name, limit in decision.strict_read_limits.items() if name != cancel}
+    return decision
+
+
 async def route(text: str, *,
+                last_user: str | None = None,
+                recent_users: list[str] | None = None,
+                last_assistant: str | None = None,
+                last_tools: str | None = None) -> RouteDecision:
+    original_text = text
+    decision = await _route_impl(text, last_user=last_user, recent_users=recent_users,
+                                 last_assistant=last_assistant, last_tools=last_tools)
+    return _guard_scheduled_cancel(decision, original_text)
+
+
+async def _route_impl(text: str, *,
                 last_user: str | None = None,
                 recent_users: list[str] | None = None,
                 last_assistant: str | None = None,

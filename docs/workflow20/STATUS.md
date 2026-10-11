@@ -333,3 +333,59 @@ unsubscribe/open-history, live traffic/location, attendee invitations, unknown
 send receipts and frozen draft recipients still need separate implementation or
 qualification. Synthetic input does not authorize real communications or native
 side effects.
+
+## Public queue guard and app entry successor
+
+Frozen `63ed233e9b048ace5d6a29b5ca06a695ed1b0d27` remains blocked. Its
+202-gate full run finished with 199 passing gates, three failing gates, 28,234
+reported passes, five failures and 155 skips. Counts are incomplete for two
+gates. Independent audit blocked the actual app entry path. Distinct QA was
+interrupted by platform filtering; its sealed partial evidence is
+BLOCKED_INCOMPLETE and cannot count as acceptance. Existing seals and failing
+runs remain immutable. No filtered QA request was transferred or repeated.
+
+The successor suspends early interpreters and skill context for recognized
+recorded queue requests. Actual isolated HTTP tests now reach the checked queue
+read and cancellation path, while preserving unrelated stored plans and skills.
+A completely consumed queue-status read offers only the pending-list tool, with
+host-bound status, count and empty ID. Named discovery still requires a new
+exact-ID request. Literal queued-send cancellation now reaches the existing
+exact fullmatch before the generic send-word exclusion; its grammar is unchanged.
+Four prerepair failures for the supported literal queued-send forms are retained.
+
+Every normal return from public `route` now passes a cancellation-only guard.
+Its implementation body and public signature are preserved by AST checks. Only
+the current prompt can identify a cancellation target; prior conversation,
+resolved text and model output cannot. Both existing argument bindings must
+match the same literal ID, with the forced queue read and its successful-read
+obligation intact and no direct cancellation. Otherwise cancellation is forbidden
+and removed from all execution metadata. Other tools and constraints remain;
+empty obligations remain unsatisfied. This is a public-route boundary; workflow
+created decisions and arbitrary internal registry calls are outside its scope.
+App entry, actual loop, current-versus-history, concurrency, missing-prerequisite,
+view-only, race and repeat controls use disposable stores and scripted clients.
+
+The grocery prefix also recognizes these bounded courtesy-comma forms:
+`Please, show my`, `Please,show my`, `Please , show my`,
+`Can you, please, show me my`, and `Please, can you please, show my`.
+Ten own-builder prerepair failures are retained. Complete exact-selector reads
+stay reads, and malformed addressed reads clarify. This does not expand effect
+authority or claim arbitrary paraphrase coverage.
+
+Narrow fixture amendments supply the existing raw Calendar carrier in two
+Reminder-source tests and the single holiday-exclusion test. Existing event rows,
+legacy mocks and all their assertions remain unchanged. Compound queue tests
+now assert exact-ID clarification and read-only canonical queue inspection;
+unrelated pending-send, channel, status and planning assertions remain intact.
+
+The returned weather repair rejects compact datetime, ISO week-date and numeric
+`at` clock suffixes in location before fetch. Its own builder run retained 17
+prerepair failures and passed 379 exact-commit focused checks. Existing city,
+postal-code, date-only and range controls remain. This is bounded syntactic
+validation, with no real provider or hourly forecast qualification.
+
+Fresh full checks, both required CI jobs, independent audit and distinct QA are
+required after the new combined freeze. Local inference, device performance,
+real native effects and all-20 outcome qualification remain NOT_RUN. Unknown
+outbound receipts, recipient-bound draft cards, complete Calendar carriers and
+empty-availability completion remain separately scoped work.

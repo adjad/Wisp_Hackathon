@@ -95,7 +95,9 @@ def priority_read(text: str) -> PersonalRead | None:
                         {"collect_task_evidence": args})
 
 
-_GROCERY_READ_PREFIX = r"\s*(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?"
+_GROCERY_READ_PREFIX = (r"\s*(?:please(?:\s*,\s*|\s+))?"
+                        r"(?:(?:can|could|would)\s+you(?:\s*,\s*|\s+))?"
+                        r"(?:please(?:\s*,\s*|\s+))?")
 _GROCERY_READ_BASE = (r"(?:what\s+should\s+I\s+(?:get|buy|pick\s+up)\s+(?:for\s+)?(?:groceries|grocery\s+shopping|shopping)|"
             r"what(?:'s|\s+is)\s+on\s+(?:my\s+|the\s+)?(?:grocery|shopping)\s+list|"
             r"(?:show(?:\s+me)?|check|read|summari[sz]e)\s+(?:my\s+|the\s+)?(?:grocery|shopping)\s+list|"

@@ -278,6 +278,8 @@ async def lifespan(app: FastAPI):
     global client
     client = OMLXClient()
     profile = remote_only_profile()
+    from service.demo.founder import enabled as founder_demo_enabled
+    founder_demo_enabled()  # validate opt-in resource before serving the preview
     started_tasks = []
     if profile is not None:
         try:
@@ -2178,11 +2180,22 @@ async def delete_session(sid: str) -> dict[str, Any]:
 @app.get("/assistant/next")
 async def assistant_next() -> dict[str, Any]:
     """The single soonest active commitment — data for the notch countdown chip."""
+    from service.demo.founder import enabled, reminder_rows
+    if enabled():
+        now = time.time()
+        rows = assistant_store.calendar_events_overlapping(now, now + 60 * 86400) + reminder_rows(now)
+        rows = sorted((r for r in rows if r["when_ts"] >= now), key=lambda r:r["when_ts"])
+        return {"commitment": rows[0] if rows else None, "demo_reminders": True}
     return {"commitment": assistant_store.next_active()}
 
 
 @app.get("/assistant/upcoming")
 async def assistant_upcoming(days: int = 7) -> dict[str, Any]:
+    from service.demo.founder import enabled, reminder_rows
+    if enabled():
+        now = time.time();end = now + max(1, min(days, 60)) * 86400
+        rows = assistant_store.calendar_events_overlapping(now, end) + [r for r in reminder_rows(now) if now <= r["when_ts"] < end]
+        return {"commitments": sorted(rows, key=lambda r:r["when_ts"]), "demo_reminders": True}
     return {"commitments": assistant_store.upcoming(days=max(1, min(days, 60)))}
 
 
@@ -2219,6 +2232,9 @@ async def assistant_sync_calendar(body: dict[str, Any]) -> dict[str, Any]:
               if isinstance(raw_source, str) and raw_source.isascii() else None)
     if source is None:
         raise HTTPException(status_code=422, detail="source must be Calendar or Reminders")
+    from service.demo.founder import enabled, PROVENANCE
+    if source == "reminders" and enabled():
+        return {"ok": True, "synced": 0, "ignored_native_sync": True, "demo": PROVENANCE}
     diagnostics = body.get("diagnostics") or {}
     if (diagnostics.get("syncing") or diagnostics.get("authorized") is False
             or diagnostics.get("available") is False):

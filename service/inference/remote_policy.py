@@ -165,4 +165,9 @@ def require_local_models_disabled(operation: str) -> None:
 
 
 def remote_demo_tool_allowed(tool_name: str | None) -> bool:
-    return isinstance(tool_name, str) and tool_name in _READ_TOOLS
+    if not isinstance(tool_name, str):
+        return False
+    if tool_name in _READ_TOOLS:
+        return True
+    from service.demo.founder import enabled
+    return tool_name in {"search_notes", "lookup_contact", "list_contacts"} and enabled()

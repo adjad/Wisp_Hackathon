@@ -52,6 +52,10 @@ def _scheduled_source(source: str) -> dict:
 
 
 def source_status(source: str) -> dict:
+    from service.demo.founder import enabled, data, PROVENANCE
+    if source in {"notes", "reminders"} and enabled():
+        return {"id": source, "label": "Fictional demo " + _LABELS[source], "state": "ready",
+                "count": len(data()[source]), "reason": PROVENANCE, "demo": True}
     if source in {"calendar", "reminders"}:
         return _scheduled_source(source)
     if source == "email":
@@ -133,6 +137,11 @@ async def _ensure_sources(sources: Iterable[str], timeout_seconds: float = 2.5) 
     wanted = tuple(dict.fromkeys(sources))
     if not wanted:
         return {"sources": [], "syncing": False}
+    from service.demo.founder import enabled
+    if enabled() and any(s in {"notes", "reminders"} for s in wanted):
+        real = tuple(s for s in wanted if s not in {"notes", "reminders"})
+        result = await _ensure_sources(real, timeout_seconds) if real else {"syncing": False}
+        return {**result, "sources": [source_status(s) for s in wanted], "reminders_fresh": True}
     # A user retry after opening Mail must re-read it, not reuse the completed
     # local-only snapshot until the next five-minute timer. Completion of this
     # retry requires a NEW header push; the existing ready flag is not enough.
@@ -205,6 +214,9 @@ async def refresh_notes(timeout_seconds: float | None = None) -> dict:
     and is therefore never accepted as fresh; neither is a publish that carries
     no start stamp at all, since it cannot be told apart from that case.
     """
+    from service.demo.founder import enabled, PROVENANCE
+    if enabled():
+        return {"status": "fresh", "fresh": True, "timed_out": False, "age_seconds": 0, "reason": PROVENANCE, "demo": True}
     from service.tools import notes_tools as notes
     # Assumes the service and the Swift app share one host clock.
     requested_at = time.time()

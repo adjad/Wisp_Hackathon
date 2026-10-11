@@ -262,11 +262,13 @@ class Tool:
         return self.description if self.retrieval_description is None else self.retrieval_description
 
     def schema(self) -> dict:
+        from service.demo.founder import enabled, TOOL_DESCRIPTIONS
+        description = TOOL_DESCRIPTIONS.get(self.name, self.description) if enabled() else self.description
         return {
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
+                "description": description,
                 "parameters": self.parameters,
             },
         }

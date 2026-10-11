@@ -208,6 +208,31 @@ final class WispClient {
         return Commitment.parse(c)
     }
 
+    // GET /demo/aria/topbar -> the Aria demo's collapsed-bar data: the next
+    // synthetic event and at most one proactive chip carrying the nudge's hub
+    // payload (so a tap can show the same card). nil outside the demo.
+    struct AriaTopBar: Equatable {
+        let nextTitle: String
+        let nextLabel: String
+        let chipLabel: String
+        let chipEvent: NSDictionary?
+    }
+
+    func ariaTopBar() async -> AriaTopBar? {
+        var request = URLRequest(url: Self.baseURL.appendingPathComponent("demo/aria/topbar"))
+        request.timeoutInterval = 5
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              obj["enabled"] as? Bool == true else { return nil }
+        let next = obj["next"] as? [String: Any]
+        let chip = obj["chip"] as? [String: Any]
+        return AriaTopBar(nextTitle: next?["title"] as? String ?? "",
+                          nextLabel: next?["label"] as? String ?? "",
+                          chipLabel: chip?["label"] as? String ?? "",
+                          chipEvent: (chip?["event"] as? [String: Any]).map { NSDictionary(dictionary: $0) })
+    }
+
     // GET /assistant/upcoming -> next N days.
     func assistantUpcoming(days: Int = 7) async -> [Commitment] {
         let url = Self.baseURL.appendingPathComponent("assistant/upcoming")

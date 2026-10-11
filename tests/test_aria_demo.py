@@ -291,3 +291,93 @@ class StateSeparation(FullFixture):
                 self.assertTrue(Path(demo[key]).resolve().is_relative_to(home / 'aria-demo'))
                 self.assertFalse(Path(real[key]).resolve().is_relative_to(home / 'aria-demo'))
         self.assertEqual(json.loads(json.dumps(real['moe'])), demo['moe'])
+
+
+class ProactiveSurfaces(AriaFixture):
+    """Daily Summary + top bar in the demo come from the world and the REAL
+    behavior engine (persona-trained, week-long demo horizon)."""
+
+    def setUp(self):
+        super().setUp()
+        from datetime import datetime
+        from service.assistant import behavior_runtime as br
+        from service.assistant.hub import Hub
+        from service.assistant.store import AssistantStore
+        from service.behavior.engine import BehaviorEngine
+        from service.demo.aria.proactive import DEMO_NUDGE_HORIZON_S
+        tz = datetime.now().astimezone().tzinfo
+        self.now = datetime.now(tz).replace(hour=13, minute=0, second=0, microsecond=0).timestamp()
+        self.clock[0] = self.now
+        self.world.reset(self.now)
+        home = Path(os.environ['WISP_HOME']) / f'behavior-{id(self)}'
+        self.store = AssistantStore(home / 'assistant.db')
+        self.hub = Hub(self.store)
+        with patch.dict(os.environ, {'WISP_BEHAVIOR_PHRASER': '0'}):
+            self.rt = br.BehaviorRuntime(
+                home, mode='local', synthetic=True,
+                local_factory=lambda p: BehaviorEngine(p, min_horizon_s=DEMO_NUDGE_HORIZON_S),
+                calendar_sync_fn=lambda: {'available': True, 'last_sync': self.now},
+                session_db_fn=lambda: None, clock=lambda: self.now, calendar_grace_s=0.0)
+            asyncio.run(self.rt.tick(self.store, self.hub, now=self.now, force=True))
+        br.set_runtime(self.rt)
+        self.addCleanup(lambda: (br.set_runtime(None), self.rt.close()))
+
+    def test_engine_delivers_gym_conflict_and_likely_skip_on_the_demo_day(self):
+        from service.demo.aria.proactive import heads_up
+        items = heads_up(self.now)
+        kinds = [i['kind'] for i in items]
+        self.assertEqual(kinds[:2], ['habit_conflict', 'cancel_likely'])
+        self.assertIn('overlaps your workout', items[0]['title'])
+        self.assertEqual(items[0]['performed'], 'add_reminder')
+        self.assertEqual(items[1]['performed'], 'add_hold')
+        self.assertEqual(items[0]['event']['type'], 'nudge')
+        self.assertEqual(items[0]['event']['nudge_id'], items[0]['nudge_id'])
+
+    def test_topbar_next_event_and_chip(self):
+        from service.demo.aria.proactive import topbar
+        bar = topbar(self.now)
+        self.assertIsNotNone(bar['next'])
+        self.assertGreaterEqual(bar['next']['when_ts'], self.now)
+        self.assertTrue(bar['chip']['label'].startswith('⚠ Gym conflict'))
+        self.assertLessEqual(len(bar['chip']['label']), 28)
+        self.assertEqual(bar['chip']['event']['kind'], 'habit_conflict')
+
+    def test_daily_summary_heads_up_and_undo(self):
+        from service.demo.aria.proactive import heads_up, summary_sections
+        sections = summary_sections(self.now)
+        text = sections['FULL']
+        self.assertEqual(sections['READY'], '1')
+        self.assertIn('### Heads up', text)
+        self.assertIn('overlaps your workout', text)
+        self.assertIn('reminder added', text)
+        self.assertIn('tentative hold placed', text)
+        self.assertIn('### Mail', text)
+        self.assertIn('### Messages', text)
+        self.assertIn('Aria demo', text)
+        # Undo on the real nudge flows back into the summary.
+        first = heads_up(self.now)[0]
+        self.rt.undo(self.store, first['nudge_id'])
+        after = {i['nudge_id']: i for i in heads_up(self.now)}
+        # An undone nudge leaves the heads-up list (or shows nothing performed).
+        self.assertTrue(first['nudge_id'] not in after or after[first['nudge_id']]['performed'] == '')
+        self.assertNotIn('reminder added', summary_sections(self.now)['FULL'])
+
+    def test_brief_and_sync_status_never_wait_for_native_sources(self):
+        from service.assistant import brief, sync_status
+        snap = sync_status.sources_snapshot(['calendar', 'reminders', 'email', 'messages'])
+        self.assertFalse(snap['syncing'])
+        self.assertEqual({s['state'] for s in snap['sources']}, {'ready'})
+        started = asyncio.run(asyncio.wait_for(sync_status.ensure_daily_sources(timeout_seconds=20), 2))
+        self.assertFalse(started['syncing'])
+        with patch('service.demo.aria.proactive.time.time', return_value=self.now):
+            sections = asyncio.run(brief._sections('morning'))
+        self.assertIn('Heads up', sections['FULL'])
+
+    def test_topbar_endpoint(self):
+        client = TestClient(service.main.app)
+        with patch('service.demo.aria.proactive.time.time', return_value=self.now):
+            body = client.get('/demo/aria/topbar').json()
+        self.assertTrue(body['enabled'])
+        self.assertIn('Gym conflict', body['chip']['label'])
+        with patch.object(policy, '_ARIA_MODE', None):
+            self.assertEqual(client.get('/demo/aria/topbar').json(), {'enabled': False, 'next': None, 'chip': None})

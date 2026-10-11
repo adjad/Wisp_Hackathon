@@ -2050,6 +2050,12 @@ async def _sections(part_of_day: str, snapshot: dict | None = None) -> dict[str,
     model to render them. So anything thrown below degrades to that instead of to
     nothing, and the traceback goes to stderr for whoever is debugging.
     """
+    from service.inference.remote_policy import aria_demo_mode
+    if aria_demo_mode():
+        # The Aria demo's brief comes from its synthetic world and the demo's
+        # behavior nudges, never from native caches (service/demo/aria).
+        from service.demo.aria.proactive import summary_sections
+        return await asyncio.to_thread(summary_sections)
     # Restored caches are intentionally not enough for any Daily Summary
     # source. Ask the Swift app for current Calendar, Reminders, Mail, and
     # Messages reads, then name anything still in flight deterministically.

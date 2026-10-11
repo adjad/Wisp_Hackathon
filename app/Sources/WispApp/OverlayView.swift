@@ -83,10 +83,11 @@ struct OverlayView: View {
     // Collapsed: a black bar that wraps the notch (physical or virtual) on a
     // MacBook; on a monitor, a small capsule under the menu bar. Hover to open.
     // The Intel founder preview hides the collapsed bar (hover still opens the
-    // panel). Intel v5 does so only while the Aria demo is running.
+    // panel). Intel v5 shows it in both modes; in the Aria demo it also carries
+    // the next event and a proactive chip (ariaBarContent).
     private var hideNotchBar: Bool {
 #if WISP_REMOTE_FULL
-        return model.ariaDemo
+        return false
 #elseif WISP_REMOTE_ONLY_DEMO
         return true
 #else
@@ -106,6 +107,9 @@ struct OverlayView: View {
                     .padding(.bottom, 5)
                     .opacity(breathe ? 0.3 : 1)
                     .animation(.easeInOut(duration: 1).repeatForever(autoreverses: true), value: breathe)
+            } else if model.ariaDemo, let bar = model.ariaTopBar, !(isNotch && !layout.isVirtualNotch),
+                      !(bar.chipLabel.isEmpty && bar.nextTitle.isEmpty) {
+                ariaBarContent(bar)
             } else if !isNotch {
                 HStack(spacing: 8) {
                     orb.scaleEffect(0.7)
@@ -124,8 +128,43 @@ struct OverlayView: View {
         .contentShape(Rectangle())
         // Hover-to-expand is driven by the panel's tracking area; tap is a
         // fallback for click-to-open.
-        .onTapGesture { model.requestExpand() }
-        .help(hideNotchBar ? "" : "Wisp — hover to open (⌥Space)")
+        .onTapGesture {
+            if model.ariaDemo, model.ariaTopBar?.chipEvent != nil {
+                model.openAriaChip()
+            } else {
+                model.requestExpand()
+            }
+        }
+        .help(hideNotchBar ? "" : ariaBarHelp ?? "Wisp — hover to open (⌥Space)")
+    }
+
+    private var ariaBarHelp: String? {
+        guard model.ariaDemo, let bar = model.ariaTopBar, !bar.nextTitle.isEmpty else { return nil }
+        return "Next: \(bar.nextTitle) (\(bar.nextLabel))" + (bar.chipLabel.isEmpty ? "" : " — click for details")
+    }
+
+    // Aria demo: one compact line in the collapsed bar — the proactive chip
+    // when there is one, else the next event. Text never sits under a physical
+    // camera housing (the caller only shows this on a floating or virtual bar).
+    private func ariaBarContent(_ bar: WispClient.AriaTopBar) -> some View {
+        Group {
+            if !bar.chipLabel.isEmpty {
+                Text(bar.chipLabel)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Theme.textPrimary)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(Capsule().fill(Theme.chipFill))
+                    .overlay(Capsule().stroke(Theme.chipStroke, lineWidth: 1))
+            } else {
+                Text("\(bar.nextLabel) · \(bar.nextTitle)")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Theme.textSecondary)
+            }
+        }
+        .lineLimit(1)
+        .truncationMode(.tail)
+        .padding(.horizontal, 8)
+        .padding(.bottom, isNotch ? 7 : 6)
     }
 
     private var header: some View {

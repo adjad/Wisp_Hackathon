@@ -145,6 +145,13 @@ def _default_local_factory(path: Path):
     if os.environ.get("WISP_BEHAVIOR_PHRASER", "1") != "0":
         from service.assistant.behavior_phraser import WispPhraser
         phraser = WispPhraser()
+    from service.demo.aria import env_requested as aria_demo
+    if aria_demo():
+        # The persona plants its next gym-morning conflict and Tue/Thu
+        # back-to-back run within the coming week; look that far so the demo
+        # shows them on any day.
+        from service.demo.aria.proactive import DEMO_NUDGE_HORIZON_S
+        return BehaviorEngine(path, phraser=phraser, min_horizon_s=DEMO_NUDGE_HORIZON_S)
     return BehaviorEngine(path, phraser=phraser)
 
 

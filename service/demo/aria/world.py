@@ -184,6 +184,7 @@ class World:
                                       m["ts"] + shift, int(m["unread"]), None, sender))
             self._set_meta("schema_version", str(SCHEMA_VERSION))
             self._set_meta("seeded_at", str(now))
+            self._set_meta("calendar_day", day.isoformat())
         return self.counts()
 
     def _chat_for(self, contact: dict | None, name: str) -> tuple[str, str]:
@@ -193,6 +194,27 @@ class World:
                                (contact.get("phone") or "", contact.get("email") or "")):
                 return row["thread_id"], row["contact"]
         return "chat:" + re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-"), name
+
+    def refresh_calendar(self, now: float | None = None) -> int:
+        """Once per local day, add the persona's calendar for the current
+        window (the behavior engine re-plants its next gym conflict and
+        back-to-back run daily). Existing rows, including events the demo
+        cancelled or added, are kept as they are."""
+        now = self.clock() if now is None else now
+        today = datetime.fromtimestamp(now, _local_tz()).date().isoformat()
+        if self.meta("calendar_day") == today:
+            return 0
+        from service.behavior.persona import generate_persona
+        from service.behavior.timeutil import resolve_tz, tz_name
+        persona = generate_persona(now, tz=tz_name(resolve_tz(None)))
+        added = 0
+        with self._lock, self._db:
+            for e in persona.calendar_events:
+                added += self._db.execute("INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?,?)",
+                                          (e["demo_id"], e["title"], e["start_ts"], e.get("end_ts"),
+                                           e.get("location") or "", e.get("notes") or "", "active")).rowcount
+            self._set_meta("calendar_day", today)
+        return added
 
     def _insert_message(self, mid, contact, handle, direction, text, ts, *, unread, demo_action=None,
                         thread=None, sender=None):

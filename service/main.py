@@ -2451,6 +2451,11 @@ async def assistant_daily_summary(body: dict[str, Any] | None = None) -> dict[st
     from service.assistant.sync_status import ensure_daily_sources
     from datetime import datetime as _dt
     part = "morning" if _dt.now().hour < 12 else "evening"
+    if aria_demo_mode():
+        # Demo: no native sources to wait for; bring the demo's nudges current
+        # so the summary's Heads up section reflects them (cards arrive too).
+        from service.demo.aria.proactive import refresh_behavior
+        await refresh_behavior(assistant_store, assistant_hub)
     # Never present restored caches as current before source readiness. Awaited
     # ONCE, here, and handed to _sections — which used to repeat the same wait.
     snapshot = await ensure_daily_sources(timeout_seconds=_SOURCE_WAIT_S)
@@ -2803,6 +2808,16 @@ async def aria_demo_status() -> dict[str, Any]:
     return await asyncio.to_thread(aria_tools.status)
 
 
+@app.get("/demo/aria/topbar")
+async def aria_demo_topbar() -> dict[str, Any]:
+    """The collapsed top bar in the demo: next synthetic event + one proactive
+    chip (from the demo's delivered behavior nudges). Empty outside the demo."""
+    if not aria_demo_mode():
+        return {"enabled": False, "next": None, "chip": None}
+    from service.demo.aria.proactive import topbar
+    return {"enabled": True, **(await asyncio.to_thread(topbar))}
+
+
 @app.post("/demo/aria/reset")
 async def aria_demo_reset() -> dict[str, Any]:
     """Restore the Aria demo's seeded world and clear its learned behavior.
@@ -2820,6 +2835,10 @@ async def aria_demo_reset() -> dict[str, Any]:
         await asyncio.to_thread(behavior_runtime.clear_demo_state, assistant_store)
     await asyncio.to_thread(aria_tools.mirror)
     await assistant_hub.publish({"type": "changed"})
+    # Re-learn the persona and re-fire today's nudges (fresh budget) in the
+    # background, so the reset returns at once.
+    from service.demo.aria.proactive import refresh_behavior
+    asyncio.create_task(refresh_behavior(assistant_store, assistant_hub))
     return {"ok": True, "counts": counts}
 
 

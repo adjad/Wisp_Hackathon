@@ -559,7 +559,8 @@ async def tick(hub, now: float | None = None) -> list[dict]:
     import asyncio
     now = time.time() if now is None else now
     delivered = await asyncio.to_thread(get_world().deliver_due, now)
-    if delivered or now - _last_mirror >= MIRROR_EVERY_S:
+    refreshed = await asyncio.to_thread(get_world().refresh_calendar, now)
+    if delivered or refreshed or now - _last_mirror >= MIRROR_EVERY_S:
         await asyncio.to_thread(mirror)
         _last_mirror = now
         await hub.publish({"type": "changed"})

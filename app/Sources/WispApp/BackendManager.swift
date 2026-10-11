@@ -157,8 +157,8 @@ final class BackendManager {
             proc.environment?["WISP_REMOTE_ONLY"] = "1"
 #endif
 #if WISP_REMOTE_FULL
-            // Intel v5: real mode (WISP_REMOTE_FULL=1) or the Aria demo
-            // (WISP_FOUNDER_DEMO=1), chosen per launch; never both.
+            // Intel v5: both modes use remote-full; the runtime Aria flag
+            // selects demo behavior, and WISP_FOUNDER_DEMO is always removed.
             if var environment = proc.environment {
                 AriaDemoMode.applyBackendMode(demo: AriaDemoMode.isOn(), to: &environment)
                 proc.environment = environment

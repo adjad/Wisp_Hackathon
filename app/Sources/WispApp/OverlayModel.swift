@@ -181,7 +181,9 @@ final class OverlayModel: ObservableObject {
     // Behavior-engine nudges shown as cards at the top of the panel (newest
     // first, see NudgeViews.swift). Each also arrives as a notification.
     @Published var nudges: [BehaviorNudge] = []
+    @Published var transientNotice: String?
     private var assistantTask: Task<Void, Never>?
+    private var transientNoticeTask: Task<Void, Never>?
     // The last scheduled brief this session notified about. The SSE stream is
     // re-subscribed after any drop, so the same brief can arrive twice.
 
@@ -929,6 +931,16 @@ final class OverlayModel: ObservableObject {
     func refreshAssistant() {
         Task { [weak self] in
             self?.summaryPeriod = await self?.client.summarySchedule() ?? "AM"
+        }
+    }
+
+    func showTransientNotice(_ message: String, duration: TimeInterval = 4) {
+        transientNoticeTask?.cancel()
+        transientNotice = message
+        transientNoticeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, duration) * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.transientNotice = nil
         }
     }
 

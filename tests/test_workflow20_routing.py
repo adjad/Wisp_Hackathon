@@ -925,3 +925,146 @@ def test_public_weather_does_not_use_personal_data_voice():
     assert decision.direct_calls == [('get_weather', {'location':'Tokyo','period':''})]
     assert decision.tool_subset == ['get_weather']
     assert not decision.light_read
+
+
+@pytest.fixture
+def exact_cancel_queue(tmp_path, monkeypatch):
+    from service.assistant import outbound_queue as queues
+    from service.assistant.outbound_queue import OutboundQueue
+    from service.tools import action_tools
+    from service.safety import policy, grants
+    from service.agent import loop
+    import socket
+    import subprocess
+    queue = OutboundQueue(tmp_path / 'fictional-cancel.sqlite')
+    monkeypatch.setattr(queues, 'outbound_queue', queue)
+    def forbidden(*args, **kwargs): raise AssertionError('no native/network/model effects')
+    async def async_forbidden(*args, **kwargs): forbidden()
+    monkeypatch.setattr(socket.socket, 'connect', forbidden)
+    monkeypatch.setattr(socket.socket, 'connect_ex', forbidden)
+    monkeypatch.setattr(subprocess, 'Popen', forbidden)
+    monkeypatch.setattr(action_tools, 'app_request', async_forbidden)
+    from service.assistant import outbox
+    monkeypatch.setattr(outbox, 'request', async_forbidden)
+    monkeypatch.setattr(policy, '_FULL_ACCESS', False)
+    monkeypatch.setattr(policy, '_READ_ONLY', False)
+    monkeypatch.setattr(grants, 'check', lambda *args, **kwargs: None)
+    monkeypatch.setattr(loop, 'audit', lambda *args, **kwargs: None)
+    monkeypatch.setattr('service.memory.identity.identity_prompt_block', lambda **kwargs: '')
+    yield queue
+    queue._db.close()
+
+
+def _exact_cancel_loop(monkeypatch, queue, *, read_error=False, missing=False, read_only=False,
+                       claim_after_read=False, duplicate=False, suffix='', quoted_id=False, malformed_id=False):
+    from service.agent import loop
+    from service.safety import policy
+    from tests.test_direct_dispatch_exec import ScriptedClient, Approver, _tool_call
+    a = queue.add(channel='email', recipient='a@synthetic.invalid', body='Fixture A', when_ts=2000000000)
+    b = queue.add(channel='email', recipient='b@synthetic.invalid', body='Fixture B', when_ts=2000000000)
+    target = '000000000000' if missing else a
+    selector = target + '0' if malformed_id else target
+    prompt = f'Cancel pending email ' + (f'"{selector}"' if quoted_id else selector) + suffix
+    decision = asyncio.run(R.route(prompt))
+    monkeypatch.setattr(policy, '_READ_ONLY', read_only)
+    actual = loop.run_tool
+    calls = []
+    async def run(tool, args):
+        calls.append((tool.name, dict(args)))
+        if tool.name == 'list_scheduled_sends' and read_error:
+            return '(error: synthetic queue read unavailable)'
+        result = await actual(tool, args)
+        if tool.name == 'list_scheduled_sends' and claim_after_read:
+            assert queue.claim(a)
+        return result
+    monkeypatch.setattr(loop, 'run_tool', run)
+    script = [{'tool_calls': [_tool_call('list_scheduled_sends', {'id': b}, 'read')]},
+              {'tool_calls': [_tool_call('cancel_scheduled_send', {'id': b}, 'cancel')]}]
+    if duplicate:
+        script.append({'tool_calls': [_tool_call('cancel_scheduled_send', {'id': b}, 'duplicate')]})
+    script.append({'content': 'Synthetic result; actual state is asserted separately.'})
+    client, approver, events = ScriptedClient(script), Approver(), []
+    async def emit(event): events.append(event)
+    asyncio.run(loop.run_agent(client, 'Agents-A1-4B-oQe6', [{'role':'user','content':prompt}],
+        emit, approver, tools=decision.tool_subset, force_first_tool=decision.force_first_tool,
+        expect_tool_first=decision.expect_tool_first, required_tool_groups=decision.required_tool_groups,
+        tool_argument_bindings=decision.tool_argument_bindings, forbidden_tools=decision.forbidden_tools,
+        multi_round=decision.multi_round, include_memory_context=False, max_steps=8))
+    return a, b, target, calls, events
+
+
+def test_exact_cancel_actual_loop_cannot_switch_to_another_pending_id(monkeypatch, exact_cancel_queue):
+    queue = exact_cancel_queue
+    a, b, _, calls, events = _exact_cancel_loop(monkeypatch, queue, duplicate=True)
+    states = {key: queue.get(key)['status'] for key in (a, b)}
+    assert states == {a:'cancelled', b:'pending'}, (states, calls)
+    assert calls == [('list_scheduled_sends', {'id': a}), ('cancel_scheduled_send', {'id': a})]
+    assert any(event['type'] == 'tool_result' and event['result'].startswith('Cancelled [' + a) for event in events)
+
+
+@pytest.mark.parametrize('prompt', [
+    'Cancel pending email abcdef123456', 'Please stop my queued text ID abcdef123456.',
+    'Cancel the scheduled message with ID abcdef123456!', 'Stop queued delivery abcdef123456',
+])
+def test_exact_cancel_complete_clause_binds_same_literal_to_both_tools(prompt):
+    decision = asyncio.run(R.route(prompt))
+    assert decision.tool_argument_bindings['list_scheduled_sends'] == {'id':'abcdef123456'}
+    assert decision.tool_argument_bindings['cancel_scheduled_send'] == {'id':'abcdef123456'}
+    assert decision.required_tool_groups == (frozenset({'list_scheduled_sends'}),)
+    assert decision.force_first_tool == 'list_scheduled_sends' and not decision.direct_calls
+
+
+@pytest.mark.parametrize('prompt', [
+    'Cancel pending email abcdef123456 if Maya agrees',
+    'Cancel pending email abcdef123456 unless it is urgent',
+    'Cancel pending email abcdef123456 and abcdef123457',
+    'Cancel pending email abcdef123456 but keep abcdef123456',
+    'Cancel pending email abcdef123456 containing "if Maya agrees"',
+    'Cancel pending email abcdef123456 tomorrow',
+    'Cancel pending email abcdef123456 "if Maya agrees"',
+    'Cancel pending email abcdef1234567 if Maya agrees',
+    'Cancel pending email abcdef12345 unless it is urgent',
+    'Cancel pending email',
+    'Cancel pending ID abcdefabcde email',
+])
+def test_exact_cancel_unconsumed_conditions_never_offer_cancellation(prompt):
+    decision = asyncio.run(R.route(prompt))
+    assert 'cancel_scheduled_send' not in decision.tool_subset
+    assert 'cancel_scheduled_send' in decision.forbidden_tools
+    assert 'cancel_scheduled_send' not in decision.tool_argument_bindings
+
+
+@pytest.mark.parametrize('mode', ['read_error','missing','read_only','claim_after_read'])
+def test_exact_cancel_actual_loop_negative_outcomes_never_touch_other_id(monkeypatch, exact_cancel_queue, mode):
+    queue = exact_cancel_queue
+    a, b, target, calls, events = _exact_cancel_loop(monkeypatch, queue, **{mode:True})
+    assert queue.get(b)['status'] == 'pending'
+    assert queue.get(a)['status'] == ('sending' if mode == 'claim_after_read' else 'pending')
+    assert not any(event['type']=='tool_result' and event['result'].startswith('Cancelled [') for event in events)
+    assert all(args['id'] == target for _, args in calls)
+    if mode in {'read_error','read_only'}:
+        assert all(name != 'cancel_scheduled_send' for name, _ in calls)
+
+
+@pytest.mark.parametrize('suffix', [' if Maya agrees', ' unless it is urgent', ' "if Maya agrees"'])
+def test_exact_cancel_actual_loop_conditional_request_cannot_mutate(monkeypatch, exact_cancel_queue, suffix):
+    queue = exact_cancel_queue
+    a, b, _, calls, events = _exact_cancel_loop(monkeypatch, queue, suffix=suffix)
+    assert queue.get(a)['status'] == queue.get(b)['status'] == 'pending'
+    assert all(name != 'cancel_scheduled_send' for name, _ in calls)
+    assert not any(event['type']=='tool_result' and event['result'].startswith('Cancelled [') for event in events)
+
+
+@pytest.mark.parametrize('suffix', ['', ' if Maya agrees'])
+def test_exact_cancel_quoted_id_never_grants_unbound_effect(monkeypatch, exact_cancel_queue, suffix):
+    queue = exact_cancel_queue
+    a, b, _, calls, _ = _exact_cancel_loop(monkeypatch, queue, quoted_id=True, suffix=suffix)
+    assert queue.get(a)['status'] == queue.get(b)['status'] == 'pending', calls
+    assert all(name != 'cancel_scheduled_send' for name, _ in calls)
+
+
+def test_exact_cancel_malformed_id_never_grants_unbound_effect(monkeypatch, exact_cancel_queue):
+    queue = exact_cancel_queue
+    a, b, _, calls, _ = _exact_cancel_loop(monkeypatch, queue, malformed_id=True, suffix=' if Maya agrees')
+    assert queue.get(a)['status'] == queue.get(b)['status'] == 'pending', calls
+    assert all(name != 'cancel_scheduled_send' for name, _ in calls)

@@ -6998,14 +6998,33 @@ def _scheduled_send_review(text: str) -> RouteDecision | None:
     ids = re.findall(r"\b[0-9a-f]{12}\b", value, re.I)
     if len(set(ids)) == 1:
         args = {"id": ids[0]}
-    tools = ["list_scheduled_sends"] + (["cancel_scheduled_send"] if cancel else [])
+    exact_cancel = re.fullmatch(
+        r"\s*(?:please\s+)?(?:cancel|stop)\s+(?:(?:the|my)\s+)?"
+        r"(?:queued|pending|scheduled)\s+(?:e-?mail|text|message|send|delivery)\s+"
+        r"(?:(?:with\s+)?id\s+)?(?P<id>[0-9a-f]{12})[.!?\s]*", text, re.I) if cancel else None
+    # A literal target belongs to the host contract. Conditional, multi-target
+    # or otherwise unconsumed cancellation clauses must clarify after reading;
+    # one unique ID appearing somewhere is not unconditional effect authority.
+    has_literal_id = bool(re.search(r"\b[0-9a-f]{12}\b", text, re.I))
+    named_discovery = named_cancel and not has_literal_id and not re.search(
+        r"\b(?:queued|pending|scheduled|id)\b", value, re.I)
+    may_cancel = cancel and (exact_cancel is not None or named_discovery)
+    tools = ["list_scheduled_sends"] + (["cancel_scheduled_send"] if may_cancel else [])
     decision = _mk_scoped(tools, "recorded scheduled-send review; delivery unverified", force="list_scheduled_sends", light=False)
     decision.required_tool_groups = (frozenset({"list_scheduled_sends"}),)
     decision.tool_argument_bindings["list_scheduled_sends"] = args
+    if exact_cancel is not None:
+        target = {"id": exact_cancel.group("id")}
+        decision.tool_argument_bindings["list_scheduled_sends"] = target.copy()
+        decision.tool_argument_bindings["cancel_scheduled_send"] = target.copy()
+    elif cancel and not may_cancel:
+        decision.forbidden_tools |= frozenset({"cancel_scheduled_send"})
     decision.forbidden_tools |= frozenset({"schedule_send", "send_email", "send_message", "draft_email", "draft_message"})
     decision.resolved_request = (text + "\n\nInspect the recorded queue and preserve every recipient, time, body and status constraint. "
         "A pending-only view cannot establish prior outcomes. 'sent' means app acceptance, not recipient delivery. "
         "Never automatically retry an uncertain send; missing records cannot establish delivery or cancellation.")
+    if cancel and not may_cancel:
+        decision.resolved_request += " Ask for an unconditional single exact-ID cancellation; no cancellation is authorized by this scoped route."
     return decision
 
 

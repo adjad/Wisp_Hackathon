@@ -1,8 +1,10 @@
 """Mac-side runtime for the behavior engine: feed it, run it, act on it.
 
-Off unless ``WISP_BEHAVIOR=1`` or ``WISP_FOUNDER_DEMO=1`` (the founder demo
-build turns it on automatically). ``WISP_BEHAVIOR_SYNTHETIC_ONLY=1`` (implied
-by the founder demo) learns from the synthetic persona instead of real data.
+Off unless ``WISP_BEHAVIOR=1``, ``WISP_FOUNDER_DEMO=1`` or the full remote
+build (``WISP_REMOTE_ONLY=1`` + ``WISP_REMOTE_FULL=1``) turns it on;
+``WISP_BEHAVIOR=0`` always wins. ``WISP_BEHAVIOR_SYNTHETIC_ONLY=1`` (implied
+by the founder demo only) learns from the synthetic persona instead of real
+data; the full remote build learns from real activity.
 
 Brain
     ``local`` (default): an in-process ``BehaviorEngine`` at
@@ -121,8 +123,10 @@ def brain_mode() -> str:
 
 
 def _home() -> Path:
-    from service.paths import moe_dir
-    return moe_dir()
+    # The Aria demo's synthetic persona learns into its own state directory
+    # (service.paths.state_dir), never the real-mode behavior.db.
+    from service.paths import state_dir
+    return state_dir()
 
 
 # --------------------------------------------------------------------------

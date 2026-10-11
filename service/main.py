@@ -15,7 +15,8 @@ load/swap) that has no other visible signal — see OMLXClient.ensure_only.
 from __future__ import annotations
 
 import asyncio
-from service.inference.remote_policy import remote_only_profile, require_generation_role, require_local_models_disabled
+from service.inference.remote_policy import (remote_full_mode, remote_only_profile, remote_read_only_mode,
+                                             require_generation_role, require_local_models_disabled)
 import json
 import os
 import re
@@ -355,6 +356,18 @@ async def lifespan(app: FastAPI):
         started_tasks.append(asyncio.create_task(nodes.run()))
         from service.memory.api import worker as memory_worker
         started_tasks.append(asyncio.create_task(memory_worker.run(client)))
+    elif remote_full_mode():
+        # The full remote build (Intel v5) runs the assistant scheduler as on a
+        # Mac with local models: due reminders and holds, the daily brief,
+        # user-approved scheduled sends, and behavior ticks (on by default in
+        # this build; WISP_BEHAVIOR=0 still turns them off). The scheduler never
+        # starts or loads oMLX; its only model call is the behavior phraser,
+        # which goes to the pinned GX10 target and stands down while a chat
+        # turn is in flight. Deliberately NOT started here: the oMLX warmup and
+        # idle unloader (local engine only), Super Model warmup, proactive
+        # nodes (other hosts), and conversation-memory capture (local model
+        # only; it would idle anyway since the fast role is unmanaged).
+        started_tasks.append(asyncio.create_task(assistant_scheduler.run()))
     else:
         # The remote-only build starts no assistant scheduler, so behavior
         # learning (on automatically in the founder demo) runs its own loop.
@@ -475,6 +488,22 @@ async def shutdown_omlx() -> dict[str, Any]:
         return {"stopped": True}
     except FileNotFoundError:
         return {"stopped": False}
+
+
+# Full remote build: history the agent sees per turn. The GX10 contract is a
+# 32k-token window and a 131,072-byte messages+tools aggregate, and the remote
+# fit refuses to trim selected messages, so history must leave room for the
+# system prompt, up to 32 tool schemas, tool results and the output budget.
+# The local formula below would give old turns ~20k tokens (~80 KB); 6k tokens
+# (~24 KB) keeps the last few turns for follow-ups like "reply to that".
+_REMOTE_FULL_HISTORY_TOKENS = 6000
+
+
+def _history_budget(target: Target) -> int:
+    budget = max(1500, target.context_window - 11500)
+    if remote_full_mode():
+        budget = min(budget, _REMOTE_FULL_HISTORY_TOKENS)
+    return budget
 
 
 def _direct_generation_budget(target: Target) -> tuple[int, bool]:
@@ -1718,14 +1747,14 @@ async def agent(body: dict[str, Any]):
 
             user_msg: dict[str, Any] = {
                 "role": "user",
-                "content": prompt if super_model_cloud or remote_only_profile() is not None else (decision.resolved_request or prompt),
+                "content": prompt if super_model_cloud or remote_read_only_mode() else (decision.resolved_request or prompt),
             }
             schedule_read = (not (workflow_turn and workflow_turn.decision)
                              and _current_schedule_source_route(decision, prompt))
             # Test mode is stateless (see the endpoint docstring) — the prompt
             # stands alone, with no session history loaded or built on.
-            messages = ([user_msg] if super_model_cloud or remote_only_profile() is not None else _tool_turn_messages(
-                sid, user_msg, max_tokens=max(1500, target.context_window - 11500),
+            messages = ([user_msg] if super_model_cloud or remote_read_only_mode() else _tool_turn_messages(
+                sid, user_msg, max_tokens=_history_budget(target),
                 test_mode=test_mode,
                 verified_results_only=(decision.verified_results_only or
                                        schedule_read),
@@ -1805,7 +1834,7 @@ async def agent(body: dict[str, Any]):
                              + "".join("\n" + guidance for guidance in synthesis_guidance)
                              + (workflow_turn.plan.prompt_block()
                                 if workflow_turn and workflow_turn.decision else ""))
-                if remote_only_profile() is not None and _agent_memory_context_allowed(
+                if remote_read_only_mode() and _agent_memory_context_allowed(
                         decision, cloud=super_model_cloud,
                         grounded_workflow=bool(workflow_turn and workflow_turn.decision),
                         schedule_read=schedule_read):
@@ -1814,8 +1843,8 @@ async def agent(body: dict[str, Any]):
                     # the same gate the memory block uses elsewhere.
                     from service.memory.prompt_blocks import remote_only_context_block
                     style_hint += remote_only_context_block()
-                if remote_only_profile() is not None:
-                    # Remote-only sends the raw prompt, not decision.resolved_request,
+                if remote_read_only_mode():
+                    # Read-only remote sends the raw prompt, not decision.resolved_request,
                     # so a behavior route's "answer only from these results"
                     # instruction rides in the style hint instead (a few hundred
                     # bytes, well inside the gateway's budget).
@@ -1832,7 +1861,7 @@ async def agent(body: dict[str, Any]):
                                         short_circuit_tools=_PRESYNTHESIZED_TOOLS,
                                         style_hint=style_hint or None,
                                         public_web_synthesis=super_model_cloud,
-                                        include_memory_context=remote_only_profile() is None and _agent_memory_context_allowed(
+                                        include_memory_context=not remote_read_only_mode() and _agent_memory_context_allowed(
                                             decision, cloud=super_model_cloud,
                                             grounded_workflow=bool(workflow_turn and
                                                                    workflow_turn.decision),
@@ -1888,7 +1917,7 @@ async def agent(body: dict[str, Any]):
                 # tool-free. Excluded for "coding" too: several of the
                 # style rules (no em/en dashes, no hyphenated compounds) are
                 # prose-specific and could otherwise bleed into code syntax.
-                if remote_only_profile() is not None:
+                if remote_read_only_mode():
                     # Only the learned profile card rides along here; every
                     # other memory/skill context stays off in this build.
                     from service.memory.prompt_blocks import remote_only_context_block
@@ -2332,7 +2361,7 @@ async def assistant_sync_calendar(body: dict[str, Any]) -> dict[str, Any]:
 @app.post("/assistant/commitments")
 async def assistant_add(body: dict[str, Any]) -> dict[str, Any]:
     """Manually add a reminder/event. Accepts when_ts (epoch) or when_iso."""
-    if remote_only_profile() is not None:
+    if remote_read_only_mode():
         raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     title = str(body.get("title") or "").strip()
     if not title:
@@ -2356,7 +2385,7 @@ async def assistant_add(body: dict[str, Any]) -> dict[str, Any]:
 @app.post("/assistant/commitments/{cid}")
 async def assistant_update(cid: str, body: dict[str, Any]) -> dict[str, Any]:
     """Mark a commitment done/dismissed (status)."""
-    if remote_only_profile() is not None:
+    if remote_read_only_mode():
         raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     status = str(body.get("status") or "").strip()
     if status not in {"active", "done", "dismissed"}:
@@ -2490,6 +2519,12 @@ async def assistant_sync_emails(body: dict[str, Any]) -> dict[str, Any]:
 async def assistant_sync_notes(body: dict[str, Any]) -> dict[str, Any]:
     """Receive raw Notes.app content from the Swift app (which holds Notes
     Automation access) so search_notes can look through it verbatim."""
+    from service.demo.founder import enabled, PROVENANCE
+    if enabled():
+        # The Aria demo answers Notes from fictional fixtures. In the Intel v5
+        # build the app's Notes reader may still be running from real mode, so
+        # real note content is refused here rather than cached.
+        return {"ok": True, "ignored_native_sync": True, "demo": PROVENANCE}
     from service.tools.notes_tools import cache_notes
     diag = body.get("diagnostics") or {}
     cache_notes(str(body.get("raw") or ""), available=bool(diag.get("available", True)),
@@ -2548,7 +2583,7 @@ async def assistant_delete(cid: str) -> dict[str, Any]:
     """Cancel/delete a commitment. For a real calendar event, ask the Swift app
     to remove it from macOS Calendar (it holds the write grant); the re-sync then
     drops it from the store. Manual items are deleted outright."""
-    if remote_only_profile() is not None:
+    if remote_read_only_mode():
         raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     c = assistant_store.get(cid)
     if not c:
@@ -2635,7 +2670,7 @@ async def assistant_event_ack(event_id: str, body: dict[str, Any]) -> dict[str, 
 
 @app.post("/assistant/events/{event_id}/claim")
 async def assistant_event_claim(event_id: str, body: dict[str, Any]) -> dict[str, Any]:
-    if remote_only_profile() is not None:
+    if remote_read_only_mode():
         raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     if set(body) != {"kind", "action_id", "payload"}:
         raise HTTPException(status_code=422, detail="kind, action_id and exact payload are required")
@@ -2685,7 +2720,7 @@ async def assistant_send_message_draft(body: dict[str, Any]) -> dict[str, Any]:
     on it, not a regex. Those checks are for catching the model before a human
     looks — see action_tools.human_reviewed_content.
     """
-    if remote_only_profile() is not None:
+    if remote_read_only_mode():
         raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     from service.safety.audit import audit
     from service.tools.action_tools import human_reviewed_content, send_message
@@ -2721,7 +2756,7 @@ async def assistant_events() -> StreamingResponse:
 
 @app.post("/agent/approve")
 async def approve(body: dict[str, Any]) -> dict[str, Any]:
-    if remote_only_profile() is not None:
+    if remote_read_only_mode():
         raise HTTPException(status_code=403, detail="This action is unavailable in the four-read remote-only demo")
     sid, action_id = body.get("session_id"), body.get("action_id")
     approved, request_id = body.get("approved"), body.get("request_id")

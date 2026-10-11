@@ -490,8 +490,11 @@ async def run_tool(tool: Tool, args: dict) -> str:
     the model can read and correct on its next step, the same way a wrong
     file path or an ambiguous title already does.
     """
-    from service.inference.remote_policy import remote_only_profile, remote_demo_tool_allowed
-    if remote_only_profile() is not None and not remote_demo_tool_allowed(tool.name):
+    from service.inference.remote_policy import remote_only_profile, remote_tool_allowed, remote_full_mode
+    if remote_only_profile() is not None and not remote_tool_allowed(tool.name):
+        if remote_full_mode():
+            return ("This tool needs Wisp's on-Mac models or extensions, which this "
+                    "remote-inference build does not run; nothing was executed.")
         return "This action is unavailable in the four-read remote-only demo; nothing was executed."
     if tool.unavailable_reason:
         return tool.unavailable_reason

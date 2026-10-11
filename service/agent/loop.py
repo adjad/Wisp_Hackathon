@@ -1482,7 +1482,15 @@ async def run_agent(
     def _admit(offered: list[dict]) -> list[dict]:
         """Drop every schema the skill boundary protects. Used at every build and rebuild."""
         blocked = _skill_boundary_names()
-        return [s for s in offered if s["function"]["name"] not in blocked]
+        admitted = [s for s in offered if s["function"]["name"] not in blocked]
+        from service.inference.remote_policy import remote_full_mode, remote_only_profile, remote_tool_allowed
+        if remote_full_mode():
+            # Full remote build: never offer a tool this build cannot run, and
+            # keep the menu inside the gateway's tool-count contract (router
+            # order is relevance order; measured menus stay well under it).
+            admitted = [s for s in admitted if remote_tool_allowed(s["function"]["name"])]
+            admitted = admitted[:remote_only_profile().tools]
+        return admitted
 
     if force_first_tool and _skill_boundary(force_first_tool):
         force_first_tool = None

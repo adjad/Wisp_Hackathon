@@ -1,8 +1,8 @@
 """HTTP surface for behavior learning (``/behavior/*``).
 
 Every route answers 409 with a plain explanation while behavior learning is
-off (it is on with ``WISP_BEHAVIOR=1`` and automatically in the founder demo
-build). Engine work runs off the event loop. Only Wisp-internal state changes
+off (it is on with ``WISP_BEHAVIOR=1`` and by default in the founder demo and
+full remote builds; ``WISP_BEHAVIOR=0`` turns it off). Engine work runs off the event loop. Only Wisp-internal state changes
 here: Undo deletes items Wisp itself created on its own schedule, and ``act``
 returns the prefilled request for an ``open_prompt`` action rather than
 sending or changing anything.

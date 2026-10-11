@@ -1,18 +1,30 @@
 # GX10 + Intel Mac runbook (demo day, 1 PM)
 
+> **If short on time, or you have no GX10 shell yet: do only steps 1 (Mac half) and 5.**
+>
+> 1. On the Mac: `bash deploy/gx10/mac-check-gateway.sh`. Every line should be `[ok]`.
+> 2. Rehearse with `docs/BEHAVIOR_DEMO.md`: reset first
+>    (`.venv/bin/python demo/wisp_demo.py behavior clear`), then run the beats.
+>
+> The behavior engine runs **locally on the Mac by default** (`brain.mode local`),
+> so the demo does not depend on any change to the GX10. Everything else here
+> (steps 0, 2, 3, 6, 7 and the GX10 half of step 1) is GX10-side and can wait
+> until you have shell access, which may be after the demo. Skip it rather than
+> rush it.
+
 Do the steps in order. Times are estimates. A **cutoff** means: if the step
 isn't done by then, stop and fall back. The current manual setup works as long
 as the GX10 is not rebooted.
 
 | # | Step | Time | Required |
 | --- | --- | --- | --- |
-| 0 | Copy the files to the GX10 | 3 min | yes |
-| 1 | Health check of the current setup | 5 min | yes |
-| 2 | Gateway supervision and restart test | 15 min | yes (cutoff 12:15) |
+| 0 | Copy the files to the GX10 | 3 min | needs a GX10 shell; only for steps 2 and 3 |
+| 1 | Health check of the current setup | 5 min | **yes** (the Mac half needs no GX10 shell) |
+| 2 | Gateway supervision and restart test | 15 min | recommended, needs a GX10 shell (cutoff 12:15) |
 | 3 | Brain server on the GX10 | 20 min | **optional**; skip unless step 2 finished early |
-| 4 | Mac-side flags | 5 min | yes |
-| 5 | Demo rehearsal | 20 min | yes |
-| 6 | Failure drills | 10 min | recommended |
+| 4 | Mac-side flags | 5 min | MacBook: yes. Intel founder build: nothing to set unless you use the remote brain |
+| 5 | Demo rehearsal | 20 min | **yes** |
+| 6 | Failure drills | 10 min | recommended, needs a GX10 shell |
 | 7 | Rollback, if anything goes wrong | 2 min | as needed |
 
 Ground rules:
@@ -27,11 +39,19 @@ Ground rules:
 Placeholders used below: GX10 is `asus@100.111.110.43`; the inference origin
 is `https://6wjp.tail4cc204.ts.net`.
 
+```
+Intel Mac --Tailscale--> https://6wjp.tail4cc204.ts.net:443   (Serve; do not change)
+                           +-> http://127.0.0.1:8767            wisp-gx10-gateway (token gateway)
+                                 +-> http://127.0.0.1:11434     Ollama, qwen3.6:35b
+                         https://6wjp.tail4cc204.ts.net:8443    (optional, step 3 only)
+                           +-> http://127.0.0.1:8790            wisp-brain (behavior engine API)
+```
+
 ---
 
 ## 0. Copy the files to the GX10 (3 min)
 
-Run this on the Mac, from the Wisp checkout that contains `deploy/gx10`:
+Skip if you have no GX10 access yet. Run this on the Mac, from the Wisp checkout that contains `deploy/gx10`:
 
 ```sh
 rsync -a --relative --exclude __pycache__ \
@@ -86,7 +106,9 @@ bash install-gateway-service.sh --dry-run          # read the rendered unit + pl
 bash install-gateway-service.sh                    # installs + ENABLES; won't start a duplicate
 ```
 
-The installer prints "Using the running gateway's interpreter: …". It may also
+The installer prints "Using the running gateway's interpreter: …". It checks
+that `gateway.py`'s sha256 starts with `eb7080b3` and refuses otherwise (pass
+`--allow-hash-mismatch` only if the gateway was changed on purpose). It may also
 warn about env vars the manual process has. If it lists any, decide whether
 `gateway.py` needs them before taking over.
 
@@ -166,9 +188,10 @@ tailscale serve status     # expect :443 -> 127.0.0.1:8767 (unchanged) AND :8443
 curl -s http://127.0.0.1:8790/healthz      # {"ok":true,"engine":"ready"}
 ```
 
-If `/healthz` returns `503 {"engine":"unavailable"}`, the copied code predates
-the finished engine. Re-run step 0 with the current checkout, then run
-`install-brain.sh` again.
+If `/healthz` returns `503 {"engine":"unavailable"}`, the engine failed to
+start: read `journalctl --user -u wisp-brain -n 50`. If the copied code is
+stale, re-run step 0 with the current checkout, then run `install-brain.sh`
+again.
 
 The phraser uses the same Ollama model as the gateway, so no second model is
 loaded. For template-only text, use `--no-phraser`.
@@ -194,39 +217,58 @@ that can read the process environment, so use it for a quick test only.
 
 ## 4. Mac-side flags (5 min)
 
-> **Integrator to finalize.** The values below are what
-> `service/assistant/behavior_runtime.py` reads today. Confirm them against
-> `docs/BEHAVIOR_DEMO.md` before the demo.
+These are the flags `service/assistant/behavior_runtime.py` reads.
 
 | Flag | Value | Notes |
 | --- | --- | --- |
-| `WISP_REMOTE_ONLY` | `1` | Existing Intel build. All model roles go to the GX10. |
-| `WISP_FOUNDER_DEMO` | `1` | Existing. Implies behavior on, with synthetic data only. |
-| `WISP_BEHAVIOR` | `1` | Behavior engine on. Implied by the founder demo. |
-| `WISP_BEHAVIOR_SYNTHETIC_ONLY` | `1` | Learn from the fictional persona and the `Wisp Demo` calendar only. |
-| `WISP_BRAIN_MODE` | `local` (default) or `remote` | Or set `brain: {mode, url}` in the models config. |
-| `WISP_BRAIN_URL` | `https://6wjp.tail4cc204.ts.net:8443` | Remote only. No trailing slash: the Keychain account hashes it. |
-| `WISP_BEHAVIOR_PHRASER` | `0` to disable | Local engine only. Template text, no GX10 phrasing calls. |
+| `WISP_REMOTE_ONLY` | `1` | Set by the Intel founder app for its own backend. All model roles go to the GX10. Nothing to do by hand. |
+| `WISP_FOUNDER_DEMO` | `1` | Set by the Intel founder app. Turns behavior learning on **and** synthetic-only. |
+| `WISP_BEHAVIOR` | `1` | Behavior learning on. Implied by the founder demo; needed on the MacBook. |
+| `WISP_BEHAVIOR_SYNTHETIC_ONLY` | `1` | Learn only from the fictional persona and the `Wisp Demo` calendar. Implied by the founder demo; needed on the MacBook. Required for `/behavior/reset`. |
+| `WISP_BRAIN_MODE` | `local` (default) or `remote` | Or `brain: {mode, url}` in `~/.moe/config.yaml` (under `WISP_HOME` if set). In the file, set `mode` explicitly: a `url` alone only selects remote through the environment variable. |
+| `WISP_BRAIN_URL` | `https://6wjp.tail4cc204.ts.net:8443` | Remote only. No trailing slash: the Keychain account hashes the exact string. A URL alone (no mode) selects `remote`. |
+| `WISP_BRAIN_TOKEN` | the brain token | Remote only. Optional: otherwise Keychain service `com.wisp.inference`, account `wispbrain:<sha256(URL)>` (see "Brain token to the Mac"). Test use only. |
+| `WISP_BEHAVIOR_PHRASER` | `0` to disable | Local engine only. Template text, no phrasing calls to the GX10. |
 
-In `local` mode the GX10 sees only chat inference and the short phrasing
-requests. In `remote` mode the Mac sends observations (titles, contacts and
-times; never message text) to the brain on the GX10, over Tailscale only.
+Environment flags reach Wisp only when you start the app binary from
+Terminal, for example
+`WISP_BEHAVIOR=1 WISP_BEHAVIOR_SYNTHETIC_ONLY=1 /path/to/Wisp.app/Contents/MacOS/Wisp`.
+The founder app needs none of them for the default `local` demo.
+
+What the GX10 sees:
+
+- **`local` mode (default):** chat inference, plus short phrasing requests
+  (one nudge's title, body, evidence line and button labels) and occasionally a
+  batch of unrecognised event titles to label. The timeline stays on the Mac in
+  `<WISP_HOME>/behavior.db`.
+- **`remote` mode:** the Mac sends observations (event titles, contact names,
+  times; never message text) to the brain server on the GX10, over Tailscale
+  only. In synthetic mode these are the fictional persona's.
+
+Check with `.venv/bin/python demo/wisp_demo.py behavior status`: `mode`,
+`active_engine` (`local` or `remote`) and `errors`.
 
 ## 5. Demo rehearsal (20 min)
 
-Follow `docs/BEHAVIOR_DEMO.md` for the exact seeding and presets. Then run
-these beats:
+Follow `docs/BEHAVIOR_DEMO.md` for the exact seeding, presets and Plan B. Then
+run these beats:
 
 1. **Green board.** Run `mac-check-gateway.sh`; all checks should be `[ok]`.
    Open Wisp and confirm Send answers.
-2. **It noticed.** A nudge card appears, for example a gym clash or a
-   meeting that's likely to be cancelled. Point at the "because" line. That's
-   the evidence, composed by code.
-3. **Ask about yourself.** Ask "What do you know about my week?" The answer
-   comes from `describe_me` and `predict_my_day`.
-4. **Correct it.** Reject or confirm a pattern (`correct_pattern`), or give
-   the nudge feedback "wrong". That kind of nudge is muted.
-5. **Optional, only after drill 6a is rehearsed:** stop the gateway and show
+2. **Reset.** `.venv/bin/python demo/wisp_demo.py behavior clear` (it posts
+   `/behavior/reset`) so the nudge budget is full, then `behavior run`.
+3. **It noticed.** `drop --preset gym-conflict` or `drop --preset backtoback`.
+   A nudge alert and card appear. Point at the "because" line. That's the
+   evidence, composed by code. Click Undo on one.
+4. **Ask about yourself.** Ask "What do you know about me?" and "Predict my
+   day". The answers come from `describe_me` and `predict_my_day`. (Not "...my
+   week": that phrase does not reach the behavior tools.)
+5. **Correct it.** Right after an answer, say "That's wrong" about a pattern,
+   or reject one with `behavior patterns --reject <id>`; or give a nudge the
+   feedback "Wrong". That pattern stops driving predictions, or that kind of
+   nudge is muted after a second vote.
+6. **Reset again** before the real run.
+7. **Optional, only after drill 6a is rehearsed:** stop the gateway and show
    that nudges still appear. Learning is local and phrasing falls back to
    templates. Then restart the gateway.
 
@@ -239,7 +281,8 @@ systemctl --user stop wisp-gx10-gateway
 ```
 
 On the Mac, `mac-check-gateway.sh` now reports HTTP `502`. Send fails, and
-nudges and cards still show with template text. Recover on the GX10:
+nudges and cards still show with template text (a nudge may arrive up to about
+10 s later while the phraser times out). Recover on the GX10:
 
 ```sh
 systemctl --user start wisp-gx10-gateway
@@ -257,7 +300,7 @@ itself after 5 s.
   `None`.
 - In `remote` mode the runtime falls back to the local engine for 120 s at a
   time. The profile card is served from the cached
-  `behavior_profile_card.txt`.
+  `<WISP_HOME>/behavior_profile_card.txt`.
 
 Turn Tailscale back on and re-check.
 
@@ -280,14 +323,16 @@ bash ~/wisp-src/deploy/gx10/rollback-gateway-service.sh --dry-run
 bash ~/wisp-src/deploy/gx10/rollback-gateway-service.sh
 ```
 
-Brain server. Data and token are kept unless you pass `--purge`:
+Brain server. This stops and disables `wisp-brain`. Data and token are kept
+unless you pass `--purge`:
 
 ```sh
 bash ~/wisp-src/deploy/gx10/uninstall-brain.sh --serve-off       # removes :8443 only if it points to 127.0.0.1:8790 (--port N otherwise)
 bash ~/wisp-src/deploy/gx10/uninstall-brain.sh --restore-previous # or: go back to the previous code
 ```
 
-Mac: remove `WISP_BRAIN_MODE` and `WISP_BRAIN_URL`. Behavior then runs locally.
+Mac: remove `WISP_BRAIN_MODE` and `WISP_BRAIN_URL` (and any `brain:` block in
+`config.yaml`). Behavior then runs locally.
 To turn behavior off completely, remove `WISP_BEHAVIOR*`. The cleanup section
 of `docs/BEHAVIOR_DEMO.md` has the rest.
 

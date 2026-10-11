@@ -132,8 +132,9 @@ mocks do not measure extraction quality or prove native notification delivery.
 
 A separate demo shows Wisp learning routines, predicting tomorrow and sending
 nudges, some with an Undo for what it already did. The full script, with exact
-prompts and talking points, is in
-[docs/BEHAVIOR_DEMO.md](../docs/BEHAVIOR_DEMO.md).
+prompts, talking points and a Plan B, is in
+[docs/BEHAVIOR_DEMO.md](../docs/BEHAVIOR_DEMO.md). How the engine works is in
+[docs/BEHAVIOR_ENGINE.md](../docs/BEHAVIOR_ENGINE.md).
 
 Unlike Catch, this demo **does write to the Mac's real Calendar, Reminders and
 Notes**, but only into containers named **Wisp Demo**. Those containers hold
@@ -143,20 +144,22 @@ fictional data for Aria Solano / Cedarloop, and each item is tagged with
 ```sh
 python3 demo/seed_mac_persona.py seed --dry-run      # print the AppleScript, write nothing
 python3 demo/seed_mac_persona.py seed                # or: seed --calendar / --reminders / --notes
+.venv/bin/python demo/wisp_demo.py behavior clear    # reset first: full nudge budget (POST /behavior/reset)
 .venv/bin/python demo/wisp_demo.py behavior status   # also: run, patterns, predict, profile, nudges
-.venv/bin/python demo/wisp_demo.py drop --preset gym-conflict   # meeting over the next gym morning
+.venv/bin/python demo/wisp_demo.py drop --preset gym-conflict   # meeting on the next gym morning
 .venv/bin/python demo/wisp_demo.py drop --preset backtoback     # 4 meetings tomorrow 14:00-16:00
 .venv/bin/python demo/wisp_demo.py drop --preset dev            # no Mac change; Dev's window
 python3 demo/seed_mac_persona.py remove              # quit Wisp first; deletes only "Wisp Demo"
 ```
 
-Launch with `WISP_BEHAVIOR=1 WISP_BEHAVIOR_SYNTHETIC_ONLY=1`. The founder/Intel
-build turns both on automatically. Seeding runs on the macOS system Python
-3.9+ and needs only the standard library. Re-seeding skips items that already
-exist.
+Launch with `WISP_BEHAVIOR=1 WISP_BEHAVIOR_SYNTHETIC_ONLY=1` by starting the app
+binary from Terminal. The founder/Intel build turns both on automatically.
+`behavior clear` works only in synthetic mode. Seeding runs on the macOS system
+Python 3.9+ and needs only the standard library; `wisp_demo.py` needs the repo
+venv. Re-seeding skips items that already exist.
 
 Tests (Linux-safe, no osascript or backend):
 
 ```sh
-.venv/bin/python -m pytest -q tests/test_seed_mac_persona.py tests/test_wisp_demo_behavior.py
+WISP_HOME=$(mktemp -d) .venv/bin/python -m pytest -q tests/test_seed_mac_persona.py tests/test_wisp_demo_behavior.py
 ```

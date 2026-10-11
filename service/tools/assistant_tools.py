@@ -470,17 +470,21 @@ async def get_upcoming(days: int = 7, account: str | None = None,
         calendar_rows = assistant_store.calendar_events_overlapping(
             start if today_period else forward_start, end)
         rows = [row for row in assistant_store.active_between(forward_start, end)
-                if forward_start <= float(row.get("when_ts") or 0) < end]
-        rows = calendar_rows + rows
+                if row.get("source") != "calendar"
+                and forward_start <= float(row.get("when_ts") or 0) < end]
     else:
         import math
         # upcoming() collapses by title/minute before account filtering. Read
-        # raw Calendar occurrences as well, retaining the existing inclusive
+        # raw Calendar occurrences instead, retaining the existing inclusive
         # elapsed-seconds horizon (explicit periods remain half-open).
         end = now + days * 86400
         calendar_rows = assistant_store.calendar_events_overlapping(
             now, math.nextafter(end, math.inf))
-        rows = calendar_rows + assistant_store.upcoming(now=now, days=days)
+        rows = assistant_store.upcoming(now=now, days=days)
+    # Calendar comes from exactly one raw read. The independent legacy read
+    # above contributes other sources only, never a later/deleted occurrence
+    # or Calendar provenance attached to a manual display-dedupe winner.
+    rows = calendar_rows + _without_withheld_sources(rows, {"calendar"})
     items = _filter_account(rows, account)
     if calendar_only:
         # Raw occurrences are available above. A manual winner carrying

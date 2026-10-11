@@ -207,3 +207,43 @@ def test_pure_route_bound_calendar_read_reaches_actual_registry(isolated):
     result = dispatch(**decision.tool_argument_bindings["get_upcoming"])
     assert "Calendar events: 2" in result
     assert "Room 101" in result and "Room 202" in result
+
+
+@pytest.mark.parametrize("period", ["", "today"])
+@pytest.mark.parametrize("raw_empty", [False, True])
+def test_independent_legacy_calendar_read_cannot_mix_or_resurrect_generations(isolated, monkeypatch, period, raw_empty):
+    first = event("same", location="Captured room")
+    later = {**first, "location": "Independent later room"}
+    state = {"generation": "first"}
+    def raw_read(*args):
+        assert state["generation"] == "first"
+        captured = [] if raw_empty else [dict(first)]
+        state["generation"] = "later"  # Simulate sync between independent reads.
+        return captured
+    def legacy_read(*args, **kwargs):
+        assert state["generation"] == "later"
+        return [later]
+    monkeypatch.setattr(isolated, "calendar_events_overlapping", raw_read)
+    monkeypatch.setattr(isolated, "upcoming", legacy_read)
+    monkeypatch.setattr(isolated, "active_between", legacy_read)
+    result = dispatch(period=period, calendar_only=True)
+    assert "Independent later room" not in result
+    if raw_empty:
+        assert "Physics Midterm" not in result and "Nothing scheduled" in result
+    else:
+        assert "Calendar events: 1" in result and "Captured room" in result
+
+
+@pytest.mark.parametrize("period", ["", "today"])
+def test_legacy_manual_calendar_provenance_is_not_a_native_contribution(isolated, monkeypatch, period):
+    native = event("same", location="Captured room")
+    secondary = {**native, "source": "manual", "kind": "reminder",
+        "source_id": "manual", "location": "", "duplicate_sources": ["calendar", "reminders"],
+        "duplicate_ids": ["calendar.local", "reminder.local"]}
+    monkeypatch.setattr(isolated, "calendar_events_overlapping", lambda *args: [native])
+    monkeypatch.setattr(isolated, "upcoming", lambda **kwargs: [secondary])
+    monkeypatch.setattr(isolated, "active_between", lambda *args: [secondary])
+    result = dispatch(period=period)
+    assert "Calendar events: 1; Wisp/Apple reminders: 1" in result
+    assert "Captured room" in result and result.count("Physics Midterm") == 2
+    assert secondary["duplicate_sources"] == ["calendar", "reminders"]

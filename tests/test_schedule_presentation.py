@@ -73,6 +73,11 @@ def test_busy_month_is_a_clean_agenda_not_a_raw_storage_dump(monkeypatch):
         _row("Call dentist", NOW + timedelta(days=3, hours=2), source="reminders"),
     ])
     monkeypatch.setattr(assistant_tools.assistant_store, "active_between", lambda *_args: rows)
+    monkeypatch.setattr(assistant_tools.assistant_store, "calendar_events_overlapping",
+                        lambda start, end: [row for row in rows if row["source"] == "calendar"
+                                            and row["when_ts"] < end
+                                            and (row["when_ts"] >= start
+                                                 or (row.get("end_ts") or 0) > start)])
 
     result = asyncio.run(assistant_tools.get_upcoming(period="this month"))
 
@@ -234,6 +239,11 @@ def test_month_range_keeps_future_month_items_and_separates_sources(monkeypatch)
         _row("October event", datetime(2026, 10, 1, 9)),
     ]
     monkeypatch.setattr(assistant_tools.assistant_store, "active_between", lambda *_args: rows)
+    monkeypatch.setattr(assistant_tools.assistant_store, "calendar_events_overlapping",
+                        lambda start, end: [row for row in rows if row["source"] == "calendar"
+                                            and row["when_ts"] < end
+                                            and (row["when_ts"] >= start
+                                                 or (row.get("end_ts") or 0) > start)])
 
     result = asyncio.run(assistant_tools.get_upcoming(period="this month"))
 

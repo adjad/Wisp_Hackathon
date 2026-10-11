@@ -6974,11 +6974,14 @@ def _scheduled_send_review(text: str) -> RouteDecision | None:
     # A named future delivery can be described without queue terminology.
     # Discovery stays read-first: the host cancellation tool still needs an
     # exact pending record ID; a title or recipient is never that ID.
-    named_cancel = bool(re.fullmatch(
+    named_pattern = (
         r"\s*(?:please\s+)?cancel\s+(?:the\s+)?[A-Za-z][A-Za-z'’-]*"
         r"(?:\s+[A-Za-z][A-Za-z'’-]*){0,3}\s+(?:e-?mail|message|text)"
-        r"(?:\s+but\s+(?:leave|keep)\s+[A-Za-z][A-Za-z'’ -]{0,60})?[.!?\s]*", value, re.I))
-    if not (queue_hint or named_cancel) or re.match(r"\s*(?:explain|define|how\s+(?:do|does|to))\b", value, re.I):
+        r"(?:\s+but\s+(?:leave|keep)\s+[A-Za-z][A-Za-z'’ -]{0,60})?[.!?\s]*")
+    named_cancel = bool(re.fullmatch(named_pattern, value, re.I))
+    quoted_named_attempt = bool(re.fullmatch(named_pattern,
+        re.sub(r'(?:\s+"…")+\s*$', '', value), re.I))
+    if not (queue_hint or named_cancel or quoted_named_attempt) or re.match(r"\s*(?:explain|define|how\s+(?:do|does|to))\b", value, re.I):
         return None
     if re.search(r"\b(?:calendar|reminders?|notes?|files?|Safari|battery|clipboard|volume)\b", value, re.I):
         return None
@@ -7006,8 +7009,9 @@ def _scheduled_send_review(text: str) -> RouteDecision | None:
     # or otherwise unconsumed cancellation clauses must clarify after reading;
     # one unique ID appearing somewhere is not unconditional effect authority.
     has_literal_id = bool(re.search(r"\b[0-9a-f]{12}\b", text, re.I))
-    named_discovery = named_cancel and not has_literal_id and not re.search(
-        r"\b(?:queued|pending|scheduled|id)\b", value, re.I)
+    named_discovery = (named_cancel and re.fullmatch(named_pattern, text, re.I)
+        and not has_literal_id and not re.search(
+            r"\b(?:queued|pending|scheduled|id|if|unless|until|only|provided|when|except)\b", value, re.I))
     may_cancel = cancel and (exact_cancel is not None or named_discovery)
     tools = ["list_scheduled_sends"] + (["cancel_scheduled_send"] if may_cancel else [])
     decision = _mk_scoped(tools, "recorded scheduled-send review; delivery unverified", force="list_scheduled_sends", light=False)

@@ -7093,6 +7093,7 @@ def _grocery_read(text: str) -> RouteDecision | None:
             return None
         decision = _mk_scoped([], "grocery read requires complete literal selectors", expect=False, light=False)
         from service.tools.registry import REGISTRY
+        decision.verified_results_only = True
         decision.forbidden_tools = frozenset(REGISTRY)
         decision.resolved_request = text + ("\n\nNo source was read and no action occurred. Clarify the complete grocery read, "
             "source selection and literal list/item selectors; preserve every constraint and additional requested action. "
@@ -7101,6 +7102,7 @@ def _grocery_read(text: str) -> RouteDecision | None:
     tools = list(read.tools)
     decision = _mk_scoped(tools, "source-grounded shopping evidence", multi=len(tools) > 1,
                           after=frozenset(tools), light=False, expect=False)
+    decision.verified_results_only = True
     decision.required_tool_groups = read.groups
     decision.tool_argument_bindings = read.bindings
     decision.direct_calls = [(tool, read.bindings[tool]) for tool in tools]

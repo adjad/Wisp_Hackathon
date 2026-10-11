@@ -104,7 +104,7 @@ _GROCERY_READ_BASE = (r"(?:what\s+should\s+I\s+(?:get|buy|pick\s+up)\s+(?:for\s+
 def grocery_read_attempt(text: str) -> bool:
     """An addressed outer read keeps even malformed selectors inert."""
     return re.match(r"\s*(?:(?:please|can you|could you)\s+)?" + _GROCERY_READ_BASE +
-                    r"(?=\s|[.!?]|$)", text, re.I) is not None
+                    r"(?=\W|$)", text, re.I) is not None
 
 
 def grocery_read(text: str) -> PersonalRead | None:

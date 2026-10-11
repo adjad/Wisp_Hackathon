@@ -2001,6 +2001,14 @@ async def view_emails_impl(query: str | None = None, day: str | None = None,
         except ValueError:
             return f"(couldn't understand the date {day!r} — use 'today', 'yesterday', or YYYY-MM-DD)"
         rows = [r for r in rows if start <= r["ts"] < end]
+    # Scope the query before assessing read-status coverage. Unknown flags in
+    # unrelated mail must not inflate the exclusion count for this lookup.
+    if query:
+        rows = [r for r in rows
+                if _matches(query, r["sender"], r["to"], r["subject"], r["body"])]
+        if not rows:
+            return (f"No emails matching “{query}” were found in the recent "
+                    "inbox Wisp searched.")
     note = ""
     if unread:
         # Same rule as summarize_emails: read status only exists for what's
@@ -2008,24 +2016,28 @@ async def view_emails_impl(query: str | None = None, day: str | None = None,
         # "read". Reporting zero unread from records that never knew would be a
         # confident wrong answer.
         known = [r for r in rows if r.get("unread") is not None]
-        if not known:
-            return ("(Read/unread status isn't in the raw email cache yet — it "
-                    "arrives on the next Mail sync, usually within 15 minutes. "
-                    "Tell the user you can't check unread just yet rather than "
-                    "saying they have none.)")
+        unknown = len(rows) - len(known)
+        if unknown:
+            note = (
+                f"Read-status coverage: {unknown} "
+                f"{'email was' if unknown == 1 else 'emails were'} excluded from "
+                "the requested raw-cache scope because read/unread "
+                "status is unknown. Unread coverage is incomplete; excluded "
+                "records may also be unread.\n\n"
+            )
+        # An empty date scope does not prove that read flags are unavailable.
+        # Retain the bounded raw-cache absence message below in that case.
+        had_scoped_rows = bool(rows)
         rows = [r for r in known if r["unread"]]
         label = f"UNREAD in {label}" if label != "your recent inbox" else "your UNREAD email"
-        if not rows:
+        if not rows and unknown:
+            return note + "No known unread emails were found in this raw-cache scope."
+        if not rows and had_scoped_rows:
+            if query:
+                return (f"No known unread emails matching “{query}” were found "
+                        "in this raw-cache scope.")
             return f"No unread emails in {label.replace('UNREAD in ', '')}."
     rows.sort(key=lambda r: r["ts"])
-    scoped = rows
-    if query:
-        matched = [r for r in scoped if _matches(query, r["sender"], r["to"], r["subject"], r["body"])]
-        if matched:
-            rows = matched
-        else:
-            return (f"No emails matching “{query}” were found in the recent "
-                    "inbox Wisp searched.")
     if not rows:
         return (f"No emails found for {label} (note: raw content only covers "
                 "roughly the 50 most recent emails — try summarize_emails for older mail).")

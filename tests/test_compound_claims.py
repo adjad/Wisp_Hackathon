@@ -140,9 +140,9 @@ _SINGLE = [
     ("what do you know about me", "self query -> recall", 1, "recall"),
     ("what's new across my apps", "recency sweep -> get_recent_activity", 6,
      "get_recent_activity"),
-    ("what's queued to send", "scheduled-send queue -> scoped tools (3)", 3, None),
-    # Ambiguous cancellation inspects pending records before choosing an ID.
-    ("cancel that text", "recorded scheduled-send review; delivery unverified", 2,
+    ("what's queued to send", "recorded scheduled-send review; delivery unverified", 1, "list_scheduled_sends"),
+    # Ambiguous cancellation only discovers records; a new exact-ID request is required.
+    ("cancel that text", "recorded scheduled-send review; delivery unverified", 1,
      "list_scheduled_sends"),
 ]
 
@@ -170,10 +170,23 @@ def test_single_domain_routes_are_unchanged() -> None:
           recent.force_first_tool == 'get_recent_activity' and recent.expect_tool_first
           and not recent.direct_calls and not recent.tool_argument_bindings
           and not recent.clarify_channel)
+    queue_read = routed("what's queued to send")
+    check('canonical queue read has exactly its pending-list reader',
+          queue_read.tool_subset == ['list_scheduled_sends']
+          and queue_read.force_first_tool == 'list_scheduled_sends'
+          and queue_read.expect_tool_first
+          and queue_read.required_tool_groups == (frozenset({'list_scheduled_sends'}),)
+          and queue_read.tool_argument_bindings == {'list_scheduled_sends':{'status':'pending','id':'','count':20}}
+          and not queue_read.direct_calls and queue_read.verified_results_only)
+    check('canonical queue read forbids every other registered tool',
+          set(REGISTRY) - {'list_scheduled_sends'} <= queue_read.forbidden_tools)
     cancel = routed('cancel that text')
-    check('cancel has only queue discovery and pending cancellation',
-          set(cancel.tool_subset or []) == {'list_scheduled_sends','cancel_scheduled_send'}
-          and len(cancel.tool_subset) == 2)
+    check('cancel has only read-only queue discovery until a new exact-ID request',
+          set(cancel.tool_subset or []) == {'list_scheduled_sends'}
+          and len(cancel.tool_subset) == 1
+          and 'cancel_scheduled_send' in cancel.forbidden_tools
+          and 'cancel_scheduled_send' not in cancel.tool_argument_bindings
+          and 'unconditional single exact-ID cancellation' in cancel.resolved_request)
     check('cancel requires pending discovery first', cancel.expect_tool_first
           and cancel.force_first_tool == 'list_scheduled_sends'
           and cancel.required_tool_groups == (frozenset({'list_scheduled_sends'}),)

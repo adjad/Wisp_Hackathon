@@ -47,6 +47,9 @@ def resolve_destination(recipient: str, channel: str) -> tuple[str, str]:
 async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
                            session_id: str = "", session_store=None) -> TaskExecution:
     calls, results = [], []
+    # Host evidence stays local to one approved final invocation, before any
+    # display wrapper. This is in-process binding, not a cross-process token.
+    draft_receipt = draft_binding = final_draft_binding = None
     news_used = bool(plan.news_artifact_provenance)
     durable_execution = store is not None and bool(session_id)
     direct_news_harness = bool(
@@ -69,7 +72,9 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
             return False
 
     async def invoke(name, args, *, effect=False):
-        nonlocal news_used
+        nonlocal news_used, draft_receipt, draft_binding
+        if effect:
+            draft_receipt = draft_binding = None
         tool = get_tool(name)
         if tool is None:
             return "failed", f"Required tool {name} is unavailable."
@@ -78,6 +83,8 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
             return "failed", str(problem)
         policy = decide(tool.category, args, tool=name)
         cid = f"workflow_{plan.id}_{len(calls)}"
+        approved_draft_binding = ((cid, args.get("to"), args.get("text"))
+                                  if effect and name == "draft_message" else None)
         call = {"id": cid, "name": name, "args": dict(args),
                 "decision": policy.tier.value, "reason": policy.reason}
         calls.append(call)
@@ -116,6 +123,17 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
                     news_used = True
                 status = classify_tool_outcome(
                     name, raw.model_text if isinstance(raw, DisplayOnlyToolResult) else raw).status
+                if effect and name == "draft_message" and status == "succeeded":
+                    from service.tools.registry import _valid_message_draft
+                    if (_valid_message_draft(raw, name)
+                            and approved_draft_binding == final_draft_binding
+                            and raw.resolved_to == approved_draft_binding[1]
+                            and raw.prepared_text == approved_draft_binding[2]):
+                        draft_receipt, draft_binding = raw, approved_draft_binding
+                    else:
+                        status, raw = "failed", (
+                            "(error: The prepared draft did not match the approved recipient "
+                            "and text. No draft card was created.)")
             else:
                 raw, status = "The user denied this action.", "denied"
         if effect and news_used and not isinstance(raw, DisplayOnlyToolResult):
@@ -233,7 +251,18 @@ async def execute_workflow(plan, emit, approver, *, test_mode=False, store=None,
                     when=when.isoformat())
     if not owns_revision():
         return finish("failed", "Nothing sent: this delivery request was changed or cancelled.")
+    final_draft_binding = ((f"workflow_{plan.id}_{len(calls)}", args.get("to"), args.get("text"))
+                           if effect == "draft_message" else None)
     status, raw = await invoke(effect, args, effect=True)
     if status == "succeeded" and effect == "draft_message":
-        await emit({"type": "message_draft", "to": destination, "text": body})
+        from service.tools.registry import _valid_message_draft
+        if (not _valid_message_draft(draft_receipt, effect)
+                or draft_binding != final_draft_binding
+                or draft_binding != (final_draft_binding[0], args.get("to"), args.get("text"))
+                or draft_receipt.resolved_to != draft_binding[1]
+                or draft_receipt.prepared_text != draft_binding[2]):
+            return finish("failed", "The prepared draft could not be verified against the approved "
+                          "recipient and text. No draft card was created.")
+        await emit({"type": "message_draft", "to": draft_receipt.resolved_to,
+                    "text": draft_receipt.prepared_text})
     return finish("completed" if status == "succeeded" else status, raw)

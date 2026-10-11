@@ -37,6 +37,7 @@ struct OverlayView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     header
                     MemoryReviewNotice()
+                    NudgeStack(model: model)
                     inputRow.padding(.top, 10)
                     Divider().overlay(Theme.hairline).padding(.vertical, 10)
                     content
@@ -76,6 +77,9 @@ struct OverlayView: View {
     // MacBook; on a monitor, a small capsule under the menu bar. Hover to open.
     private var notchBar: some View {
         ZStack(alignment: .bottom) {
+#if WISP_REMOTE_ONLY_DEMO
+            Color.clear
+#else
             Theme.surface
             if model.isProcessing || model.phase == .streaming {
                 Circle().fill(.white.opacity(0.9))
@@ -92,6 +96,7 @@ struct OverlayView: View {
                 }
                 .padding(.bottom, 8)
             }
+#endif
         }
         // The visible bar and the window both come from the same layout, so
         // they cannot drift apart.
@@ -101,7 +106,9 @@ struct OverlayView: View {
         // Hover-to-expand is driven by the panel's tracking area; tap is a
         // fallback for click-to-open.
         .onTapGesture { model.requestExpand() }
+#if !WISP_REMOTE_ONLY_DEMO
         .help("Wisp — hover to open (⌥Space)")
+#endif
     }
 
     private var header: some View {

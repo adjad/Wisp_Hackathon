@@ -72,6 +72,17 @@ def _cloud_public_raw_evidence(value: object) -> str:
     return "\n".join(safe) if safe else "(no usable public tool evidence found.)"
 
 
+def _note_decision(tool: str, approved: bool) -> bool:
+    """Behavior-learning hook: record that the user approved/denied a
+    confirm-tier action (tool name only). Never raises; returns `approved`."""
+    try:
+        from service.assistant import behavior_runtime
+        behavior_runtime.record_decision(tool, approved)
+    except Exception:  # noqa: BLE001
+        pass
+    return approved
+
+
 async def _finish_denied_outbound(emit: Emit) -> str:
     await emit({"type": "text", "text": _DENIED_OUTBOUND_TEXT})
     await emit({"type": "done"})
@@ -1655,6 +1666,13 @@ async def run_agent(
         return set(group or ()) - (attempted_tools - previews)
 
     def _verified_final(text: str) -> str:
+        uncertain = [outcome for name, outcome in tool_outcomes
+                     if name in {"send_email", "send_message", "forward_email", "reply_to_email"}
+                     and outcome.status == "unknown"]
+        if uncertain:
+            # A missing receipt proves neither sent nor not sent. Stop before
+            # the generic verifier can replace it with a definite negative.
+            return uncertain[-1].text
         from service.agent.verification import verify_delivery_claims
         text = verify_delivery_claims(text, tool_outcomes)
         actions = [(name, outcome) for name, outcome in tool_outcomes
@@ -1834,7 +1852,7 @@ async def run_agent(
                     "\n".join(_rows[:60])
                     + (f"\n…and {len(_rows) - 60} more"
                        if len(_rows) > 60 else ""))
-            if await approver.confirm(_action):
+            if _note_decision(_name, await approver.confirm(_action)):
                 _result = await execute_tool(_tool, _args)
                 audit("confirm_allow", tool=_name, args=_args)
             else:
@@ -1880,6 +1898,11 @@ async def run_agent(
                 response = "The requested action was not completed because approval was denied."
                 await emit({"type": "text", "text": response})
                 return response
+        elif (_direct_outcome.status == "unknown"
+              and _name in {"send_email", "send_message", "forward_email", "reply_to_email"}):
+            response = _verified_final(_direct_outcome.text)
+            await emit({"type": "text", "text": response})
+            return response
         elif _direct_outcome.status in {"failed", "needs_input", "no_match", "unsupported"}:
             failed_tools.add(_name)
             if _direct_outcome.effect != "read":
@@ -1889,10 +1912,11 @@ async def run_agent(
         elif _direct_outcome.status in {"succeeded", "planned"}:
             tools_answered.add(_name)
         if _direct_outcome.status == "succeeded" and _name == "draft_message":
-            await emit({"type": "message_draft",
-                        "to": str(_args.get("to") or ""),
-                        "text": str(_args.get("text") or "")})
-            return ""
+            from service.tools.registry import _valid_message_draft
+            if _valid_message_draft(_result, _name):
+                await emit({"type": "message_draft",
+                            "to": _result.resolved_to, "text": _result.prepared_text})
+                return ""
         if (_direct_outcome.status == "denied"
                 and _name in _TERMINAL_OUTBOUND_DENIALS):
             return await _finish_denied_outbound(emit)
@@ -2456,7 +2480,7 @@ async def run_agent(
                           "always confirmed",
                 "preview": "\n".join(_lines),
             }
-            _batch_approved = await approver.confirm(_batch_action)
+            _batch_approved = _note_decision("calendar_changes", await approver.confirm(_batch_action))
             if _batch_approved:
                 for _, _batch_name, _batch_args in _batch_calls:
                     if _batch_name == "add_calendar_event" and (
@@ -2857,7 +2881,7 @@ async def run_agent(
                     if cid in batch_verdict:
                         approved = batch_verdict[cid]
                     else:
-                        approved = await approver.confirm(action)
+                        approved = _note_decision(name, await approver.confirm(action))
                     if approved:
                         # Whether the card actually SHOWED the outgoing text
                         # (confirm_preview populates `preview` for the outbound
@@ -2927,6 +2951,11 @@ async def run_agent(
                     response = "The requested action was not completed because approval was denied."
                     await emit({"type": "text", "text": response})
                     return response
+            elif (outcome.status == "unknown"
+                  and name in {"send_email", "send_message", "forward_email", "reply_to_email"}):
+                response = _verified_final(outcome.text)
+                await emit({"type": "text", "text": response})
+                return response
             elif outcome.status in {"failed", "needs_input", "unsupported"}:
                 failed_tools.add(name)
                 if outcome.effect != "read":
@@ -2942,10 +2971,11 @@ async def run_agent(
                 # End the turn after emitting the exact editable recipient/body
                 # so the model cannot replace the card with a Markdown draft or
                 # ask another "should I send it?" question.
-                await emit({"type": "message_draft",
-                            "to": str(args.get("to") or ""),
-                            "text": str(args.get("text") or "")})
-                return ""
+                from service.tools.registry import _valid_message_draft
+                if _valid_message_draft(result, name):
+                    await emit({"type": "message_draft",
+                                "to": result.resolved_to, "text": result.prepared_text})
+                    return ""
             if outcome.status == "denied" and name in _TERMINAL_OUTBOUND_DENIALS:
                 return await _finish_denied_outbound(emit)
             if name == "create_tool" and get_tool(str(args.get("name", "")).strip().lower()):

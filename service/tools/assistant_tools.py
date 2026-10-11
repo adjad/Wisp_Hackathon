@@ -226,17 +226,53 @@ def _without_withheld_sources(items: list[dict], withheld: set[str]) -> list[dic
     return visible
 
 
-def _collapse_schedule_rows(items: list[dict]) -> list[dict]:
-    """Defensively collapse mirrored commitments before presenting them.
+def _calendar_occurrence_key(item: dict) -> tuple | None:
+    """Native occurrence identity, never a title/time similarity guess."""
+    import math
+    native_id, when = item.get("source_id"), item.get("when_ts")
+    if (not isinstance(native_id, str) or not native_id.strip()
+            or type(when) not in (int, float) or not math.isfinite(when)):
+        return None
+    account, context = item.get("account"), item.get("context")
+    if any(value is not None and not isinstance(value, str) for value in (account, context)):
+        return None
+    return (native_id, when, account, context)
 
-    The store does this for normal reads. Keeping this small presentation-layer
-    guard makes a response resilient while a source sync is in flight (and
-    keeps callers with fixture-like stores from relaying a manual/Apple mirror
-    pair as two separate things the user has to do).
+
+def _collapse_schedule_rows(items: list[dict]) -> list[dict]:
+    """Keep native Calendar occurrences separate from manual/Reminder mirrors.
+
+    Missing native identity and conflicting descriptions remain separate. The
+    same occurrence can arrive through both the raw and normal store reads;
+    an absent field on one read is not a contradictory field value.
     """
-    by_key: dict[tuple[str, int] | tuple[str, int, int], dict] = {}
+    by_key: dict[tuple, dict] = {}
+    calendar: dict[tuple, list[int]] = {}
+    calendar_rows: list[dict] = []
     rank = {"manual": 0, "reminders": 1, "calendar": 2}
     for item in items:
+        if item.get("source") == "calendar":
+            identity = _calendar_occurrence_key(item)
+            peers = calendar.setdefault(identity, []) if identity is not None else []
+            fields = ("title", "kind", "end_ts", "all_day", "location", "organizer", "url", "status")
+            compatible = [index for index in peers
+                          if all(item.get(field) == calendar_rows[index].get(field)
+                                 for field in fields
+                                 if item.get(field) is not None
+                                 and calendar_rows[index].get(field) is not None)]
+            if len(compatible) == 1:
+                index = compatible[0]
+                peer = calendar_rows[index]
+                additions = {field: item[field] for field in fields
+                             if peer.get(field) is None and item.get(field) is not None}
+                if additions:
+                    calendar_rows[index] = {**peer, **additions}
+                continue
+            # More than one compatible description is ambiguous, not proof
+            # that this row denotes either of those conflicting events.
+            peers.append(len(calendar_rows))
+            calendar_rows.append(item)
+            continue
         title = " ".join(str(item.get("title") or "").split()).casefold()
         when = item.get("when_ts")
         if not title or when is None:
@@ -246,7 +282,8 @@ def _collapse_schedule_rows(items: list[dict]) -> list[dict]:
         current = by_key.get(key)
         if current is None or rank.get(item.get("source"), 9) < rank.get(current.get("source"), 9):
             by_key[key] = item
-    return sorted(by_key.values(), key=lambda item: float(item.get("when_ts") or 0))
+    return sorted(calendar_rows + list(by_key.values()),
+                  key=lambda item: float(item.get("when_ts") or 0))
 
 
 def _agenda_day_label(when: datetime, today: date) -> str:
@@ -433,14 +470,29 @@ async def get_upcoming(days: int = 7, account: str | None = None,
         calendar_rows = assistant_store.calendar_events_overlapping(
             start if today_period else forward_start, end)
         rows = [row for row in assistant_store.active_between(forward_start, end)
-                if forward_start <= float(row.get("when_ts") or 0) < end]
-        rows = calendar_rows + rows
+                if row.get("source") != "calendar"
+                and forward_start <= float(row.get("when_ts") or 0) < end]
     else:
+        import math
+        # upcoming() collapses by title/minute before account filtering. Read
+        # raw Calendar occurrences instead, retaining the existing inclusive
+        # elapsed-seconds horizon (explicit periods remain half-open).
+        end = now + days * 86400
+        calendar_rows = assistant_store.calendar_events_overlapping(
+            now, math.nextafter(end, math.inf))
         rows = assistant_store.upcoming(now=now, days=days)
+    # Calendar comes from exactly one raw read. The independent legacy read
+    # above contributes other sources only, never a later/deleted occurrence
+    # or Calendar provenance attached to a manual display-dedupe winner.
+    rows = calendar_rows + _without_withheld_sources(rows, {"calendar"})
+    from service.demo.founder import enabled, reminder_rows
+    if enabled():
+        rows = [r for r in rows if r.get("source") == "calendar"] + [r for r in reminder_rows(now) if now <= r["when_ts"] < end]
     items = _filter_account(rows, account)
     if calendar_only:
-        items = [row for row in items if row.get("source") == "calendar"
-                 or "calendar" in (row.get("duplicate_sources") or [])]
+        # Raw occurrences are available above. A manual winner carrying
+        # Calendar display-dedupe provenance is not another native event.
+        items = [row for row in items if row.get("source") == "calendar"]
     if query:
         items = _match_schedule_query(items, query)
     items = _without_holiday_calendars(items, include_holidays=bool(include_holidays))
@@ -525,6 +577,30 @@ async def get_past_events(days: int = 30, query: str | None = None,
             + "\n".join(lines))
 
 
+def _reminder_due_time(when_iso: str) -> tuple[float, str]:
+    """Resolve one reminder instant before either native or local effects.
+
+    Naive values name Mac-local wall times and must identify exactly one
+    instant. An explicit ISO offset already identifies an instant; the native
+    reminder bridge receives its epoch, not Calendar-style local components.
+    """
+    from math import isfinite
+    from service.tasks.temporal import unambiguous_local_time
+
+    when = datetime.fromisoformat(when_iso)
+    if when.tzinfo is None and not unambiguous_local_time(when):
+        raise ValueError("invalid or ambiguous local reminder time")
+    ts = when.timestamp()
+    if not isfinite(ts):
+        raise ValueError("non-finite reminder time")
+    if when.tzinfo is not None:
+        local = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+        label = local.strftime("%a %b %-d at %-I:%M %p %Z%z")
+    else:
+        label = when.strftime("%a %b %-d at %-I:%M %p")
+    return ts, label
+
+
 @register(
     "add_reminder",
     "Create a reminder in Wisp's local commitment store. Wisp will notify the "
@@ -547,10 +623,10 @@ async def get_past_events(days: int = 30, query: str | None = None,
 )
 async def add_reminder(title: str, when_iso: str, kind: str = "reminder") -> str:
     try:
-        when = datetime.fromisoformat(when_iso)
-    except ValueError:
-        return f"(bad when_iso {when_iso!r} — use e.g. 2026-07-13T16:00)"
-    ts = when.timestamp()
+        ts, when_str = _reminder_due_time(when_iso)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return (f"(bad when_iso {when_iso!r} — use a valid, unambiguous local ISO "
+                "time, e.g. 2026-07-13T16:00, or an explicit UTC offset; nothing was added.)")
     if ts < time.time() - 60:
         return f"({when_iso} is in the past — not added)"
     clean_title = title.strip()
@@ -560,7 +636,6 @@ async def add_reminder(title: str, when_iso: str, kind: str = "reminder") -> str
         return "(error: unsupported reminder kind; nothing was added.)"
     from service.assistant.outbox import request as app_request
     from service.assistant.hub import hub
-    when_str = when.strftime("%a %b %-d at %-I:%M %p")
     payload = {"title": clean_title, "due_ts": ts, "commitment_kind": kind}
     if not hub.has_subscribers:
         # Nothing is sent now, but an earlier attempt at this exact reminder
@@ -964,6 +1039,9 @@ def reminders_matching(scope: str = "all", query: str = "",
     Calendar events are excluded. A Wisp reminder can carry a task-like kind,
     so source provenance—not the display kind—is the safe boundary.
     """
+    from service.demo.founder import enabled, matching_reminders
+    if enabled():
+        return matching_reminders(query, scope, now)
     scope = (scope or "all").strip().lower()
     if scope not in _REMINDER_SCOPES:
         return []
@@ -1080,6 +1158,9 @@ def _stale_note(hidden: int) -> str:
              "what does my reminder say"],
 )
 async def search_reminders(query: str, scope: str = "all") -> str:
+    from service.demo.founder import enabled, reminder_text
+    if enabled():
+        return reminder_text(query, scope)
     from service.assistant.sync_status import ensure_sources
     readiness = await ensure_sources(("reminders",), timeout_seconds=4.0)
     state = next((source["state"] for source in readiness["sources"]

@@ -55,6 +55,88 @@ class PersonalRead:
     direct_calls: tuple[tuple[str, dict], ...] = ()
 
 
+def _evidence_sources(included: str | None, excluded: str | None,
+                      allowed: tuple[str, ...]) -> tuple[str, ...] | None:
+    def parse(value):
+        found = []
+        for part in re.split(r"\s*(?:,|\band\b|\bor\b)\s*", value, flags=re.I):
+            part = re.sub(r"^(?:my|our|the)\s+", "", part.strip(), flags=re.I)
+            names = [name for name in allowed if re.fullmatch(_SOURCE[name], part, re.I)]
+            if len(names) != 1:
+                return None
+            found.append(names[0])
+        return tuple(dict.fromkeys(found))
+    selected = parse(included) if included else allowed
+    removed = parse(excluded) if excluded else ()
+    if selected is None or removed is None:
+        return None
+    return tuple(name for name in selected if name not in removed)
+
+
+def priority_read(text: str) -> PersonalRead | None:
+    """Complete priority scope; the period describes tasks, never mail receipt."""
+    match = re.fullmatch(
+        r"\s*(?:(?:please|can you|could you)\s+)?(?:what\s+(?:should\s+I\s+"
+        r"(?:work\s+on|focus\s+on|do|prioriti[sz]e|tackle)|do\s+I\s+need\s+to\s+do)|"
+        r"help\s+me\s+prioriti[sz]e(?:\s+my\s+(?:work|tasks))?)"
+        r"(?:\s+(?P<period>now|today|tomorrow|tmrow|tmrw|(?:this|next)\s+(?:week|month)))?"
+        r"(?:\s+(?:using|from)\s+(?P<include>[^.!?;\n]+?)(?:\s+only)?)?"
+        r"(?:\s*,?\s*(?:without|excluding|skip)\s+(?P<exclude>[^.!?;\n]+))?[.!?\s]*", text, re.I)
+    if not match:
+        return None
+    sources = _evidence_sources(match["include"], match["exclude"], tuple(_SOURCE))
+    if sources is None:
+        return None
+    period = (match["period"] or "today").casefold()
+    period = {"now": "today", "tmrow": "tomorrow", "tmrw": "tomorrow"}.get(period, period)
+    args = {"period": period, "include_overdue": True, "include_undated": True,
+            **{f"include_{source}": source in sources for source in _SOURCE}}
+    return PersonalRead(sources, ("collect_task_evidence",), (frozenset({"collect_task_evidence"}),),
+                        {"collect_task_evidence": args})
+
+
+_GROCERY_READ_PREFIX = (r"\s*(?:please(?:\s*,\s*|\s+))?"
+                        r"(?:(?:can|could|would)\s+you(?:\s*,\s*|\s+))?"
+                        r"(?:please(?:\s*,\s*|\s+))?")
+_GROCERY_READ_BASE = (r"(?:what\s+should\s+I\s+(?:get|buy|pick\s+up)\s+(?:for\s+)?(?:groceries|grocery\s+shopping|shopping)|"
+            r"what(?:'s|\s+is)\s+on\s+(?:my\s+|the\s+)?(?:grocery|shopping)\s+list|"
+            r"(?:show(?:\s+me)?|check|read|summari[sz]e)\s+(?:my\s+|the\s+)?(?:grocery|shopping)\s+list|"
+            r"(?:read|check)\s+(?:my\s+)?(?P<before>notes\s+and\s+reminders|reminders\s+and\s+notes)\s+for\s+groceries)")
+
+
+def grocery_read_attempt(text: str) -> bool:
+    """An addressed outer read keeps even malformed selectors inert."""
+    return re.match(_GROCERY_READ_PREFIX + _GROCERY_READ_BASE +
+                    r"(?=\W|$)", text, re.I) is not None
+
+
+def grocery_read(text: str) -> PersonalRead | None:
+    """One shopping read; list context and item text remain different fields."""
+    match = re.fullmatch(
+        _GROCERY_READ_PREFIX + _GROCERY_READ_BASE +
+        r"(?:\s+(?:using|from)\s+(?P<include>notes|reminders|notes\s+and\s+reminders|reminders\s+and\s+notes))?"
+        r'(?:\s+(?:on|in)\s+(?:my\s+|the\s+)?"(?P<label>[^"\r\n]{1,200})"\s+(?P<kind>list|note|folder))?'
+        r'(?:\s+containing\s+"(?P<query>[^"\r\n]{1,200})")?'
+        r"(?:\s*,?\s*(?:without|excluding|skip)\s+(?P<exclude>notes|reminders|notes\s+and\s+reminders|reminders\s+and\s+notes))?"
+        r"[.!?\s]*", text, re.I)
+    if not match or match["before"] and match["include"]:
+        return None
+    sources = _evidence_sources(match["include"] or match["before"], match["exclude"], ("notes", "reminders"))
+    if sources is None:
+        return None
+    if ((match["label"] is not None and not match["label"].strip())
+            or (match["query"] is not None and not match["query"].strip())
+            or match["kind"] and match["kind"].casefold() != "list" and "reminders" in sources):
+        return None
+    names = {"notes": "grocery_note_evidence", "reminders": "grocery_reminder_evidence"}
+    tools = tuple(names[source] for source in sources)
+    args = {"list_label": match["label"] or "", "query": match["query"] or ""}
+    if match["kind"]:
+        args["label_kind"] = match["kind"].casefold()
+    return PersonalRead(sources, tools, tuple(frozenset({tool}) for tool in tools),
+                        {tool: dict(args) for tool in tools})
+
+
 def mentioned_sources(text: str) -> tuple[str, ...]:
     source = mask_quoted(text)
     return tuple(name for name, pattern in _SOURCE.items() if re.search(pattern, source, re.I))
@@ -170,7 +252,7 @@ def email_summary_excluding_messages(text: str) -> PersonalRead | None:
 
 
 def personal_read(text: str) -> PersonalRead | None:
-    if (typed := weather_read(text) or calendar_question(text) or conversation_read(text)
+    if (typed := priority_read(text) or grocery_read(text) or weather_read(text) or calendar_question(text) or conversation_read(text)
             or email_summary_excluding_messages(text)) is not None:
         return typed
     if (daily := daily_read(text)) is not None:

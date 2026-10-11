@@ -355,6 +355,14 @@ async def lifespan(app: FastAPI):
         started_tasks.append(asyncio.create_task(nodes.run()))
         from service.memory.api import worker as memory_worker
         started_tasks.append(asyncio.create_task(memory_worker.run(client)))
+    else:
+        # The remote-only build starts no assistant scheduler, so behavior
+        # learning (on automatically in the founder demo) runs its own loop.
+        from service.assistant.behavior_runtime import enabled as behavior_enabled
+        if behavior_enabled():
+            from service.assistant import behavior_runtime
+            started_tasks.append(asyncio.create_task(
+                behavior_runtime.run_loop(assistant_store, assistant_hub)))
     recovery_task = asyncio.create_task(quarantine.watch(tuple(started_tasks), client.aclose))
     # A10 WP3: serves the app's private bridge socket only when the app launched
     # this process with one (a browser enabled by the user). Otherwise this is a no-op.
@@ -386,6 +394,8 @@ from service.memory.api import router as memory_router
 app.include_router(memory_router)
 from service.assistant.today_api import router as today_router
 app.include_router(today_router)
+from service.behavior_api import router as behavior_router
+app.include_router(behavior_router)
 
 OMLX_CLI = "/Applications/oMLX.app/Contents/MacOS/omlx-cli"
 
@@ -1793,6 +1803,15 @@ async def agent(body: dict[str, Any]):
                              + "".join("\n" + guidance for guidance in synthesis_guidance)
                              + (workflow_turn.plan.prompt_block()
                                 if workflow_turn and workflow_turn.decision else ""))
+                if remote_only_profile() is not None and _agent_memory_context_allowed(
+                        decision, cloud=super_model_cloud,
+                        grounded_workflow=bool(workflow_turn and workflow_turn.decision),
+                        schedule_read=schedule_read):
+                    # Remote-only keeps memory context off (include_memory_context
+                    # below); the learned profile card is the one exception, under
+                    # the same gate the memory block uses elsewhere.
+                    from service.memory.prompt_blocks import remote_only_context_block
+                    style_hint += remote_only_context_block()
                 final = await run_agent(turn_client, decision.model, messages, emit, approver,
                                         tools=decision.tool_subset,
                                         active_skill=active_skill,
@@ -1859,7 +1878,11 @@ async def agent(body: dict[str, Any]):
                 # style rules (no em/en dashes, no hyphenated compounds) are
                 # prose-specific and could otherwise bleed into code syntax.
                 if remote_only_profile() is not None:
-                    msgs = [{"role": "system", "content": ROLE_SYSTEM.get(decision.role, ROLE_SYSTEM["general"])}] + messages
+                    # Only the learned profile card rides along here; every
+                    # other memory/skill context stays off in this build.
+                    from service.memory.prompt_blocks import remote_only_context_block
+                    msgs = [{"role": "system", "content": ROLE_SYSTEM.get(decision.role, ROLE_SYSTEM["general"])
+                             + remote_only_context_block()}] + messages
                 elif super_model_cloud:
                     # The privacy decision covers only the literal current prompt.
                     # Do not attach local memory, conversation rewrites, role prompts,
@@ -2287,6 +2310,11 @@ async def assistant_sync_calendar(body: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=409 if isinstance(exc, RevisionConflict) else 422, detail=str(exc)) from exc
     assistant_scheduler.record_sync(source, n, diagnostics=body.get("diagnostics") or {})
     await assistant_hub.publish({"type": "changed"})
+    if source == "calendar":
+        # Behavior learning diffs the fresh Calendar now (cancellations/moves)
+        # instead of on its next tick. No-op unless behavior learning is on.
+        from service.assistant import behavior_runtime
+        behavior_runtime.poke(assistant_store, assistant_hub)
     return {"ok": True, "synced": n}
 
 

@@ -19,6 +19,7 @@ _FORCED_MODE = os.environ.get("WISP_REMOTE_ONLY")
 _READ_TOOLS = frozenset({"get_upcoming", "get_past_events", "search_reminders",
                          "view_emails", "summarize_emails", "view_messages",
                          "summarize_messages"})
+_BEHAVIOR_TOOLS = frozenset({"describe_me", "predict_my_day", "my_patterns", "correct_pattern"})
 
 
 def _refuse(message: str):
@@ -169,5 +170,14 @@ def remote_demo_tool_allowed(tool_name: str | None) -> bool:
         return False
     if tool_name in _READ_TOOLS:
         return True
+    # Behavior-learning tools read (or, for correct_pattern, edit) only Wisp's
+    # own learned profile — never a native source — and they are the point of
+    # the founder demo. Allowed only while behavior learning is on, so the
+    # pinned read set (_READ_TOOLS) is unchanged. Their schemas are small; the
+    # demo routes offer them alone (see router._behavior_request).
+    if tool_name in _BEHAVIOR_TOOLS:
+        # Mirrors service.assistant.behavior_runtime.enabled() without importing
+        # the assistant package (which opens stores) from this policy module.
+        return os.environ.get("WISP_BEHAVIOR") == "1" or os.environ.get("WISP_FOUNDER_DEMO") == "1"
     from service.demo.founder import enabled
     return tool_name in {"search_notes", "lookup_contact", "list_contacts"} and enabled()

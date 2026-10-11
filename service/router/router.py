@@ -7281,15 +7281,136 @@ def _guard_scheduled_cancel(decision: RouteDecision, original_text: str) -> Rout
     return decision
 
 
+# --------------------------------------------------------------------------
+# Behavior learning: "what do you know about me", "predict my day", "when do I
+# usually work out". Active only while behavior learning is on (WISP_BEHAVIOR=1
+# or the founder demo); otherwise every phrase keeps its existing route (e.g.
+# "what do you know about me" -> recall). Whole-utterance matches only, so a
+# compound request ("... and check my email") keeps the claims router.
+_BEHAVIOR_LEAD = (r"^\s*(?:(?:hey|ok|okay)\s+)?(?:wisp[,:]?\s+)?(?:so\s+)?"
+                  r"(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?")
+_BEHAVIOR_TAIL = (r"(?:\s+(?:so\s+far|by\s+now|yet|please|then|again|lately|recently|"
+                  r"from\s+my\s+(?:calendar|activity|routine)))?\s*[?.!]*\s*$")
+_BEHAVIOR_DESCRIBE_RE = re.compile(
+    _BEHAVIOR_LEAD + r"(?:"
+    r"what\s+(?:do|did)\s+you\s+(?:know|think|remember)\s+about\s+me|"
+    r"what\s+(?:have|did)\s+you\s+(?:learn(?:ed|t)?|notice[d]?|figure[d]?\s+out|pick(?:ed)?\s+up)"
+    r"(?:\s+about\s+me)?|"
+    r"describe\s+me|describe\s+my\s+(?:habits|routines?|patterns|week|life)|"
+    r"tell\s+me\s+(?:what\s+you\s+know\s+)?about\s+(?:me|myself)|"
+    r"what\s+are\s+my\s+(?:usual\s+)?(?:habits|routines?|patterns)|"
+    r"(?:show|list|tell)\s+(?:me\s+)?(?:about\s+)?my\s+(?:habits|routines?|patterns)|"
+    r"what\s+(?:habits|routines?|patterns)\s+(?:do\s+i\s+have|have\s+you\s+(?:noticed|learned|learnt|seen|found)"
+    r"|did\s+you\s+(?:notice|learn|find))"
+    r")" + _BEHAVIOR_TAIL, re.I)
+_BEHAVIOR_DAY = r"(?:my\s+)?(?:tomorrow|today|day(?:\s+(?:tomorrow|today))?)"
+_BEHAVIOR_PREDICT_RE = re.compile(
+    _BEHAVIOR_LEAD + r"(?:"
+    r"predict\s+(?:my\s+)?(?:day|today|tomorrow)(?:\s+(?:tomorrow|today))?|"
+    r"what\s+will\s+" + _BEHAVIOR_DAY + r"\s+(?:look|be)\s+like|"
+    # Without behavior learning these two fall to a public web search.
+    r"what\s+does\s+(?:my\s+)?tomorrow\s+look\s+like|how\s+does\s+(?:my\s+)?tomorrow\s+look|"
+    r"how\s+will\s+" + _BEHAVIOR_DAY + r"\s+(?:go|look)|"
+    r"what\s+do\s+you\s+(?:think|expect|predict)\s+" + _BEHAVIOR_DAY + r"\s+will\s+(?:look|be)\s+like|"
+    r"what\s+(?:do\s+you\s+)?(?:predict|expect)\s+(?:for\s+)?" + _BEHAVIOR_DAY +
+    r")" + _BEHAVIOR_TAIL, re.I)
+_BEHAVIOR_USUAL_RE = re.compile(
+    _BEHAVIOR_LEAD + r"(?P<q>"
+    r"(?:when|what\s+time|what\s+days?|how\s+often)\s+do\s+i\s+(?:usually|normally|typically|tend\s+to|generally)\s+\w.*|"
+    r"who\s+do\s+i\s+(?:usually\s+|normally\s+|mostly\s+|typically\s+)?(?:talk|text|chat|speak|message)\s+"
+    r"(?:to|with)\b.*|"
+    r"which\s+(?:meetings?|events?|plans?|calls?)\s+do\s+i\s+(?:usually\s+|normally\s+|typically\s+|tend\s+to\s+|"
+    r"often\s+|always\s+)?(?:cancel|skip|move|reschedule|bail\s+on|decline)\b.*|"
+    r"do\s+i\s+(?:usually|normally|typically|tend\s+to)\s+\w.*"
+    r")\s*[?.!]*\s*$", re.I)
+_BEHAVIOR_COMPOUND_RE = re.compile(
+    r"(?:,|;|\b(?:and|then|also|plus)\b)\s*(?:please\s+)?(?:remind|text|message|email|e-mail|send|add|"
+    r"schedule|book|create|cancel|move|delete|tell|check|open|play|set|draft|call)\b", re.I)
+_BEHAVIOR_CORRECT_RE = re.compile(
+    r"^\s*(?:no[,.]?\s+)?(?:that(?:'s|’s|\s+is)\s+(?:wrong|not\s+right|not\s+true|incorrect|right|correct|true)|"
+    r"(?:reject|confirm|forget|ignore|drop)\s+(?:that|this|the)\s+(?:pattern|habit|routine)|"
+    r"(?:that|this)\s+(?:pattern|habit|routine)\s+is\s+(?:wrong|right|correct|outdated|not\s+true))\b",
+    re.I)
+_BEHAVIOR_TOOLS_ALL = ("describe_me", "predict_my_day", "my_patterns", "correct_pattern")
+_BEHAVIOR_GUIDANCE = (
+    "\n\nAnswer only from these learned-pattern results. They are statistical patterns from the "
+    "user's own calendar and activity, not facts: say how sure Wisp is using the evidence counts, "
+    "keep any probabilities, and never invent routines, times or people that are not in the results. "
+    "If nothing has been learned yet, say so plainly.")
+
+
+def _behavior_request(text: str, last_tools: str | None = None) -> RouteDecision | None:
+    from service.assistant.behavior_runtime import enabled as behavior_enabled
+    if not behavior_enabled():
+        return None
+    value = " ".join(mask_quoted(text).replace("’", "'").split())
+    if not value or len(value) > 200 or _BEHAVIOR_COMPOUND_RE.search(value):
+        return None
+    from service.tools.registry import REGISTRY
+    call: tuple[str, dict] | None = None
+    reason = ""
+    if _BEHAVIOR_PREDICT_RE.search(value):
+        low = value.casefold()
+        if "tomorrow" in low:
+            day = "tomorrow"
+        elif "today" in low:
+            day = "today"
+        else:
+            from datetime import datetime
+            day = "tomorrow" if datetime.now().hour >= 18 else "today"
+        call, reason = ("predict_my_day", {"day": day}), "behavior prediction -> predict_my_day"
+    elif _BEHAVIOR_DESCRIBE_RE.search(value):
+        call, reason = ("describe_me", {}), "behavior self-description -> describe_me"
+    elif (usual := _BEHAVIOR_USUAL_RE.search(value)) is not None:
+        query = usual.group("q").strip(" ?.!")
+        call, reason = ("my_patterns", {"query": query}), "behavior routine question -> my_patterns"
+    elif _BEHAVIOR_CORRECT_RE.search(value) and (
+            re.search(r"\b(?:pattern|habit|routine)\b", value, re.I)
+            or any(name in (last_tools or "") for name in _BEHAVIOR_TOOLS_ALL)):
+        decision = _mk_scoped(["my_patterns", "correct_pattern"], "behavior correction -> correct_pattern",
+                              expect=False, light=False)
+        decision.forbidden_tools = frozenset(set(REGISTRY) - {"my_patterns", "correct_pattern"})
+        decision.resolved_request = text + (
+            "\n\nThe user is correcting what Wisp learned about their routines. Find the exact pattern "
+            "(my_patterns) and call correct_pattern with status rejected for 'wrong' or confirmed for "
+            "'right'. Only Wisp's learned profile changes; never touch the calendar or reminders.")
+        return decision
+    if call is None:
+        return None
+    decision = _mk_direct([call], reason)
+    decision.forbidden_tools = frozenset(set(REGISTRY) - {call[0]})
+    decision.tool_argument_bindings = {call[0]: dict(call[1])}
+    decision.resolved_request = text + _BEHAVIOR_GUIDANCE
+    return decision
+
+
 async def route(text: str, *,
                 last_user: str | None = None,
                 recent_users: list[str] | None = None,
                 last_assistant: str | None = None,
                 last_tools: str | None = None) -> RouteDecision:
     original_text = text
-    decision = await _route_impl(text, last_user=last_user, recent_users=recent_users,
-                                 last_assistant=last_assistant, last_tools=last_tools)
+    # Behavior-learning questions are claimed here, ahead of _route_impl (whose
+    # body is pinned), only while behavior learning is on.
+    behavior = _behavior_route(text, last_user=last_user, recent_users=recent_users,
+                               last_assistant=last_assistant, last_tools=last_tools)
+    decision = behavior if behavior is not None else await _route_impl(
+        text, last_user=last_user, recent_users=recent_users,
+        last_assistant=last_assistant, last_tools=last_tools)
     return _guard_scheduled_cancel(decision, original_text)
+
+
+def _behavior_route(text: str, *, last_user: str | None, recent_users: list[str] | None,
+                    last_assistant: str | None, last_tools: str | None) -> RouteDecision | None:
+    """Same ordering as before: an explicit Wisp knowledge operation still wins."""
+    behavior = _behavior_request(text, last_tools)
+    if behavior is None or _knowledge_request(text) is not None:
+        return None
+    request = _classify_web_request(text, last_user, recent_users=tuple(recent_users or ()),
+                                    last_assistant=last_assistant)
+    return _finalize(behavior, text, web_request=replace(
+        request, provenance=_WebProvenance.PRIVATE, current=False, query=None,
+        public_reference=False, inherited=False, clarification=None))
 
 
 async def _route_impl(text: str, *,

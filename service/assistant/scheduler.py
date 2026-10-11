@@ -101,6 +101,14 @@ async def run() -> None:
                 await attention_runtime.tick(assistant_store, hub)
         except Exception:  # noqa: BLE001 — never break the loop
             pass
+        # Behavior learning (off unless WISP_BEHAVIOR=1 or the founder demo):
+        # ingest/mine/nudge on its own internal cadence; never raises.
+        try:
+            from service.assistant import behavior_runtime
+            if behavior_runtime.enabled():
+                await behavior_runtime.tick(assistant_store, hub)
+        except Exception:  # noqa: BLE001 — never break the loop
+            pass
         # once-daily brief at the configured hour (8am or 8pm), or first tick
         # after if Wisp wasn't running at that moment.
         # The brief itself is now a deterministic render (no generation — see

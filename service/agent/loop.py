@@ -72,6 +72,17 @@ def _cloud_public_raw_evidence(value: object) -> str:
     return "\n".join(safe) if safe else "(no usable public tool evidence found.)"
 
 
+def _note_decision(tool: str, approved: bool) -> bool:
+    """Behavior-learning hook: record that the user approved/denied a
+    confirm-tier action (tool name only). Never raises; returns `approved`."""
+    try:
+        from service.assistant import behavior_runtime
+        behavior_runtime.record_decision(tool, approved)
+    except Exception:  # noqa: BLE001
+        pass
+    return approved
+
+
 async def _finish_denied_outbound(emit: Emit) -> str:
     await emit({"type": "text", "text": _DENIED_OUTBOUND_TEXT})
     await emit({"type": "done"})
@@ -1841,7 +1852,7 @@ async def run_agent(
                     "\n".join(_rows[:60])
                     + (f"\n…and {len(_rows) - 60} more"
                        if len(_rows) > 60 else ""))
-            if await approver.confirm(_action):
+            if _note_decision(_name, await approver.confirm(_action)):
                 _result = await execute_tool(_tool, _args)
                 audit("confirm_allow", tool=_name, args=_args)
             else:
@@ -2469,7 +2480,7 @@ async def run_agent(
                           "always confirmed",
                 "preview": "\n".join(_lines),
             }
-            _batch_approved = await approver.confirm(_batch_action)
+            _batch_approved = _note_decision("calendar_changes", await approver.confirm(_batch_action))
             if _batch_approved:
                 for _, _batch_name, _batch_args in _batch_calls:
                     if _batch_name == "add_calendar_event" and (
@@ -2870,7 +2881,7 @@ async def run_agent(
                     if cid in batch_verdict:
                         approved = batch_verdict[cid]
                     else:
-                        approved = await approver.confirm(action)
+                        approved = _note_decision(name, await approver.confirm(action))
                     if approved:
                         # Whether the card actually SHOWED the outgoing text
                         # (confirm_preview populates `preview` for the outbound

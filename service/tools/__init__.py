@@ -47,6 +47,7 @@ import service.tools.automation_tools  # noqa: F401 (raw AppleScript, schedule_t
 # notes_write.py, misc_t1.py, local_log.py, maps_travel.py extended in place
 import service.tools.doc_tools  # noqa: F401         (real .docx/.xlsx via python-docx/openpyxl)
 import service.tools.codex_tools  # noqa: F401       (local Codex task overview)
+import service.tools.behavior_tools  # noqa: F401    (learned routines: describe/predict/correct)
 
 __all__ = ["Tool", "ToolOutcome", "REGISTRY", "tool_schemas", "get_tool",
            "is_tool_error", "classify_tool_outcome", "is_tool_routable",

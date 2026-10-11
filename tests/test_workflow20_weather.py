@@ -333,3 +333,63 @@ def test_missing_requested_date_never_returns_unrequested_numbers(monkeypatch):
     result = dispatch_weather(location="SF", period="2026-10-14")
     assert result.startswith("(error:") and "does not cover" in result
     assert "99°F" not in result and "80°F" not in result and len(calls) == 1
+
+
+@pytest.mark.parametrize("period", [
+    "2026-10-12T18:00:00", "2026-10-12 18:00", "20261012T180000",
+    "2026-10-12T18:00:00-07:00", "2026-10-12T18:00:00Z",
+    "2026-10-12T00:00:00", "2026-10-12X18:00:00",
+    "2026-W42-1T18:00:00", "2026-10-12+05:00",
+    "2026-10-12T18:00:00.123456",
+])
+def test_iso_datetime_scope_is_rejected_before_http(period, monkeypatch):
+    calls = fake_weather(monkeypatch, payload())
+    result = dispatch_weather(location="SF", period=period)
+    from service.tools.registry import classify_tool_outcome
+    assert classify_tool_outcome("get_weather", result).status == "failed", result
+    assert "unsupported weather range" in result and calls == []
+    assert "°F" not in result and "chance of rain" not in result
+
+
+@pytest.mark.parametrize("separator", [" and ", " to ", " through ", " thru ",
+                                        " until ", " -- ", " : ", ".."])
+@pytest.mark.parametrize("clock_first", [False, True])
+def test_compound_datetime_scope_is_rejected_before_http(separator, clock_first, monkeypatch):
+    date, clock = "2026-10-13", "2026-10-12T18:00:00-07:00"
+    period = separator.join((clock, date) if clock_first else (date, clock))
+    calls = fake_weather(monkeypatch, payload())
+    result = dispatch_weather(location="SF", period=period)
+    from service.tools.registry import classify_tool_outcome
+    assert classify_tool_outcome("get_weather", result).status == "failed", result
+    assert "unsupported weather range" in result and calls == []
+    assert "°F" not in result and "chance of rain" not in result
+
+
+@pytest.mark.parametrize("period,dates", [
+    ("today", {"2026-10-12"}), ("tomorrow", {"2026-10-13"}),
+    ("2026-10-12", {"2026-10-12"}), ("20261012", {"2026-10-12"}),
+    ("today and tomorrow", {"2026-10-12", "2026-10-13"}),
+])
+def test_datetime_guard_preserves_existing_date_only_periods(period, dates, monkeypatch):
+    from service.tools import timeranges
+    real_resolve = timeranges.resolve_span
+    monkeypatch.setattr(timeranges, "resolve_span", lambda p: real_resolve(p, now=datetime(2026, 10, 12, 9)))
+    calls = fake_weather(monkeypatch, payload())
+    result = dispatch_weather(location="SF", period=period)
+    from service.tools.registry import classify_tool_outcome
+    assert classify_tool_outcome("get_weather", result).status == "succeeded", result
+    assert calls and len(calls) == 1 and "now:" not in result
+    assert {day for day in ("2026-10-12", "2026-10-13")
+            if f"forecast ({day})" in result} == dates
+
+
+@pytest.mark.parametrize("separator", [" and ", " to ", " through ", " thru ",
+                                        " until ", " -- ", " : ", ".."])
+def test_datetime_guard_preserves_existing_date_only_ranges(separator, monkeypatch):
+    period = separator.join(("2026-10-12", "2026-10-13"))
+    calls = fake_weather(monkeypatch, payload())
+    result = dispatch_weather(location="SF", period=period)
+    from service.tools.registry import classify_tool_outcome
+    assert classify_tool_outcome("get_weather", result).status == "succeeded", result
+    assert len(calls) == 1 and "now:" not in result
+    assert "forecast (2026-10-12)" in result and "forecast (2026-10-13)" in result

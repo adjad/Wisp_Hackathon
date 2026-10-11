@@ -1288,12 +1288,26 @@ async def get_stock_price(symbols: list[str], period: str = "") -> str:
 # visible in the result rather than silently answered.
 def _weather_request_dates(period: str) -> set[str] | None:
     """Validate the full range before contacting the forecast provider."""
-    from datetime import datetime, timedelta
+    from datetime import date, datetime, timedelta
     from service.tools.timeranges import resolve_span
     if not isinstance(period, str) or len(period) > 200:
         raise ValueError("range must be a string of at most 200 characters")
     if not period:
         return None
+    # The shared range parser also accepts ISO datetimes, then discards their
+    # clocks/offsets. Weather supports whole dates only. Check every component
+    # using the parser's normalization and range delimiters before resolving it.
+    normalized = " ".join(period.strip().lower().split())
+    components = re.split(r"\s+(?:and|to|through|thru|until|\-\-|:)\s+|\s*\.\.\s*", normalized)
+    for component in components:
+        try:
+            datetime.fromisoformat(component)
+        except ValueError:
+            continue  # Words and invalid dates retain the shared validation.
+        try:
+            date.fromisoformat(component)
+        except ValueError:
+            raise ValueError("ISO clock/offset/datetime forecasts are unsupported; use a whole date") from None
     start, end, _ = resolve_span(period)
     first, last = datetime.fromtimestamp(start).date(), datetime.fromtimestamp(end).date()
     days = (last - first).days

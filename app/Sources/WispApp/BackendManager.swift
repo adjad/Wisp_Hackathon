@@ -150,6 +150,12 @@ final class BackendManager {
                                                        generation: snapshot.generation)
             proc.environment?["WISP_CREDENTIAL_PIPE"] = try BackendCredentials.pipeMetadata(credentialPipe)
             proc.environment?.merge(extraEnvironment()) { _, new in new }
+#if WISP_FOUNDER_DEMO
+            proc.environment?["WISP_FOUNDER_DEMO"] = "1"
+#endif
+#if WISP_REMOTE_ONLY_DEMO
+            proc.environment?["WISP_REMOTE_ONLY"] = "1"
+#endif
             // Echoed by /identity; only this launch's receipt carries it.
             proc.environment?[BackendOwnership.nonceEnvironmentKey] = launchNonce
             proc.standardInput = credentialPipe
@@ -519,10 +525,12 @@ final class BackendManager {
             return bundled
         }
 
+#if !WISP_REMOTE_ONLY_DEMO
         let devRoot = URL(fileURLWithPath: "/Users/adijain/Desktop/MOE_Project")
         if FileManager.default.fileExists(atPath: devRoot.appendingPathComponent("service/main.py").path) {
             return devRoot
         }
+#endif
 
         return nil
     }
@@ -533,10 +541,12 @@ final class BackendManager {
             return bundledPython
         }
 
+#if !WISP_REMOTE_ONLY_DEMO
         let systemPython = URL(fileURLWithPath: "/usr/bin/python3")
         if FileManager.default.fileExists(atPath: systemPython.path) {
             return systemPython
         }
+#endif
 
         return nil
     }

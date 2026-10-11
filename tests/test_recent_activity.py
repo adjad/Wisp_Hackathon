@@ -220,20 +220,20 @@ def test_todo_questions_are_not_stolen() -> None:
                            ('What should I work on tomorrow?','tomorrow'),
                            ('What do I need to do this week?','this week')]:
         d = dec(prompt)
-        expected = {'daily_brief','search_notes'}
-        check(f'{prompt!r} offers exactly both priority readers',
-              set(d.tool_subset or []) == expected and len(d.tool_subset) == 2)
+        expected = {'collect_task_evidence'}
+        args = {'period':period, 'include_overdue':True, 'include_undated':True,
+                **{f'include_{source}':True for source in ('calendar','reminders','email','messages','notes')}}
+        check(f'{prompt!r} offers exactly the dedicated priority collector',
+              set(d.tool_subset or []) == expected and len(d.tool_subset) == 1)
         check(f'{prompt!r} preserves period and overdue/undated work',
-              d.tool_argument_bindings == {'daily_brief':{'period':period,
-                  'include_overdue':True,'include_undated':True,'include_weather':False},
-                  'search_notes':{'query':''}})
-        check(f'{prompt!r} needs both readers before narration',
-              d.required_tool_groups == (frozenset({'daily_brief'}),frozenset({'search_notes'}))
+              d.tool_argument_bindings == {'collect_task_evidence':args})
+        check(f'{prompt!r} needs the source collector before narration',
+              d.required_tool_groups == (frozenset(expected),)
               and d.multi_round and d.expect_tool_first and set(d.narration_after) == expected)
         check(f'{prompt!r} does not execute recency or effects',
-              not d.direct_calls and d.force_first_tool != 'get_recent_activity'
-              and REGISTRY['daily_brief'].category == 'assistant_read'
-              and REGISTRY['search_notes'].category == 'notes_read'
+              d.direct_calls == [('collect_task_evidence',args)]
+              and d.force_first_tool is None
+              and REGISTRY['collect_task_evidence'].category == 'assistant_read'
               and d.resolved_request.startswith(prompt))
     # Other existing planning forms keep aggregate source coverage.
     required = {'get_upcoming','search_reminders','summarize_messages','summarize_emails','search_notes'}

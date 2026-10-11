@@ -95,14 +95,22 @@ def priority_read(text: str) -> PersonalRead | None:
                         {"collect_task_evidence": args})
 
 
-def grocery_read(text: str) -> PersonalRead | None:
-    """One shopping read; list context and item text remain different fields."""
-    base = (r"(?:what\s+should\s+I\s+(?:get|buy|pick\s+up)\s+(?:for\s+)?(?:groceries|grocery\s+shopping|shopping)|"
+_GROCERY_READ_BASE = (r"(?:what\s+should\s+I\s+(?:get|buy|pick\s+up)\s+(?:for\s+)?(?:groceries|grocery\s+shopping|shopping)|"
             r"what(?:'s|\s+is)\s+on\s+(?:my\s+|the\s+)?(?:grocery|shopping)\s+list|"
             r"(?:show|check|read|summari[sz]e)\s+(?:my\s+|the\s+)?(?:grocery|shopping)\s+list|"
             r"(?:read|check)\s+(?:my\s+)?(?P<before>notes\s+and\s+reminders|reminders\s+and\s+notes)\s+for\s+groceries)")
+
+
+def grocery_read_attempt(text: str) -> bool:
+    """An addressed outer read keeps even malformed selectors inert."""
+    return re.match(r"\s*(?:(?:please|can you|could you)\s+)?" + _GROCERY_READ_BASE +
+                    r"(?=\s|[.!?]|$)", text, re.I) is not None
+
+
+def grocery_read(text: str) -> PersonalRead | None:
+    """One shopping read; list context and item text remain different fields."""
     match = re.fullmatch(
-        r"\s*(?:(?:please|can you|could you)\s+)?" + base +
+        r"\s*(?:(?:please|can you|could you)\s+)?" + _GROCERY_READ_BASE +
         r"(?:\s+(?:using|from)\s+(?P<include>notes|reminders|notes\s+and\s+reminders|reminders\s+and\s+notes))?"
         r'(?:\s+(?:on|in)\s+(?:my\s+|the\s+)?"(?P<label>[^"\r\n]{1,200})"\s+(?P<kind>list|note|folder))?'
         r'(?:\s+containing\s+"(?P<query>[^"\r\n]{1,200})")?'

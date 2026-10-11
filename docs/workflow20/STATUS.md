@@ -246,3 +246,39 @@ publication freshness may be unknown; a Notes modification time cannot date
 individual sentences. No real model, native data, device, performance or all-20
 qualification has run. iPhone has separate source ownership and unsigned
 simulator evidence; this Mac checkpoint does not qualify an iPhone deployment.
+
+## PR4 blocked checkpoint and subsequent repairs
+
+Frozen `80d953f1690e4e4c669407f32edd0aeca30da8b3` is blocked. Its isolated
+full run completed 201 gates: 199 passed, two failed, 27,931 reported passes,
+19 failures and 155 skips; one legacy count remained unparsed. The two failing
+suites retained retired priority-reader expectations and omitted final-route
+demonstrations for the three new tools. Narrow test amendments now assert the
+exact collector/source flags, read-first direct call and narration requirements;
+other route and aggregate-planning assertions remain intact.
+
+Independent audit blocked two P1 findings. A real disposable queue/registry/loop
+reproduction showed a request to cancel A could cancel model-selected B. The
+repair binds the complete unconditional literal ID to both tools; quoted IDs,
+malformed targets, conditions and conflicting clauses cannot authorize an
+unbound effect. Additional named-selector conditions were tightened during
+helper review. All earlier failing runs and intermediate commits are retained.
+
+The second finding concerned quoted grocery selectors reaching the earlier
+Reminder deletion compiler. Six real isolated HTTP/SSE cases reproduced the
+unintended preview or wrong no-match answer; the harness refused destructive
+approval. The new pure outer-read guard suspends earlier interpreters and skill
+context for grocery reads while preserving unrelated plans and saved skill
+state. Unsupported addressed reads clarify with no tools. After repair, 895
+combined grocery/routing/unchanged-knowledge cases passed, including actual HTTP
+empty/populated stores, malformed selectors, hostile calls and genuine Reminder
+controls. These are development checks, not independent acceptance.
+
+Parallel repairs preserve native Calendar occurrence identity and validate
+weather request times/provider dates/numbers before rendering. Calendar's first
+checkpoint passed 424 tests plus 61 subtests; helper review then identified a
+second-read generation mix requiring repair before qualification. Weather's
+exact checkpoint passed 290 focused cases; hourly/daypart forecasts remain
+unsupported. No completeness, local-model, device, native-provider, performance
+or all-20 qualification is implied. A fresh combined head must pass full checks,
+both required CI jobs, independent audit and distinct QA.

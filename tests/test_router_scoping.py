@@ -103,6 +103,9 @@ def test_every_tool_has_a_scoped_home() -> None:
     # indexes its name/description. Count only targets actually demonstrated
     # by a final route, not every incidental tool in the returned menu.
     for prompt, target in (
+            ("What should I work on tomorrow?", "collect_task_evidence"),
+            ("What should I get for groceries without reminders", "grocery_note_evidence"),
+            ("What should I get for groceries without notes", "grocery_reminder_evidence"),
             ("search my chat history for an old project", "search_conversations"),
             ("clear my saved memories", "clear_memory"),
             ("Save a knowledge note titled Project:\nBring blue folder.", "save_knowledge"),
@@ -371,12 +374,15 @@ def test_multi_round_flags_the_sequential_routes() -> None:
         check(f"{prompt!r} (aggregate to-do) is multi_round", d.multi_round,
               f"subset={d.tool_subset}")
         if prompt == 'what do I need to do':
-            check('priority requires both exact complementary readers',
-                  set(d.tool_subset or []) == {'daily_brief','search_notes'}
-                  and d.required_tool_groups == (frozenset({'daily_brief'}),frozenset({'search_notes'}))
-                  and d.tool_argument_bindings == {'daily_brief':{'period':'today',
-                      'include_overdue':True,'include_undated':True,'include_weather':False},
-                      'search_notes':{'query':''}} and not d.direct_calls)
+            args = {'period':'today', 'include_overdue':True, 'include_undated':True,
+                    **{f'include_{source}':True for source in ('calendar','reminders','email','messages','notes')}}
+            check('priority requires the exact source collector before narration',
+                  d.tool_subset == ['collect_task_evidence']
+                  and d.required_tool_groups == (frozenset({'collect_task_evidence'}),)
+                  and d.tool_argument_bindings == {'collect_task_evidence':args}
+                  and d.direct_calls == [('collect_task_evidence',args)]
+                  and d.force_first_tool is None and d.expect_tool_first
+                  and REGISTRY['collect_task_evidence'].category == 'assistant_read')
         else:
             check(f"{prompt!r} keeps aggregate source coverage",
                   set(d.tool_subset or []) >= {'get_upcoming','search_reminders',
@@ -400,7 +406,7 @@ def test_narration_after_names_each_multi_round_route_requirement() -> None:
     aggregate = {'get_upcoming','search_reminders','summarize_messages','summarize_emails','search_notes'}
     for prompt in ("what do I need to do", "help me plan my day"):
         d = dec(prompt)
-        expected = {'daily_brief','search_notes'} if prompt == 'what do I need to do' else aggregate
+        expected = {'collect_task_evidence'} if prompt == 'what do I need to do' else aggregate
         check(f"{prompt!r} releases only after each required source",
               set(d.narration_after) == expected, f"-> {sorted(d.narration_after)}")
     d = dec("summarize the PDF in my downloads")

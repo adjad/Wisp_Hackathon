@@ -1356,12 +1356,14 @@ async def agent(body: dict[str, Any]):
                 pass
 
         try:
-            # Knowledge titles/bodies are literal data. Recognize their whole
-            # envelope before any earlier task/workflow/skill interpreter can
-            # mistake those fields for another command. Credential redaction
+            # Knowledge fields and outer grocery-read selectors are literal
+            # data. Recognize their envelope before task/workflow/skill
+            # interpreters can mistake those fields for another command. Credential redaction
             # and current-user capture have already run at the entry boundary.
             from service.knowledge_intent import knowledge_envelope
             literal_knowledge = knowledge_envelope(prompt) is not None
+            from service.workflows.workflow20 import grocery_read_attempt
+            literal_envelope = literal_knowledge or grocery_read_attempt(prompt)
             last_assistant = store.last_assistant_turn(sid) if sess else None
             last_user = store.last_user_turn(sid) if sess else None
             recent_users = store.recent_user_turns(sid) if sess else []
@@ -1373,12 +1375,12 @@ async def agent(body: dict[str, Any]):
             # their first question. Keep one active skill on the session until
             # the user stops it, switches explicitly, or the skill emits its
             # completion marker.
-            active_skill = "" if literal_knowledge else skills.select_for_turn(
+            active_skill = "" if literal_envelope else skills.select_for_turn(
                 prompt,
                 str((sess or {}).get("active_skill") or ""),
                 last_assistant or "",
             )
-            if not literal_knowledge and sess and active_skill != str(sess.get("active_skill") or ""):
+            if not literal_envelope and sess and active_skill != str(sess.get("active_skill") or ""):
                 store.set_active_skill(sid, active_skill)
             # Skills stay on the managed model. Beyond an active conversational
             # workflow, that covers a turn that invokes ANY enabled skill (an
@@ -1387,7 +1389,7 @@ async def agent(body: dict[str, Any]):
             skill_turn = ""
             if active_skill:
                 skill_turn = "active_skill_local"
-            elif not literal_knowledge and (skills.turn_skill_names(prompt) or skills.digest_used_skill(last_tools)):
+            elif not literal_envelope and (skills.turn_skill_names(prompt) or skills.digest_used_skill(last_tools)):
                 skill_turn = "skill_local"
 
             # Common assistant actions are moving behind a typed task boundary.
@@ -1405,7 +1407,7 @@ async def agent(body: dict[str, Any]):
                 "WISP_TYPED_REMINDERS_SHADOW_ONLY", "0").strip().lower() in {
                     "1", "true", "yes", "on"}
             from service.workflows.engine import prepare_news_selector_guard
-            news_turn = None if literal_knowledge else prepare_news_selector_guard(store, sid, prompt)
+            news_turn = None if literal_envelope else prepare_news_selector_guard(store, sid, prompt)
             if news_turn:
                 await emit({"type": "workflow", "event": news_turn.event,
                             "workflow": news_turn.plan.to_dict()})
@@ -1434,7 +1436,7 @@ async def agent(body: dict[str, Any]):
                     await emit({"type": "done"})
                     return
             from service.tasks.reply_engine import prepare_task_turn_async
-            task_turn = None if literal_knowledge else await prepare_task_turn_async(
+            task_turn = None if literal_envelope else await prepare_task_turn_async(
                 store, sid, prompt, assistant_store=assistant_store,
                 persist=not test_mode and not typed_shadow_only,
                 allow_native=not test_mode and not typed_shadow_only)
@@ -1499,7 +1501,7 @@ async def agent(body: dict[str, Any]):
             # task's source, channel and recipient through clarifications, so a
             # reply like "Messages" or "yes" advances the existing plan
             # instead of being classified as a new isolated request.
-            workflow_turn = None if literal_knowledge else prepare_turn(
+            workflow_turn = None if literal_envelope else prepare_turn(
                 store, sid, prompt, persist=not test_mode)
             # Only a turn that starts execution owns its revision; a response-only
             # turn (e.g. "already running") may describe another request's plan.
@@ -1539,7 +1541,7 @@ async def agent(body: dict[str, Any]):
             from service.workflows.reads import (
                 adjacent_stock_response, compile_read, execute_read,
             )
-            read_plan = None if literal_knowledge else compile_read(
+            read_plan = None if literal_envelope else compile_read(
                 prompt, last_user=last_user or "", last_tools=last_tools or "",
                 last_stock_response=adjacent_stock_response(
                     last_assistant or "", last_tools or ""))
@@ -1756,7 +1758,7 @@ async def agent(body: dict[str, Any]):
                 final = await run_agent(turn_client, decision.model, messages, emit, approver,
                                         tools=decision.tool_subset,
                                         active_skill=active_skill,
-                                        allow_skill_context=not literal_knowledge,
+                                        allow_skill_context=not literal_envelope,
                                         force_first_tool=force_tool,
                                         expect_tool_first=decision.expect_tool_first,
                                         short_circuit_tools=_PRESYNTHESIZED_TOOLS,
@@ -1831,8 +1833,8 @@ async def agent(body: dict[str, Any]):
                     from service.skills import always_skills_block, selected_skill_block
                     sysp = (ROLE_SYSTEM.get(decision.role, ROLE_SYSTEM["general"])
                             + memory_block(query=prompt)
-                            + ("" if literal_knowledge else selected_skill_block(prompt, active_skill))
-                            + (always_skills_block() if not literal_knowledge and decision.role != "coding" else "")
+                            + ("" if literal_envelope else selected_skill_block(prompt, active_skill))
+                            + (always_skills_block() if not literal_envelope and decision.role != "coding" else "")
                             + now_line())
                     msgs = [{"role": "system", "content": sysp}] + messages
                 # "fast" is TRIVIAL_RE's positive match only (greetings, thanks,

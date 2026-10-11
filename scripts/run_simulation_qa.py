@@ -305,6 +305,7 @@ ADDITIONAL_FULL_TESTS = {
     # and guarded owned Python children; no live inference or personal sources.
     "tests/test_workflow20_availability.py",
     "tests/test_workflow20_calendar.py",
+    "tests/test_workflow20_calendar_identity.py",
     "tests/test_workflow20_compiler.py",
     "tests/test_workflow20_daily.py",
     "tests/test_workflow20_email_threads.py",

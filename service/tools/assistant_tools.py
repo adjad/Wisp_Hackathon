@@ -226,17 +226,53 @@ def _without_withheld_sources(items: list[dict], withheld: set[str]) -> list[dic
     return visible
 
 
-def _collapse_schedule_rows(items: list[dict]) -> list[dict]:
-    """Defensively collapse mirrored commitments before presenting them.
+def _calendar_occurrence_key(item: dict) -> tuple | None:
+    """Native occurrence identity, never a title/time similarity guess."""
+    import math
+    native_id, when = item.get("source_id"), item.get("when_ts")
+    if (not isinstance(native_id, str) or not native_id.strip()
+            or type(when) not in (int, float) or not math.isfinite(when)):
+        return None
+    account, context = item.get("account"), item.get("context")
+    if any(value is not None and not isinstance(value, str) for value in (account, context)):
+        return None
+    return (native_id, when, account, context)
 
-    The store does this for normal reads. Keeping this small presentation-layer
-    guard makes a response resilient while a source sync is in flight (and
-    keeps callers with fixture-like stores from relaying a manual/Apple mirror
-    pair as two separate things the user has to do).
+
+def _collapse_schedule_rows(items: list[dict]) -> list[dict]:
+    """Keep native Calendar occurrences separate from manual/Reminder mirrors.
+
+    Missing native identity and conflicting descriptions remain separate. The
+    same occurrence can arrive through both the raw and normal store reads;
+    an absent field on one read is not a contradictory field value.
     """
-    by_key: dict[tuple[str, int] | tuple[str, int, int], dict] = {}
+    by_key: dict[tuple, dict] = {}
+    calendar: dict[tuple, list[int]] = {}
+    calendar_rows: list[dict] = []
     rank = {"manual": 0, "reminders": 1, "calendar": 2}
     for item in items:
+        if item.get("source") == "calendar":
+            identity = _calendar_occurrence_key(item)
+            peers = calendar.setdefault(identity, []) if identity is not None else []
+            fields = ("title", "kind", "end_ts", "all_day", "location", "organizer", "url", "status")
+            compatible = [index for index in peers
+                          if all(item.get(field) == calendar_rows[index].get(field)
+                                 for field in fields
+                                 if item.get(field) is not None
+                                 and calendar_rows[index].get(field) is not None)]
+            if len(compatible) == 1:
+                index = compatible[0]
+                peer = calendar_rows[index]
+                additions = {field: item[field] for field in fields
+                             if peer.get(field) is None and item.get(field) is not None}
+                if additions:
+                    calendar_rows[index] = {**peer, **additions}
+                continue
+            # More than one compatible description is ambiguous, not proof
+            # that this row denotes either of those conflicting events.
+            peers.append(len(calendar_rows))
+            calendar_rows.append(item)
+            continue
         title = " ".join(str(item.get("title") or "").split()).casefold()
         when = item.get("when_ts")
         if not title or when is None:
@@ -246,7 +282,8 @@ def _collapse_schedule_rows(items: list[dict]) -> list[dict]:
         current = by_key.get(key)
         if current is None or rank.get(item.get("source"), 9) < rank.get(current.get("source"), 9):
             by_key[key] = item
-    return sorted(by_key.values(), key=lambda item: float(item.get("when_ts") or 0))
+    return sorted(calendar_rows + list(by_key.values()),
+                  key=lambda item: float(item.get("when_ts") or 0))
 
 
 def _agenda_day_label(when: datetime, today: date) -> str:
@@ -436,11 +473,19 @@ async def get_upcoming(days: int = 7, account: str | None = None,
                 if forward_start <= float(row.get("when_ts") or 0) < end]
         rows = calendar_rows + rows
     else:
-        rows = assistant_store.upcoming(now=now, days=days)
+        import math
+        # upcoming() collapses by title/minute before account filtering. Read
+        # raw Calendar occurrences as well, retaining the existing inclusive
+        # elapsed-seconds horizon (explicit periods remain half-open).
+        end = now + days * 86400
+        calendar_rows = assistant_store.calendar_events_overlapping(
+            now, math.nextafter(end, math.inf))
+        rows = calendar_rows + assistant_store.upcoming(now=now, days=days)
     items = _filter_account(rows, account)
     if calendar_only:
-        items = [row for row in items if row.get("source") == "calendar"
-                 or "calendar" in (row.get("duplicate_sources") or [])]
+        # Raw occurrences are available above. A manual winner carrying
+        # Calendar display-dedupe provenance is not another native event.
+        items = [row for row in items if row.get("source") == "calendar"]
     if query:
         items = _match_schedule_query(items, query)
     items = _without_holiday_calendars(items, include_holidays=bool(include_holidays))

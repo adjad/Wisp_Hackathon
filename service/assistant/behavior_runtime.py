@@ -1,8 +1,10 @@
 """Mac-side runtime for the behavior engine: feed it, run it, act on it.
 
-Off unless ``WISP_BEHAVIOR=1`` or ``WISP_FOUNDER_DEMO=1`` (the founder demo
-build turns it on automatically). ``WISP_BEHAVIOR_SYNTHETIC_ONLY=1`` (implied
-by the founder demo) learns from the synthetic persona instead of real data.
+Off unless ``WISP_BEHAVIOR=1``, ``WISP_FOUNDER_DEMO=1`` or the full remote
+build (``WISP_REMOTE_ONLY=1`` + ``WISP_REMOTE_FULL=1``) turns it on;
+``WISP_BEHAVIOR=0`` always wins. ``WISP_BEHAVIOR_SYNTHETIC_ONLY=1`` (implied
+by the founder demo only) learns from the synthetic persona instead of real
+data; the full remote build learns from real activity.
 
 Brain
     ``local`` (default): an in-process ``BehaviorEngine`` at
@@ -91,7 +93,10 @@ def enabled() -> bool:
 
 
 def synthetic_only() -> bool:
-    return os.environ.get("WISP_BEHAVIOR_SYNTHETIC_ONLY") == "1" or founder_demo()
+    # The Aria demo learns the synthetic persona plus its synthetic calendar
+    # (mirrored into the demo store as the "Wisp Demo" calendar), never real data.
+    from service.demo.aria import env_requested as aria_demo
+    return os.environ.get("WISP_BEHAVIOR_SYNTHETIC_ONLY") == "1" or founder_demo() or aria_demo()
 
 
 def brain_url() -> str:
@@ -107,6 +112,9 @@ def brain_url() -> str:
 
 
 def brain_mode() -> str:
+    from service.demo.aria import env_requested as aria_demo
+    if aria_demo():
+        return "local"   # a remote brain is shared with real mode; the demo never feeds it
     mode = os.environ.get("WISP_BRAIN_MODE", "").strip().lower()
     if not mode:
         try:
@@ -121,8 +129,10 @@ def brain_mode() -> str:
 
 
 def _home() -> Path:
-    from service.paths import moe_dir
-    return moe_dir()
+    # The Aria demo's synthetic persona learns into its own state directory
+    # (service.paths.state_dir), never the real-mode behavior.db.
+    from service.paths import state_dir
+    return state_dir()
 
 
 # --------------------------------------------------------------------------
@@ -135,6 +145,13 @@ def _default_local_factory(path: Path):
     if os.environ.get("WISP_BEHAVIOR_PHRASER", "1") != "0":
         from service.assistant.behavior_phraser import WispPhraser
         phraser = WispPhraser()
+    from service.demo.aria import env_requested as aria_demo
+    if aria_demo():
+        # The persona plants its next gym-morning conflict and Tue/Thu
+        # back-to-back run within the coming week; look that far so the demo
+        # shows them on any day.
+        from service.demo.aria.proactive import DEMO_NUDGE_HORIZON_S
+        return BehaviorEngine(path, phraser=phraser, min_horizon_s=DEMO_NUDGE_HORIZON_S)
     return BehaviorEngine(path, phraser=phraser)
 
 

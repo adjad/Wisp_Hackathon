@@ -786,7 +786,8 @@ def test_main_wires_profile_into_remote_only_paths():
     agent = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "agent")
     text = ast.unparse(agent)
     assert "style_hint += remote_only_context_block()" in text
-    assert "include_memory_context=remote_only_profile() is None and" in text
+    # Read-only remote keeps memory off; the full build (WISP_REMOTE_FULL) follows the Mac path.
+    assert "include_memory_context=not remote_read_only_mode() and" in text
     assert "behavior_router" in src and "behavior_runtime.run_loop(assistant_store, assistant_hub)" in src
 
 
@@ -971,6 +972,7 @@ class RemoteOnlyLifespan(RemoteFixture):
         store_obj, hub_obj = object(), object()
         ns = {"asyncio": asyncio, "asynccontextmanager": asynccontextmanager,
               "remote_only_profile": policy.remote_only_profile,
+              "remote_full_mode": policy.remote_full_mode,
               "require_local_models_disabled": policy.require_local_models_disabled,
               "OMLXClient": lambda: fake, "role_to_model": lambda role: "qwen3.6:35b",
               "skills": SimpleNamespace(load=bomb), "mcp_manager": SimpleNamespace(start=bomb, stop=bomb),

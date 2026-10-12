@@ -103,6 +103,14 @@ async def run() -> None:
                 assistant_store.sync_source(c.name, items)
             except Exception:  # noqa: BLE001 — a connector must never break the loop
                 pass
+        # The Aria demo: deliver its simulated scheduled sends (never the app outbox).
+        try:
+            from service.inference.remote_policy import aria_demo_mode
+            if aria_demo_mode():
+                from service.demo.aria import tools as aria_tools
+                await aria_tools.tick(hub)
+        except Exception:  # noqa: BLE001 — never break the loop
+            pass
         # fire any due reminders
         try:
             for note in due_reminders(assistant_store):
@@ -233,8 +241,8 @@ async def _fire_scheduled_sends() -> None:
 
 
 def _brief_state_path():
-    from service.paths import MOE_DIR
-    return MOE_DIR / "brief_state.json"
+    from service.paths import STATE_DIR
+    return STATE_DIR / "brief_state.json"
 
 
 def _brief_date() -> date | None:

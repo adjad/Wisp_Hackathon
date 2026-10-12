@@ -168,6 +168,16 @@ final class OverlayModel: ObservableObject {
         didSet { UserDefaults.standard.set(debugMode, forKey: "wisp.debugMode") }
     }
 
+    // Intel v5: whether the running backend is the Aria founder demo (fictional
+    // data, read-only tools). Set at launch and by the menu-bar toggle; drives
+    // the panel's "Aria demo" indicator. Always false outside WISP_REMOTE_FULL.
+    @Published var ariaDemo = AriaDemoMode.available && AriaDemoMode.isOn() {
+        didSet { refreshAriaTopBar() }
+    }
+    // The Aria demo's collapsed-bar content (next event + proactive chip).
+    @Published var ariaTopBar: WispClient.AriaTopBar?
+    private var ariaTopBarTask: Task<Void, Never>?
+
     // --- assistant layer (calendar/reminders) ---
     // Upcoming commitments themselves surface as system notifications (see
     // Notifications.swift / handleAssistantEvent's "reminder" case) rather
@@ -176,7 +186,9 @@ final class OverlayModel: ObservableObject {
     // Behavior-engine nudges shown as cards at the top of the panel (newest
     // first, see NudgeViews.swift). Each also arrives as a notification.
     @Published var nudges: [BehaviorNudge] = []
+    @Published var transientNotice: String?
     private var assistantTask: Task<Void, Never>?
+    private var transientNoticeTask: Task<Void, Never>?
     // The last scheduled brief this session notified about. The SSE stream is
     // re-subscribed after any drop, so the same brief can arrive twice.
 
@@ -894,8 +906,37 @@ final class OverlayModel: ObservableObject {
     // see handleAssistantEvent's "reminder" case.
     private let assistantDelivery = AssistantDelivery()
 
+    func refreshAriaTopBar() {
+        guard ariaDemo else { ariaTopBar = nil; return }
+        Task { [weak self] in
+            guard let self else { return }
+            let bar = await self.client.ariaTopBar()
+            if self.ariaDemo { self.ariaTopBar = bar }
+        }
+    }
+
+    /// Tapping the demo's proactive chip opens the panel on the nudge's card
+    /// (Undo / Useful live there); with no chip it opens the Daily Summary.
+    func openAriaChip() {
+        if let event = ariaTopBar?.chipEvent as? [String: Any], let nudge = BehaviorNudge.parse(event) {
+            requestExpand()
+            showNudge(nudge)
+        } else {
+            runDailySummary()
+        }
+    }
+
     func startAssistant() {
         refreshAssistant()
+        ariaTopBarTask?.cancel()
+        ariaTopBarTask = Task { [weak self] in
+            // The demo's next event and chip change with the clock as well as
+            // with events, so poll gently while the demo runs.
+            while !Task.isCancelled {
+                self?.refreshAriaTopBar()
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+            }
+        }
         // Nudge notification buttons (Useful / Not now / Wrong / Undo / Do it)
         // route back here on the main actor.
         Notifications.onNudgeResponse = { [weak self] nudgeID, action, info in
@@ -924,6 +965,16 @@ final class OverlayModel: ObservableObject {
     func refreshAssistant() {
         Task { [weak self] in
             self?.summaryPeriod = await self?.client.summarySchedule() ?? "AM"
+        }
+    }
+
+    func showTransientNotice(_ message: String, duration: TimeInterval = 4) {
+        transientNoticeTask?.cancel()
+        transientNotice = message
+        transientNoticeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, duration) * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.transientNotice = nil
         }
     }
 
@@ -1101,7 +1152,7 @@ final class OverlayModel: ObservableObject {
         // Durable Calendar actions only execute through the claimed bridge.
         switch ev.type {
         case "hello", "heartbeat": return true
-        case "changed": refreshAssistant()
+        case "changed": refreshAssistant(); refreshAriaTopBar()
         case "calendar_action_unknown":
             return await Notifications.deliver(id: ev.str("event_id") + ":unknown",
                 title: "Calendar outcome unknown", body: ev.str("error"))
@@ -1121,6 +1172,7 @@ final class OverlayModel: ObservableObject {
             // A replay that outlived its moment is acknowledged silently.
             if nudge.isExpired() { return true }
             showNudge(nudge)
+            refreshAriaTopBar()
             return await Notifications.deliver(id: nudge.notificationID, title: nudge.title,
                                                body: nudge.notificationBody,
                                                subtitle: nudge.notificationSubtitle,

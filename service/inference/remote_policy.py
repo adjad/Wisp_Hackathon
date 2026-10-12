@@ -1,7 +1,21 @@
-"""Process-pinned, opt-in Intel/GX10 demo policy; never resolves credentials.
+"""Process-pinned, opt-in Intel/GX10 remote-inference policy; never resolves credentials.
 
 The launcher supplies WISP_REMOTE_ONLY=1 plus the exact nonsecret profile in
 inference.remote_only. Settings cannot change this snapshot after startup.
+
+Two modes share the pinned origin, model, Keychain-only credential and payload
+validation:
+
+* read-only (the Intel founder demo, ``WISP_REMOTE_ONLY=1`` alone): only the
+  seven native reads, the behavior tools and (with ``WISP_FOUNDER_DEMO=1``)
+  the fictional fixture readers; every other tool, approval and write endpoint
+  is refused. Budgets are the original 8k gateway contract.
+* full (``WISP_REMOTE_ONLY=1`` + ``WISP_REMOTE_FULL=1``, Intel v5): every
+  built-in tool that does not need a local model or a Wisp-local extension
+  runtime, each decided by the normal safety policy (service/safety/policy.py
+  and grants.py) exactly as on a Mac with local models. Budgets follow the
+  100k-context GX10 contract (REMOTE_FULL_PROFILE). Mutually exclusive with
+  the founder demo.
 """
 from __future__ import annotations
 
@@ -16,10 +30,22 @@ if TYPE_CHECKING:
     from service.config.endpoints import Target
 
 _FORCED_MODE = os.environ.get("WISP_REMOTE_ONLY")
+# Read once at import, like _FORCED_MODE: the mode is a launch decision.
+_FULL_MODE = os.environ.get("WISP_REMOTE_FULL")
+_FOUNDER_MODE = os.environ.get("WISP_FOUNDER_DEMO")
+# The Aria demo (service/demo/aria): full mode against a synthetic world.
+_ARIA_MODE = os.environ.get("WISP_ARIA_DEMO")
 _READ_TOOLS = frozenset({"get_upcoming", "get_past_events", "search_reminders",
                          "view_emails", "summarize_emails", "view_messages",
                          "summarize_messages"})
 _BEHAVIOR_TOOLS = frozenset({"describe_me", "predict_my_day", "my_patterns", "correct_pattern"})
+# Built-ins that full remote mode never offers or runs. Each needs something
+# this build does not have: create_tool generates code with the local coding
+# model and installs it; use_skill/wisp_skills/wisp_mcp serve the Wisp-local
+# skill and MCP runtimes, which never start in a remote-only build (and their
+# content must not leave the Mac). Everything else is left to the normal
+# safety policy, never to this list.
+_REMOTE_FULL_EXCLUDED = frozenset({"create_tool", "use_skill", "wisp_skills", "wisp_mcp"})
 
 
 def _refuse(message: str):
@@ -95,11 +121,36 @@ class RemoteOnlyProfile:
             _refuse("Remote-only transcript/schema byte budget exceeded")
 
 
+# The v5 full-mode gateway contract: the GX10 serves qwen3.6:35b with a
+# 32,000-token context. Every other field (origin, model id, credential,
+# roles, tool count, readiness timeout, response bound) is identical to the
+# read-only contract, so the packaged profile differs ONLY in these values.
+REMOTE_FULL_LIMITS = {"context_window": 32000, "max_tokens": 8192,
+                      "request_bytes": 524288, "messages": 200,
+                      "aggregate_bytes": 131072}
+REMOTE_FULL_PROFILE = RemoteOnlyProfile(**REMOTE_FULL_LIMITS)
+
+
+def _full_requested() -> bool:
+    if _FULL_MODE not in {None, "1"} or _ARIA_MODE not in {None, "1"}:
+        _refuse("Invalid remote full launch mode")
+    if _ARIA_MODE == "1" and _FULL_MODE != "1":
+        _refuse("The Aria demo requires the full remote launch")
+    if _FULL_MODE != "1":
+        return False
+    if _FORCED_MODE != "1":
+        _refuse("Remote full mode requires the forced remote-only launch")
+    if _FOUNDER_MODE is not None:
+        _refuse("Remote full mode and the founder demo are mutually exclusive")
+    return True
+
+
 @lru_cache(maxsize=1)
 def remote_only_profile() -> RemoteOnlyProfile | None:
     """Validate one startup snapshot; deliberately not cleared by Settings."""
     if _FORCED_MODE not in {None, "1"}:
         _refuse("Invalid remote-only launch mode")
+    full = _full_requested()
     from service.config import models_config
     config = models_config()
     inference = config.get("inference", {})
@@ -108,8 +159,12 @@ def remote_only_profile() -> RemoteOnlyProfile | None:
     raw = inference.get("remote_only")
     if raw is None and _FORCED_MODE is None:
         return None
-    expected = RemoteOnlyProfile()
-    fields = asdict(expected)
+    # Full mode accepts only the full (32k) contract. Read-only mode (the
+    # founder/Aria demo) accepts the original 8k contract or, because the Intel
+    # v5 package ships ONE profile for both of its runtime modes, the full
+    # contract: the larger budgets add no tools, writes or endpoints there.
+    candidates = (REMOTE_FULL_PROFILE,) if full else (RemoteOnlyProfile(), REMOTE_FULL_PROFILE)
+    fields = asdict(candidates[0])
     if not isinstance(raw, dict) or set(raw) != set(fields):
         _refuse("Remote-only launch requires the complete fixed profile")
     normalized = dict(raw)
@@ -117,15 +172,37 @@ def remote_only_profile() -> RemoteOnlyProfile | None:
         if not isinstance(raw[key], (list, tuple)):
             _refuse("Invalid remote-only role/capability metadata")
         normalized[key] = tuple(raw[key])
-    for key, value in fields.items():
+    for expected in candidates:
+        if _matches_contract(normalized, expected):
+            return expected
+    _refuse("Remote-only profile differs from the approved fixed contract")
+
+
+def _matches_contract(normalized: dict, expected: RemoteOnlyProfile) -> bool:
+    for key, value in asdict(expected).items():
         observed = normalized[key]
         if (key == "readiness_timeout" and type(observed) in {int, float}):
             good = observed == value
         else:
             good = type(observed) is type(value) and observed == value
         if not good:
-            _refuse("Remote-only profile differs from the approved fixed contract")
-    return expected
+            return False
+    return True
+
+
+def remote_full_mode() -> bool:
+    """True only in the validated full remote build (WISP_REMOTE_FULL=1)."""
+    return remote_only_profile() is not None and _full_requested()
+
+
+def aria_demo_mode() -> bool:
+    """True in the validated full remote build launched as the Aria demo."""
+    return remote_full_mode() and _ARIA_MODE == "1"
+
+
+def remote_read_only_mode() -> bool:
+    """True in the read-only remote build (the Intel founder demo)."""
+    return remote_only_profile() is not None and not _full_requested()
 
 
 def require_generation_role(role: str) -> None:
@@ -145,7 +222,8 @@ def remote_default_target(role: str = "fast") -> Target:
         "managed": False, "provider": profile.provider, "api_prefix": profile.api_prefix,
         "readiness_timeout": profile.readiness_timeout,
     })
-    return Target(role, ep, profile.model_id, profile="intel-gx10-hours-demo-v1",
+    label = "intel-gx10-full-v5" if remote_full_mode() else "intel-gx10-hours-demo-v1"
+    return Target(role, ep, profile.model_id, profile=label,
                   context_window=profile.context_window, capabilities=profile.tool_capabilities)
 
 
@@ -165,7 +243,36 @@ def require_local_models_disabled(operation: str) -> None:
         _refuse(f"{operation} is unavailable in the remote-only demo")
 
 
+def remote_tool_allowed(tool_name: str | None) -> bool:
+    """Whether a remote-only build may offer/run this tool at all.
+
+    Full mode: every built-in except _REMOTE_FULL_EXCLUDED; the normal safety
+    policy then decides allow/confirm/deny for each call. Aria demo (full mode
+    + WISP_ARIA_DEMO=1): only the demo's synthetic or data-free tools, still
+    under the normal policy. Read-only mode: the fixed founder-demo allowlist
+    (remote_demo_tool_allowed)."""
+    if not isinstance(tool_name, str) or not tool_name:
+        return False
+    if remote_full_mode():
+        if tool_name in _REMOTE_FULL_EXCLUDED:
+            return False
+        if aria_demo_mode():
+            # The Aria demo runs only tools with a synthetic implementation or
+            # that touch no personal data or native app (demo/aria/tools.py).
+            from service.demo.aria.tools import allowed
+            from service.tools.registry import REGISTRY
+            return allowed(tool_name) and tool_name in REGISTRY
+        # Only tools registered by Wisp itself; skill and MCP runtimes never
+        # start in a remote-only build, but refuse their names regardless.
+        from service.tools.registry import REGISTRY
+        tool = REGISTRY.get(tool_name)
+        return (tool is not None and tool.category != "skill_tool"
+                and not tool_name.startswith("mcp_"))
+    return remote_demo_tool_allowed(tool_name)
+
+
 def remote_demo_tool_allowed(tool_name: str | None) -> bool:
+    """The read-only (founder demo) allowlist. Unchanged by full mode."""
     if not isinstance(tool_name, str):
         return False
     if tool_name in _READ_TOOLS:

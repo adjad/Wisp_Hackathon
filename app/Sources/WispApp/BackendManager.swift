@@ -156,6 +156,14 @@ final class BackendManager {
 #if WISP_REMOTE_ONLY_DEMO
             proc.environment?["WISP_REMOTE_ONLY"] = "1"
 #endif
+#if WISP_REMOTE_FULL
+            // Intel v5: both modes use remote-full; the runtime Aria flag
+            // selects demo behavior, and WISP_FOUNDER_DEMO is always removed.
+            if var environment = proc.environment {
+                AriaDemoMode.applyBackendMode(demo: AriaDemoMode.isOn(), to: &environment)
+                proc.environment = environment
+            }
+#endif
             // Echoed by /identity; only this launch's receipt carries it.
             proc.environment?[BackendOwnership.nonceEnvironmentKey] = launchNonce
             proc.standardInput = credentialPipe
@@ -290,6 +298,15 @@ final class BackendManager {
     func stopAndWait(timeout: TimeInterval = 5) async {
         guard let process = detachForStop() else { return }
         _ = await Self.terminateAndWait(process, timeout: timeout)
+    }
+
+    /// Stop this manager's own backend (bounded, as on quit) and launch a fresh
+    /// one, which re-reads launch-time choices such as the Aria demo mode. Does
+    /// nothing while a stranger holds the port.
+    func restart() async {
+        guard !portConflict else { return }
+        await stopAndWait()
+        await startIfNeeded()
     }
 
     private func detachForStop() -> Process? {

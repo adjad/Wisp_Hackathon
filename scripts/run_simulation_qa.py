@@ -329,6 +329,12 @@ ADDITIONAL_FULL_TESTS = {
     "tests/test_intel_remote_only_main.py",
     "tests/test_intel_remote_policy.py",
     "tests/test_intel_remote_read_boundary.py",
+    # Intel v5 full remote mode + synthetic Aria demo world: temp WISP_HOME, mocked
+    # native implementations that fail if called, ASGI TestClient; no network,
+    # Keychain, model or native app access. The Swift mapping check skips when
+    # swiftc cannot run.
+    "tests/test_aria_demo.py",
+    "tests/test_intel_remote_full.py",
     # Workflow20 draft/receipt identity: sockets and subprocess forbidden, disposable stores.
     "tests/test_workflow20_draft_identity.py",
     "tests/test_workflow20_executor_draft_identity.py",

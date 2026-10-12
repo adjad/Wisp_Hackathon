@@ -379,10 +379,13 @@ class SwiftModeMapping(RemoteFixture):
         out_dir = Path(os.environ['WISP_HOME']) / f'swift-{id(self)}'
         out_dir.mkdir()
         binary = out_dir / 'aria-checks'
-        build = subprocess.run([swiftc, '-DWISP_REMOTE_ONLY_DEMO', '-DWISP_REMOTE_FULL', '-module-cache-path',
-                                str(out_dir / 'cache'), str(ROOT / 'app/Sources/WispApp/AriaDemoMode.swift'),
-                                str(ROOT / 'tests/AriaDemoModeChecks.swift'), '-o', str(binary)],
-                               capture_output=True, text=True, timeout=600)
+        try:
+            build = subprocess.run([swiftc, '-DWISP_REMOTE_ONLY_DEMO', '-DWISP_REMOTE_FULL', '-module-cache-path',
+                                    str(out_dir / 'cache'), str(ROOT / 'app/Sources/WispApp/AriaDemoMode.swift'),
+                                    str(ROOT / 'tests/AriaDemoModeChecks.swift'), '-o', str(binary)],
+                                   capture_output=True, text=True, timeout=600)
+        except OSError:
+            self.skipTest('swiftc cannot run here (sandboxed)')
         if build.returncode != 0 and 'SDK' in build.stderr:
             self.skipTest('no macOS SDK for swiftc')
         self.assertEqual(build.returncode, 0, build.stderr[-3000:])

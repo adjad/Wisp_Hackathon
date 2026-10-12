@@ -419,7 +419,10 @@ def drop_cleanup_script(container: str = "Wisp Demo") -> str:
     """AppleScript deleting ONLY the events `drop` added to the ``container``
     calendar (description carries a ``[wisp-demo-id:drop-…]`` marker). Seeded
     persona events and every other calendar are left alone. Uids are collected
-    first, so deleting never shifts the list being walked."""
+    first, so deleting never shifts the list being walked. Uids and descriptions
+    are each fetched in ONE bulk Apple event and walked as plain lists; looping
+    ``repeat with ev in (every event … whose …)`` would re-run the filtered query
+    for every property read (quadratic, timed out on ~200 events)."""
     seed = _seed_module()
     name = seed.as_string(container)
     lo, hi = time.time() - 30 * 86400, time.time() + 30 * 86400
@@ -431,11 +434,13 @@ def drop_cleanup_script(container: str = "Wisp Demo") -> str:
             "\t\tset rangeStart to " + seed.as_date(lo) + "\n"
             "\t\tset rangeEnd to " + seed.as_date(hi) + "\n"
             "\t\tset doomed to {}\n"
-            "\t\trepeat with ev in (every event of wispCal whose start date >= rangeStart and start date <= rangeEnd)\n"
+            "\t\tset uidList to uid of (every event of wispCal whose start date >= rangeStart and start date <= rangeEnd)\n"
+            "\t\tset descList to description of (every event of wispCal whose start date >= rangeStart and start date <= rangeEnd)\n"
+            "\t\trepeat with i from 1 to (count of descList)\n"
             "\t\t\ttry\n"
-            "\t\t\t\tset d to description of ev\n"
+            "\t\t\t\tset d to item i of descList\n"
             "\t\t\t\tif d is not missing value and d contains " + seed.as_string(DROP_MARKER) + " then\n"
-            "\t\t\t\t\tset end of doomed to (uid of ev)\n"
+            "\t\t\t\t\tset end of doomed to (item i of uidList)\n"
             "\t\t\t\tend if\n"
             "\t\t\tend try\n"
             "\t\tend repeat\n"
